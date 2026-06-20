@@ -71,6 +71,30 @@ def make_pairs(num_frames, tau):
     return torch.stack([starts, starts + tau], dim=1)
 
 
+def make_multi_lag_pairs(num_frames, taus):
+    """Generate frame pairs at multiple lag times to maximise trajectory use.
+
+    For each tau in taus, generates all valid (i, i+tau) pairs.  The result is
+    sorted by start frame so time_split remains leakage-free.
+
+    Args:
+        num_frames: total number of frames
+        taus: sequence of integer lag values (frames)
+
+    Returns:
+        LongTensor [P, 3] — columns: (start_frame, end_frame, tau)
+    """
+    segments = []
+    for tau in taus:
+        tau = int(tau)
+        starts = torch.arange(0, num_frames - tau, dtype=torch.long)
+        tau_col = torch.full((len(starts),), tau, dtype=torch.long)
+        segments.append(torch.stack([starts, starts + tau, tau_col], dim=1))
+    pairs = torch.cat(segments, dim=0)
+    order = torch.argsort(pairs[:, 0], stable=True)  # sort by start frame
+    return pairs[order]
+
+
 def time_split(pairs, val_frac):
     """Split pairs into train and validation sets with time-ordered guarantee.
 

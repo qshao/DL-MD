@@ -39,3 +39,20 @@ def test_make_pairs_and_split():
     train, val = d.time_split(pairs, val_frac=0.2)
     # time-ordered: max train start < min val start (no leakage)
     assert train[:, 0].max() < val[:, 0].min()
+
+
+def test_make_multi_lag_pairs():
+    taus = [5, 10, 20]
+    pairs = d.make_multi_lag_pairs(num_frames=50, taus=taus)
+    assert pairs.shape[1] == 3, "columns: (start, end, tau)"
+    # every pair should have the correct delta
+    assert (pairs[:, 1] - pairs[:, 0] == pairs[:, 2]).all()
+    # all three tau values present
+    assert set(pairs[:, 2].tolist()) == set(taus)
+    # more pairs than any single lag alone
+    single = d.make_pairs(num_frames=50, tau=10)
+    assert pairs.shape[0] > single.shape[0]
+    # sorted by start frame → time_split is leakage-free
+    assert (pairs[1:, 0] >= pairs[:-1, 0]).all(), "must be sorted by start frame"
+    train, val = d.time_split(pairs, val_frac=0.2)
+    assert train[:, 0].max() <= val[:, 0].min()

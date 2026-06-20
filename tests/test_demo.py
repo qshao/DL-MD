@@ -26,9 +26,15 @@ def _tiny_traj(tmp_path, n_res=6, n_frames=60):
 def test_run_demo_smoke(tmp_path):
     path = _tiny_traj(tmp_path)
     out = tmp_path / "out"
-    report = demo.run_demo(path, path, tau=5, out_dir=str(out), K=4, epochs=30)
+    report = demo.run_demo(
+        path, path,
+        taus=[3, 5, 8], infer_tau=5,
+        out_dir=str(out), K=4, epochs=30,
+    )
     assert "model_geometry" in report
     assert "diversity" in report
+    assert report["taus"] == [3, 5, 8]
+    assert report["infer_tau"] == 5
     # K PDB files were written
     pdbs = list(out.glob("future_*.pdb"))
     assert len(pdbs) == 4
