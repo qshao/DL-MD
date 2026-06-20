@@ -25,8 +25,12 @@ from lsmd import data, featurize as f, model as m
 
 
 def build_ctx(frames, k, device):
-    X0 = frames["t"][0]
-    edge_index, edge_feats = f.ca_graph(X0, k=k)
+    mode = frames.get("mode", "ca")
+    X0   = frames["t"][0]
+    if mode == "4bead":
+        edge_index, edge_feats = f.four_bead_graph(X0, k=k)
+    else:
+        edge_index, edge_feats = f.ca_graph(X0, k=k)
     node_feats = f.node_features(
         frames["res_type"], frames["chain_id"],
         frames["res_index"], frames["n_types"],
@@ -36,6 +40,9 @@ def build_ctx(frames, k, device):
 
 def train(frames, taus, epochs, k, hidden, layers, lr,
           clip, batch_size, T_diff, sigma_aug, density_clip, device):
+
+    mode = frames.get("mode", "ca")
+    point_dim = 12 if mode == "4bead" else 3
 
     pairs = data.make_multi_lag_pairs(frames["t"].shape[0], taus)
     train_pairs, _ = data.time_split(pairs, val_frac=0.2)
@@ -54,12 +61,12 @@ def train(frames, taus, epochs, k, hidden, layers, lr,
         edge_dim=edge_feats.shape[1],
         hidden=hidden,
         layers=layers,
-        point_dim=3,
+        point_dim=point_dim,
     ).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
 
     n_batches = (train_pairs.shape[0] + batch_size - 1) // batch_size
-    print(f"Training on {device}  taus={taus}  "
+    print(f"Training on {device}  mode={mode}  point_dim={point_dim}  taus={taus}  "
           f"{train_pairs.shape[0]} pairs  {n_batches} steps/epoch")
 
     for epoch in range(epochs):
@@ -73,7 +80,10 @@ def train(frames, taus, epochs, k, hidden, layers, lr,
             batch_w = perm_w[start:start + batch_size].to(device)
             tau_b   = batch[:, 2].to(device=device, dtype=X_all.dtype)
 
-            u_batch = f.ca_displacement(X_all[batch[:, 0]], X_all[batch[:, 1]])
+            if mode == "4bead":
+                u_batch = f.four_bead_displacement(X_all[batch[:, 0]], X_all[batch[:, 1]])
+            else:
+                u_batch = f.ca_displacement(X_all[batch[:, 0]], X_all[batch[:, 1]])
 
             opt.zero_grad()
             loss = m.ddpm_loss(
@@ -127,20 +137,24 @@ def main():
     )
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    mode      = frames.get("mode", "ca")
+    point_dim = 12 if mode == "4bead" else 3
     checkpoint = {
         "net_state":      net.state_dict(),
         "schedule_state": schedule.state_dict(),
         "node_feats":     node_feats.cpu(),
         "edge_index":     edge_index.cpu(),
         "edge_feats":     edge_feats.cpu(),
+        "gly_mask":       frames.get("gly_mask"),
         "hparams": {
             "taus":        args.taus,
             "node_dim":    node_feats.shape[1],
             "edge_dim":    edge_feats.shape[1],
             "hidden":      args.hidden,
             "layers":      args.layers,
-            "point_dim":   3,
+            "point_dim":   point_dim,
             "T_diff":      args.T_diff,
+            "mode":        mode,
         },
     }
     torch.save(checkpoint, args.out)

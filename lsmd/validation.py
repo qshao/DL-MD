@@ -416,6 +416,167 @@ def displacement_js(disp_model, disp_md, bins=30):
 
 
 # ---------------------------------------------------------------------------
+# 4-bead physical validity check
+# ---------------------------------------------------------------------------
+
+# Bond ranges [lo, hi] in Å for each bond type in the 4-bead model
+_4B_BOND_RANGES = {
+    "N-CA":  (1.35, 1.62),
+    "CA-C":  (1.40, 1.65),
+    "CA-CB": (1.38, 1.68),
+    "C-N":   (1.20, 1.52),   # peptide bond
+}
+_4B_CLASH_DIST = 2.0   # Å — minimum non-bonded heavy-atom distance
+
+
+def check_4bead_conformation(beads, gly_mask=None):
+    """Check whether a 4-bead (N, CA, C, CB) conformation is physically meaningful.
+
+    Checks four bond types:
+        N−CA  (ideal 1.46 Å)
+        CA−C  (ideal 1.52 Å)
+        CA−CB (ideal 1.52 Å; skipped for Gly if gly_mask provided)
+        C−N   (peptide bond, ideal 1.33 Å)
+
+    and non-bonded steric clashes between all atom pairs not connected by one
+    of the above bonds (threshold 2.0 Å).
+
+    Args:
+        beads    : [P, 4, 3] bead coordinates in Å, order (N, CA, C, CB)
+        gly_mask : optional bool tensor [P], True for Gly residues (no real CB)
+
+    Returns:
+        dict with keys:
+            valid           bool
+            bond_ok         bool
+            clash_free      bool
+            rg_ok           bool  (Rg of CA vs Flory scaling)
+            n_bond_violations int
+            n_clashes       int
+            bond_violations list  of (res_i, res_j, bond_type, dist_A)
+            clashes         list  of (atom_i_flat, atom_j_flat, dist_A)
+            rg_A            float
+            rg_expected_A   float
+    """
+    P = beads.shape[0]
+    device = beads.device
+    N_a, CA, C_a, CB = beads[:, 0], beads[:, 1], beads[:, 2], beads[:, 3]
+
+    bond_violations = []
+
+    def _check_bonds(a, b, name, res_a, res_b):
+        dists = (b - a).norm(dim=-1)
+        lo, hi = _4B_BOND_RANGES[name]
+        bad = ((dists < lo) | (dists > hi)).nonzero(as_tuple=False).squeeze(1)
+        for k in bad:
+            bond_violations.append((int(res_a[k]), int(res_b[k]),
+                                    name, round(dists[k].item(), 3)))
+
+    r = torch.arange(P, device=device)
+    _check_bonds(N_a,  CA,       "N-CA",  r,    r)
+    _check_bonds(CA,   C_a,      "CA-C",  r,    r)
+    _check_bonds(C_a[:-1], N_a[1:], "C-N", r[:-1], r[1:])
+    # CA-CB: skip Gly
+    if gly_mask is None:
+        _check_bonds(CA, CB, "CA-CB", r, r)
+    else:
+        not_gly = ~gly_mask
+        _check_bonds(CA[not_gly], CB[not_gly], "CA-CB",
+                     r[not_gly], r[not_gly])
+    bond_ok = len(bond_violations) == 0
+
+    # Clashes: build flat [4P, 3] and exclude bonded pairs
+    n_atoms = P * 4
+    flat = beads.reshape(n_atoms, 3)
+
+    # Bonded pairs (flat indices): N-CA, CA-C, CA-CB, C-N(next)
+    bi_list, bj_list = [], []
+    for res in range(P):
+        bi_list += [res*4, res*4+1, res*4+1]    # N-CA, CA-C, CA-CB
+        bj_list += [res*4+1, res*4+2, res*4+3]
+        if res < P - 1:
+            bi_list.append(res*4+2)              # C-N(next)
+            bj_list.append((res+1)*4)
+    # Gly: remove CA-CB bonds
+    if gly_mask is not None:
+        pairs_filtered = [(i, j) for i, j in zip(bi_list, bj_list)
+                          if not (j == (i//4)*4+3 and gly_mask[i//4])]
+        bi_list = [p[0] for p in pairs_filtered]
+        bj_list = [p[1] for p in pairs_filtered]
+
+    bonded_adj = torch.zeros(n_atoms, n_atoms, dtype=torch.bool, device=device)
+    if bi_list:
+        bi_t = torch.tensor(bi_list, device=device)
+        bj_t = torch.tensor(bj_list, device=device)
+        bonded_adj[bi_t, bj_t] = True
+        bonded_adj[bj_t, bi_t] = True
+
+    ii, jj = torch.triu_indices(n_atoms, n_atoms, offset=1, device=device)
+    nb_mask = ~bonded_adj[ii, jj]
+    nb_i, nb_j = ii[nb_mask], jj[nb_mask]
+
+    dists_nb = (flat[nb_i] - flat[nb_j]).norm(dim=-1)
+    clash_mask = dists_nb < _4B_CLASH_DIST
+    clashes = [
+        (int(nb_i[k]), int(nb_j[k]), round(dists_nb[k].item(), 3))
+        for k in clash_mask.nonzero(as_tuple=False).squeeze(1)
+    ]
+    clash_free = len(clashes) == 0
+
+    # Rg on CA positions (same Flory scaling as before)
+    centroid = CA.mean(0)
+    rg = ((CA - centroid).pow(2).sum(-1).mean()).sqrt().item()
+    rg_expected = 2.2 * (P ** 0.38)
+    rg_ok = (0.5 * rg_expected) <= rg <= (2.0 * rg_expected)
+
+    return {
+        "valid":             bond_ok and clash_free and rg_ok,
+        "bond_ok":           bond_ok,
+        "clash_free":        clash_free,
+        "rg_ok":             rg_ok,
+        "n_bond_violations": len(bond_violations),
+        "n_clashes":         len(clashes),
+        "bond_violations":   bond_violations,
+        "clashes":           clashes,
+        "rg_A":              round(rg, 3),
+        "rg_expected_A":     round(rg_expected, 3),
+    }
+
+
+def _build_4bead_bond_tensors(P, gly_mask, device):
+    """Pre-build bond index tensors and non-bonded pair indices for a P-residue
+    4-bead system.  Returns (bond_i, bond_j, bond_targets, nb_i, nb_j) as tensors.
+    Designed to be called once and reused across many minimize_energy_4bead calls."""
+    # Target distances (Å) for each bond type
+    TARGETS = {"N-CA": 1.458, "CA-C": 1.525, "CA-CB": 1.521, "C-N": 1.329}
+    bi, bj, bt = [], [], []
+    for r in range(P):
+        bi += [r*4+0, r*4+1, r*4+1]          # N-CA, CA-C, CA-CB
+        bj += [r*4+1, r*4+2, r*4+3]
+        bt += [TARGETS["N-CA"], TARGETS["CA-C"], TARGETS["CA-CB"]]
+        if r < P - 1:
+            bi.append(r*4+2); bj.append((r+1)*4); bt.append(TARGETS["C-N"])
+    # Remove CA-CB for Gly
+    if gly_mask is not None:
+        keep = [(i, j, t) for i, j, t in zip(bi, bj, bt)
+                if not (j == (i//4)*4+3 and gly_mask[i//4])]
+        bi, bj, bt = zip(*keep) if keep else ([], [], [])
+
+    bond_i = torch.tensor(bi, dtype=torch.long,  device=device)
+    bond_j = torch.tensor(bj, dtype=torch.long,  device=device)
+    bond_t = torch.tensor(bt, dtype=torch.float32, device=device)
+
+    n = P * 4
+    adj = torch.zeros(n, n, dtype=torch.bool, device=device)
+    if len(bi):
+        adj[bond_i, bond_j] = True
+        adj[bond_j, bond_i] = True
+    ii, jj = torch.triu_indices(n, n, offset=1, device=device)
+    nb_mask = ~adj[ii, jj]
+    return bond_i, bond_j, bond_t, ii[nb_mask], jj[nb_mask]
+
+
+# ---------------------------------------------------------------------------
 # Energy minimization
 # ---------------------------------------------------------------------------
 
@@ -469,6 +630,66 @@ def minimize_energy(ca, bond_target=3.8, clash_dist=3.0,
 
     opt.step(closure)
     return x.detach().to(ca.dtype)
+
+
+def minimize_energy_4bead(beads, gly_mask=None, bond_target=None,
+                           k_bond=10.0, k_clash=1.0, n_steps=100,
+                           clash_dist=2.0,
+                           _cache={}):
+    """L-BFGS energy minimization for a 4-bead (N, CA, C, CB) conformation.
+
+    Minimizes:
+        E = k_bond  × Σ_bonds   (|r_j − r_i| − d_ideal)²
+          + k_clash × Σ_{non-bonded} max(0, clash_dist − |r_j − r_i|)²
+
+    Bond ideal lengths (Å): N-CA 1.458, CA-C 1.525, CA-CB 1.521, C-N 1.329.
+    Non-bonded pairs exclude all 1-2 connected atoms.  Bond and clash terms
+    compete in the same gradient step so fixing one does not worsen the other.
+
+    Args:
+        beads      : [P, 4, 3] in order (N, CA, C, CB)
+        gly_mask   : bool [P], True for Glycine (no real CB; CA-CB bond skipped)
+        bond_target: ignored (kept for API consistency); targets are hardcoded
+        k_bond     : bond spring constant (default 10.0)
+        k_clash    : clash penalty weight (default 1.0)
+        n_steps    : max L-BFGS iterations (default 100)
+        clash_dist : minimum non-bonded distance in Å (default 2.0)
+
+    Returns:
+        [P, 4, 3] minimized bead coordinates on the same device/dtype as input
+    """
+    P      = beads.shape[0]
+    device = beads.device
+
+    # Cache bond/non-bonded pair tensors keyed by (P, gly_mask fingerprint, device)
+    gly_key = tuple(gly_mask.tolist()) if gly_mask is not None else None
+    cache_key = (P, gly_key, str(device))
+    if cache_key not in _cache:
+        _cache[cache_key] = _build_4bead_bond_tensors(P, gly_mask, device)
+    bond_i, bond_j, bond_t, nb_i, nb_j = _cache[cache_key]
+
+    n_atoms = P * 4
+    x = beads.detach().clone().float().reshape(n_atoms, 3)
+    x.requires_grad_(True)
+
+    opt = torch.optim.LBFGS([x], lr=1.0, max_iter=n_steps,
+                             line_search_fn="strong_wolfe")
+
+    def closure():
+        opt.zero_grad()
+        b_vec  = x[bond_j] - x[bond_i]
+        b_dist = b_vec.norm(dim=-1)
+        e_bond = k_bond * ((b_dist - bond_t) ** 2).sum()
+
+        nb_dist = (x[nb_i] - x[nb_j]).norm(dim=-1)
+        e_clash = k_clash * torch.clamp(clash_dist - nb_dist, min=0.0).pow(2).sum()
+
+        loss = e_bond + e_clash
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    return x.detach().reshape(P, 4, 3).to(beads.dtype)
 
 
 # ---------------------------------------------------------------------------

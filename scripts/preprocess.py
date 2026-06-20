@@ -23,22 +23,34 @@ from lsmd import data
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Preprocess MD trajectory to CA point cloud")
-    ap.add_argument("--traj", required=True, help="Trajectory file (TRR, DCD, XTC, …)")
-    ap.add_argument("--top",  required=True, help="Topology file (GRO, PDB, …)")
-    ap.add_argument("--out",  default="data/frames.pt", help="Output .pt file path")
+    ap = argparse.ArgumentParser(description="Preprocess MD trajectory to bead point cloud")
+    ap.add_argument("--traj",  required=True, help="Trajectory file (TRR, DCD, XTC, …)")
+    ap.add_argument("--top",   required=True, help="Topology file (GRO, PDB, …)")
+    ap.add_argument("--out",   default="data/frames.pt", help="Output .pt file path")
+    ap.add_argument("--atoms", choices=["ca", "4bead"], default="4bead",
+                    help="Bead representation: 'ca' (1 bead/res) or '4bead' (N,CA,C,CB)")
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
 
     print(f"Loading  {args.traj}")
     print(f"Topology {args.top}")
-    frames = data.load_frames(args.traj, args.top)
+    print(f"Mode     {args.atoms}")
 
-    F = frames["t"].shape[0]
-    P = frames["t"].shape[1]
-    print(f"Frames: {F}   CA atoms (residues): {P}   residue types: {frames['n_types']}")
-    print(f"CA coordinate range  min={frames['t'].min():.2f} Å  max={frames['t'].max():.2f} Å")
+    if args.atoms == "4bead":
+        frames = data.load_frames_4bead(args.traj, args.top)
+        F, P = frames["t"].shape[:2]
+        n_gly = int(frames["gly_mask"].sum())
+        print(f"Frames: {F}   Residues: {P}   Gly (no CB): {n_gly}   "
+              f"Residue types: {frames['n_types']}")
+        ca = frames["t"][:, :, 1, :]   # CA for range stats
+    else:
+        frames = data.load_frames(args.traj, args.top)
+        F, P = frames["t"].shape[:2]
+        print(f"Frames: {F}   CA atoms (residues): {P}   Residue types: {frames['n_types']}")
+        ca = frames["t"]
+
+    print(f"CA coordinate range  min={ca.min():.2f} Å  max={ca.max():.2f} Å")
 
     torch.save(frames, args.out)
     size_mb = os.path.getsize(args.out) / 1e6

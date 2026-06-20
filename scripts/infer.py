@@ -88,15 +88,32 @@ def main():
             K=args.K, tau=args.tau, schedule=schedule,
             steps=args.diff_steps, eta=args.eta, sigma_init=args.sigma_init,
         )                                           # [K, P, 3]
-    ca_model = x_init.to(delta.device).unsqueeze(0) + delta   # [K, P, 3]
-    ca_model = ca_model.cpu()
+    mode     = hp.get("mode", "ca")
+    gly_mask = ckpt.get("gly_mask")
+    if gly_mask is not None:
+        gly_mask = gly_mask.cpu()
 
-    # Write PDBs
+    delta    = delta.cpu()
+    x_init_c = x_init.cpu()
+
     os.makedirs(args.out, exist_ok=True)
-    res_names = ["ALA"] * P                         # placeholder; sequence in frames["res_type"]
-    for k in range(args.K):
-        path = os.path.join(args.out, f"future_{k}.pdb")
-        dec.write_ca_pdb(ca_model[k], res_names, path)
+    uniq_res  = sorted(set(r.item() for r in frames["res_type"]))
+    res_names = ["ALA"] * P   # placeholder
+
+    if mode == "4bead":
+        beads_init = x_init_c                          # [P, 4, 3]
+        delta_4b   = delta.reshape(args.K, P, 4, 3)   # [K, P, 4, 3]
+        model_out  = beads_init.unsqueeze(0) + delta_4b
+        for k in range(args.K):
+            dec.write_4bead_pdb(model_out[k], res_names,
+                                os.path.join(args.out, f"future_{k}.pdb"),
+                                gly_mask=gly_mask)
+    else:
+        ca_model = x_init_c.unsqueeze(0) + delta      # [K, P, 3]
+        model_out = ca_model
+        for k in range(args.K):
+            dec.write_ca_pdb(model_out[k], res_names,
+                             os.path.join(args.out, f"future_{k}.pdb"))
     print(f"Wrote {args.K} PDB files to {args.out}/")
 
     # Compute metrics against MD reference
@@ -104,9 +121,12 @@ def main():
     ca_md   = X_all[ref_end.long()]                 # [M, P, 3]
 
     md_src  = matching[:, 0][:128] if matching.shape[0] > 0 else val_pairs[:, 0][:128]
-    md_disp = f.ca_displacement(X_all[md_src.long()], X_all[ref_end.long()])
-    disp_md    = md_disp.norm(dim=-1).pow(2).mean(-1).sqrt()
-    disp_model = (ca_model - x_init.unsqueeze(0)).norm(dim=-1).pow(2).mean(-1).sqrt()
+    if mode == "4bead":
+        md_disp = f.four_bead_displacement(X_all[md_src.long()], X_all[ref_end.long()])
+    else:
+        md_disp = f.ca_displacement(X_all[md_src.long()], X_all[ref_end.long()])
+    disp_md    = md_disp.reshape(md_disp.shape[0], -1).norm(dim=-1)
+    disp_model = (model_out - x_init_c.unsqueeze(0)).reshape(args.K, -1).norm(dim=-1)
 
     pca_r  = val.pca_js(ca_model, ca_md)
     rmsf   = val.rmsf_profile(ca_model, ca_md)

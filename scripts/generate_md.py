@@ -52,22 +52,38 @@ from lsmd import geometry as g
 # PDB writer for multi-MODEL trajectory
 # ---------------------------------------------------------------------------
 
-def write_trajectory_pdb(frames_list, res_names, path):
-    """Write a list of CA coordinate tensors [P,3] as a multi-MODEL PDB.
+def write_trajectory_pdb(frames_list, res_names, path, gly_mask=None):
+    """Write a list of conformation tensors as a multi-MODEL PDB.
 
-    frames_list : list of [P,3] tensors
+    frames_list : list of tensors, each [P,3] (CA) or [P,4,3] (4-bead)
     res_names   : list of P residue name strings
+    gly_mask    : optional bool [P] for 4-bead mode (skip CB for Gly)
     path        : output file path
     """
+    from lsmd import decoder as dec_mod
     lines = []
-    for model_idx, ca in enumerate(frames_list, start=1):
+    for model_idx, frame in enumerate(frames_list, start=1):
         lines.append(f"MODEL     {model_idx:4d}")
-        for ri in range(ca.shape[0]):
-            x, y, z = ca[ri].tolist()
-            lines.append(
-                f"ATOM  {ri + 1:5d}  CA  {res_names[ri]:>3s} A{ri + 1:4d}    "
-                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C"
-            )
+        if frame.ndim == 2:          # CA-only [P, 3]
+            for ri in range(frame.shape[0]):
+                x, y, z = frame[ri].tolist()
+                lines.append(
+                    f"ATOM  {ri + 1:5d}  CA  {res_names[ri]:>3s} A{ri + 1:4d}    "
+                    f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C"
+                )
+        else:                        # 4-bead [P, 4, 3]
+            serial = 1
+            for ri in range(frame.shape[0]):
+                for ai, (aname, elem) in enumerate(
+                        zip(dec_mod._4BEAD_ATOM_NAMES, dec_mod._4BEAD_ELEMENTS)):
+                    if ai == 3 and gly_mask is not None and gly_mask[ri]:
+                        continue
+                    x, y, z = frame[ri, ai].tolist()
+                    lines.append(
+                        f"ATOM  {serial:5d} {aname} {res_names[ri]:>3s} A{ri + 1:4d}    "
+                        f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           {elem}"
+                    )
+                    serial += 1
         lines.append("ENDMDL")
     lines.append("END")
     with open(path, "w") as fh:
@@ -81,7 +97,8 @@ def write_trajectory_pdb(frames_list, res_names, path):
 def run_chain(net, schedule, node_feats, edge_index, edge_feats,
               x_start, x_ref, tau, n_steps, diff_steps, eta, sigma_init,
               device, bond_correction=False, bond_target=3.8, bond_iters=10,
-              min_energy=False, k_bond=10.0, k_clash=1.0, min_steps=100):
+              min_energy=False, k_bond=10.0, k_clash=1.0, min_steps=100,
+              mode="ca", gly_mask=None):
     """Run a single autoregressive trajectory chain.
 
     At each step:
@@ -110,37 +127,54 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
         for step in range(n_steps):
             t0 = time.perf_counter()
 
-            # Sample one displacement
-            delta = m.sample_ddpm(
+            # Sample one displacement  [P,3] for CA, [P,12] for 4-bead
+            raw = m.sample_ddpm(
                 net, node_feats, edge_index, edge_feats,
                 K=1, tau=tau, schedule=schedule,
                 steps=diff_steps, eta=eta, sigma_init=sigma_init,
-            )[0]                                           # [P,3]
+            )[0]
+
+            if mode == "4bead":
+                delta = raw.reshape(x.shape[0], 4, 3)   # [P, 4, 3]
+            else:
+                delta = raw                              # [P, 3]
 
             # Advance
             x = x + delta
 
             # Geometry correction (applied before re-alignment)
             if min_energy:
-                x = val.minimize_energy(x, bond_target=bond_target,
-                                        k_bond=k_bond, k_clash=k_clash,
-                                        n_steps=min_steps)
+                if mode == "4bead":
+                    x = val.minimize_energy_4bead(x, gly_mask=gly_mask,
+                                                  k_bond=k_bond, k_clash=k_clash,
+                                                  n_steps=min_steps)
+                else:
+                    x = val.minimize_energy(x, bond_target=bond_target,
+                                            k_bond=k_bond, k_clash=k_clash,
+                                            n_steps=min_steps)
             elif bond_correction:
-                # Legacy SHAKE-style projection (bonds only, no clash correction)
-                ca = x.clone()
-                for _ in range(bond_iters):
-                    vecs  = ca[1:] - ca[:-1]
-                    dists = vecs.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-                    corr  = vecs * (1.0 - bond_target / dists) * 0.5
-                    ca[:-1] = ca[:-1] + corr
-                    ca[1:]  = ca[1:]  - corr
-                x = ca
+                if mode == "ca":
+                    ca_x = x.clone()
+                    for _ in range(bond_iters):
+                        vecs  = ca_x[1:] - ca_x[:-1]
+                        dists = vecs.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                        corr  = vecs * (1.0 - bond_target / dists) * 0.5
+                        ca_x[:-1] = ca_x[:-1] + corr
+                        ca_x[1:]  = ca_x[1:]  - corr
+                    x = ca_x
 
-            # Kabsch re-align onto reference frame (frame-0 canonical orientation)
-            # This prevents slow orientation drift over many steps while preserving
-            # all internal conformational change in delta.
-            R, t = g.kabsch(x_ref_dev, x)                # aligns x onto x_ref
-            x = x @ R.transpose(-1, -2) + t.unsqueeze(-2).squeeze(0)
+            # Kabsch re-align onto reference frame using CA positions
+            if mode == "4bead":
+                ca_x     = x[:, 1, :]           # [P, 3]
+                ca_ref   = x_ref_dev[:, 1, :]
+                R, t_vec = g.kabsch(ca_ref, ca_x)
+                P_res    = x.shape[0]
+                x_flat   = x.reshape(P_res * 4, 3)
+                x_flat   = x_flat @ R.transpose(-1, -2) + t_vec.unsqueeze(0)
+                x        = x_flat.reshape(P_res, 4, 3)
+            else:
+                R, t_vec = g.kabsch(x_ref_dev, x)
+                x = x @ R.transpose(-1, -2) + t_vec.unsqueeze(-2).squeeze(0)
 
             step_times.append(time.perf_counter() - t0)
 
@@ -149,8 +183,11 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
             disp = delta.norm(dim=-1).pow(2).mean().sqrt().item()
             displacements.append(disp)
 
-            # Physical validity check on the generated conformation
-            check = val.check_conformation(x_cpu)
+            # Physical validity check
+            if mode == "4bead":
+                check = val.check_4bead_conformation(x_cpu, gly_mask=gly_mask)
+            else:
+                check = val.check_conformation(x_cpu)
             validity.append(check)
 
     return trajectory, displacements, validity, step_times
@@ -285,6 +322,8 @@ def main():
     edge_index = ckpt["edge_index"].to(device)
     edge_feats = ckpt["edge_feats"].to(device)
     taus_trained = hp["taus"]
+    mode         = hp.get("mode", "ca")
+    gly_mask     = ckpt.get("gly_mask")   # [P] bool or None
 
     if args.tau not in taus_trained:
         print(f"Warning: --tau {args.tau} not in training taus {taus_trained}. "
@@ -329,6 +368,8 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     res_names = ["ALA"] * P
+    if mode == "4bead":
+        print(f"  Mode           : 4-bead (N, CA, C, CB)  point_dim=12")
 
     # Run chains
     all_trajs     = []
@@ -350,6 +391,8 @@ def main():
             k_bond=args.k_bond,
             k_clash=args.k_clash,
             min_steps=args.min_steps,
+            mode=mode,
+            gly_mask=gly_mask,
         )
         all_trajs.append(traj)
         all_disps.append(disps)
@@ -368,7 +411,14 @@ def main():
 
     # Combined trajectory PDB (all chains interleaved as separate models)
     combined = [frame for traj in all_trajs for frame in traj]
-    write_trajectory_pdb(combined, res_names, os.path.join(args.out, "trajectory.pdb"))
+    write_trajectory_pdb(combined, res_names,
+                         os.path.join(args.out, "trajectory.pdb"),
+                         gly_mask=gly_mask)
+    if args.n_chains > 1:
+        for ci, traj in enumerate(all_trajs):
+            write_trajectory_pdb(traj, res_names,
+                                 os.path.join(args.out, f"chain_{ci}.pdb"),
+                                 gly_mask=gly_mask)
 
     # Save tensor
     if args.save_pt:
