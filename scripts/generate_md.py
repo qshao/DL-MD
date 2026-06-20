@@ -75,42 +75,13 @@ def write_trajectory_pdb(frames_list, res_names, path):
 
 
 # ---------------------------------------------------------------------------
-# Bond-length correction
-# ---------------------------------------------------------------------------
-
-def correct_bond_lengths(ca, target=3.8, n_iter=10):
-    """Project CA positions so all consecutive CA-CA distances equal target Å.
-
-    Uses symmetric SHAKE-style constraint projection: each bond's two atoms
-    are each moved by half the correction, preserving their shared midpoint.
-    Repeating n_iter times converges to within ~0.01 Å of target for typical
-    MD-generated conformations.
-
-    Args:
-        ca      : [P, 3] CA coordinates (modified in-place clone)
-        target  : ideal CA-CA bond length in Å (default 3.8)
-        n_iter  : number of projection passes (default 10)
-
-    Returns:
-        [P, 3] corrected CA coordinates
-    """
-    ca = ca.clone()
-    for _ in range(n_iter):
-        vecs  = ca[1:] - ca[:-1]                                   # [P-1, 3]
-        dists = vecs.norm(dim=-1, keepdim=True).clamp(min=1e-6)    # [P-1, 1]
-        corr  = vecs * (1.0 - target / dists) * 0.5               # [P-1, 3]
-        ca[:-1] = ca[:-1] + corr
-        ca[1:]  = ca[1:]  - corr
-    return ca
-
-
-# ---------------------------------------------------------------------------
 # Generative MD core
 # ---------------------------------------------------------------------------
 
 def run_chain(net, schedule, node_feats, edge_index, edge_feats,
               x_start, x_ref, tau, n_steps, diff_steps, eta, sigma_init,
-              device, bond_correction=False, bond_target=3.8, bond_iters=10):
+              device, bond_correction=False, bond_target=3.8, bond_iters=10,
+              min_energy=False, k_bond=10.0, k_clash=1.0, min_steps=100):
     """Run a single autoregressive trajectory chain.
 
     At each step:
@@ -149,9 +120,21 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
             # Advance
             x = x + delta
 
-            # Bond-length correction: project each CA-CA bond back to target length
-            if bond_correction:
-                x = correct_bond_lengths(x, target=bond_target, n_iter=bond_iters)
+            # Geometry correction (applied before re-alignment)
+            if min_energy:
+                x = val.minimize_energy(x, bond_target=bond_target,
+                                        k_bond=k_bond, k_clash=k_clash,
+                                        n_steps=min_steps)
+            elif bond_correction:
+                # Legacy SHAKE-style projection (bonds only, no clash correction)
+                ca = x.clone()
+                for _ in range(bond_iters):
+                    vecs  = ca[1:] - ca[:-1]
+                    dists = vecs.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                    corr  = vecs * (1.0 - bond_target / dists) * 0.5
+                    ca[:-1] = ca[:-1] + corr
+                    ca[1:]  = ca[1:]  - corr
+                x = ca
 
             # Kabsch re-align onto reference frame (frame-0 canonical orientation)
             # This prevents slow orientation drift over many steps while preserving
@@ -268,11 +251,19 @@ def main():
     ap.add_argument("--save_pt",      action="store_true",
                     help="Also save trajectory as .pt tensor [chains, steps+1, P, 3]")
     ap.add_argument("--correct_bonds", action="store_true",
-                    help="Project CA-CA bonds back to 3.8 Å after each step")
+                    help="SHAKE-style bond projection after each step (bonds only)")
+    ap.add_argument("--min_energy",   action="store_true",
+                    help="L-BFGS energy minimization after each step (bonds + clashes)")
     ap.add_argument("--bond_target",  type=float, default=3.8,
-                    help="Target CA-CA bond length for --correct_bonds (default 3.8 Å)")
+                    help="Target CA-CA bond length in Å (default 3.8)")
     ap.add_argument("--bond_iters",   type=int,   default=10,
-                    help="Projection passes per step for --correct_bonds (default 10)")
+                    help="SHAKE projection passes per step (default 10)")
+    ap.add_argument("--k_bond",       type=float, default=10.0,
+                    help="Bond spring constant for --min_energy (default 10.0)")
+    ap.add_argument("--k_clash",      type=float, default=1.0,
+                    help="Clash penalty weight for --min_energy (default 1.0)")
+    ap.add_argument("--min_steps",    type=int,   default=100,
+                    help="Max L-BFGS iterations per step for --min_energy (default 100)")
     ap.add_argument("--device",       default=None)
     args = ap.parse_args()
 
@@ -327,8 +318,12 @@ def main():
     print(f"  Chains         : {args.n_chains}")
     print(f"  Total time     : {total_ns:.1f} ns  "
           f"({args.steps * args.tau * 200 * 1000 // 2}× faster than 2 fs MD)")
-    if args.correct_bonds:
-        print(f"  Bond correction: ON  (target={args.bond_target} Å, {args.bond_iters} iters/step)")
+    if args.min_energy:
+        print(f"  Energy min     : ON  (L-BFGS, {args.min_steps} steps, "
+              f"k_bond={args.k_bond}, k_clash={args.k_clash})")
+    elif args.correct_bonds:
+        print(f"  Bond correction: ON  (SHAKE, target={args.bond_target} Å, "
+              f"{args.bond_iters} iters/step)")
     print(f"  Device         : {device}")
     print()
 
@@ -351,6 +346,10 @@ def main():
             bond_correction=args.correct_bonds,
             bond_target=args.bond_target,
             bond_iters=args.bond_iters,
+            min_energy=args.min_energy,
+            k_bond=args.k_bond,
+            k_clash=args.k_clash,
+            min_steps=args.min_steps,
         )
         all_trajs.append(traj)
         all_disps.append(disps)
@@ -385,6 +384,7 @@ def main():
     metrics["checkpoint"]      = args.checkpoint
     metrics["time_labels"]     = time_labels
     metrics["bond_correction"] = args.correct_bonds
+    metrics["energy_minimization"] = args.min_energy
 
     metrics_path = os.path.join(args.out, "metrics.json")
     with open(metrics_path, "w") as fh:

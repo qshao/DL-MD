@@ -253,3 +253,48 @@ def test_timing_report_speedup_positive():
                                out_path="/dev/null", target_ns=100)
     assert result["speedup_vs_classical_md"] > 0
     assert result["steps_needed"] == 500       # 100 ns / 0.2 ns/step
+
+
+# ── minimize_energy ───────────────────────────────────────────────────────────
+
+def test_minimize_energy_fixes_bonds():
+    """After minimization, all CA-CA bonds should be within 0.05 Å of 3.8 Å."""
+    ca = _helix_chain(20)
+    # Perturb bonds by adding noise
+    torch.manual_seed(42)
+    ca_noisy = ca + torch.randn_like(ca) * 0.5
+    result = val.minimize_energy(ca_noisy, bond_target=3.8, k_bond=10.0,
+                                 k_clash=1.0, n_steps=200)
+    bonds = (result[1:] - result[:-1]).norm(dim=-1)
+    assert (bonds - 3.8).abs().max().item() < 0.1
+
+
+def test_minimize_energy_removes_clashes():
+    """After minimization, no non-adjacent CA pair should be closer than ~2.9 Å."""
+    ca = _helix_chain(20)
+    # Force a clash: move residue 10 onto residue 0
+    ca_clash = ca.clone()
+    ca_clash[10] = ca[0].clone()
+    result = val.minimize_energy(ca_clash, bond_target=3.8, clash_dist=3.0,
+                                 k_bond=10.0, k_clash=1.0, n_steps=200)
+    P = result.shape[0]
+    idx_i, idx_j = torch.triu_indices(P, P, offset=2)
+    dists = (result[idx_i] - result[idx_j]).norm(dim=-1)
+    assert dists.min().item() > 2.5
+
+
+def test_minimize_energy_preserves_shape():
+    """Minimization should not move atoms far from their input positions."""
+    ca = _helix_chain(20)
+    torch.manual_seed(7)
+    ca_noisy = ca + torch.randn_like(ca) * 0.3
+    result = val.minimize_energy(ca_noisy, n_steps=200)
+    rmsd = (result - ca_noisy).pow(2).sum(-1).mean().sqrt().item()
+    assert rmsd < 2.0   # should stay close to input
+
+
+def test_minimize_energy_output_shape_and_dtype():
+    ca = _helix_chain(15)
+    result = val.minimize_energy(ca)
+    assert result.shape == ca.shape
+    assert result.dtype == ca.dtype

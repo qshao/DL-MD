@@ -416,6 +416,62 @@ def displacement_js(disp_model, disp_md, bins=30):
 
 
 # ---------------------------------------------------------------------------
+# Energy minimization
+# ---------------------------------------------------------------------------
+
+def minimize_energy(ca, bond_target=3.8, clash_dist=3.0,
+                    k_bond=10.0, k_clash=1.0, n_steps=100):
+    """Minimize a CA pseudo-energy to simultaneously fix bond lengths and clashes.
+
+    Minimizes:
+        E = k_bond  × Σ_{consecutive}  (|r_{i+1} − r_i| − bond_target)²
+          + k_clash × Σ_{non-adjacent} max(0, clash_dist − |r_i − r_j|)²
+
+    using L-BFGS with strong Wolfe line search.  Both bond and clash terms
+    compete in a single gradient step, so fixing one does not worsen the other
+    (unlike sequential SHAKE-style projection).
+
+    Args:
+        ca          : [P, 3] CA coordinates (any device, float32 or float64)
+        bond_target : ideal CA-CA bond length in Å (default 3.8)
+        clash_dist  : minimum non-bonded CA-CA distance in Å (default 3.0)
+        k_bond      : bond spring constant — higher value enforces bonds more strictly
+        k_clash     : clash penalty weight
+        n_steps     : maximum L-BFGS iterations (default 100)
+
+    Returns:
+        [P, 3] minimized CA coordinates on the same device as input
+    """
+    P = ca.shape[0]
+    device = ca.device
+
+    x = ca.detach().clone().float()
+    x.requires_grad_(True)
+
+    # Non-adjacent upper-triangle pair indices: j >= i+2 (excludes diagonal + bonds)
+    idx_i, idx_j = torch.triu_indices(P, P, offset=2, device=device)
+
+    opt = torch.optim.LBFGS([x], lr=1.0, max_iter=n_steps,
+                             line_search_fn="strong_wolfe")
+
+    def closure():
+        opt.zero_grad()
+        bonds  = (x[1:] - x[:-1]).norm(dim=-1)                        # [P-1]
+        e_bond = k_bond * ((bonds - bond_target) ** 2).sum()
+
+        diff   = x[idx_i] - x[idx_j]                                  # [n_pairs, 3]
+        dists  = diff.norm(dim=-1)                                     # [n_pairs]
+        e_clash = k_clash * torch.clamp(clash_dist - dists, min=0.0).pow(2).sum()
+
+        loss = e_bond + e_clash
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    return x.detach().to(ca.dtype)
+
+
+# ---------------------------------------------------------------------------
 # Physical validity check
 # ---------------------------------------------------------------------------
 
