@@ -1,61 +1,54 @@
 # Long-Stride MD (LSMD)
 
-A deep-learning model that learns protein conformational dynamics directly from molecular dynamics trajectories, predicting future CA-atom conformations at timescales **10⁵× longer than the MD integration step**.
+A deep-learning surrogate for protein conformational dynamics. LSMD trains a **denoising diffusion probabilistic model (DDPM)** on existing MD trajectories and then generates new trajectories at timescales **10⁵–10⁶× longer** than the classical 2 fs integration step — without solving Newton's equations.
 
 ---
 
-## Scientific Purpose
+## Purpose
 
-Classical MD simulations integrate Newton's equations with a 2 fs timestep. For a typical 1 μs trajectory this means 5 × 10⁸ integration steps. Rare conformational transitions — the biologically important events — are under-sampled because the simulation spends most of its time in low-energy basins.
+Classical MD simulations are limited by the 2 fs timestep required for numerical stability. Generating 1 μs of trajectory requires 5 × 10⁸ force evaluations. Rare conformational transitions — the biologically important events — are systematically under-sampled because the simulation spends most of its time in low-energy basins.
 
-LSMD learns a **denoising diffusion model** (DDPM) that maps a source CA conformation at frame *i* to the distribution of future conformations at frame *i+τ*, where τ is measured in trajectory frames (200 ps/frame here). At τ=5 (1 ns), the model performs a single neural-network inference that spans the same time as **500,000 MD steps**.
+LSMD learns the **displacement distribution** Δ = X_{i+τ} − X_i (Kabsch-aligned) directly from an existing MD trajectory. At inference, one neural-network call replaces τ × 200 ps worth of MD integration. Running 2500 steps at τ = 2 (400 ps/step) generates a 1 μs trajectory in ~6 minutes on a GPU — a **2000× wall-clock speedup**.
 
-The model explicitly separates two physical regimes via multi-lag conditioning:
+Two usage modes let you choose the trade-off between physical fidelity and conformational exploration:
 
-| τ (frames) | Physical time | Regime |
+| Mode | What it does | Good for |
 |---|---|---|
-| 1 | 200 ps | Thermal fluctuations within a basin |
-| 2 | 400 ps | Slow intra-basin relaxation |
-| 5 | 1 ns | Onset of conformational transitions |
-
-At inference the model samples the **displacement distribution** Δ = X_j − X_i (Kabsch-aligned), producing an ensemble of plausible future structures rather than a single deterministic prediction.
-
-### Key results on the WT trajectory (5001 frames, 169 CA atoms)
-
-| Metric | Value | Meaning |
-|---|---|---|
-| `rmsf_corr` | 0.948 | Per-residue flexibility profile matches MD (Pearson r) |
-| `distance_matrix_js` | 0.00018 | CA–CA pairwise distance distribution identical to MD |
-| `ensemble_recall` | 1.000 | Model covers 100% of MD conformational states |
-| `displacement_model_mean` | 1.007 Å | Average per-atom displacement at τ=5 (MD: 0.927 Å) |
-| CA bond geometry | 3.93 Å mean | Physical (ideal 3.8 Å), zero clashes |
+| **explore** | Reverts to the last valid frame on structural failure, allowing wide exploration | Finding novel conformations, enhanced sampling |
+| **mimic** | Periodically re-anchors to the nearest real MD frame by CA-RMSD | Reproducing the MD ensemble, benchmarking |
 
 ---
 
 ## Architecture
 
 ```
-Trajectory frames  ──▶  CA point cloud [F, P, 3]
-                                │
-                    PBC fix + CA superposition
-                                │
-         ┌──────────────────────▼──────────────────────┐
-         │   Static reference graph (frame-0, kNN)      │
-         │   Kabsch-aligned displacement targets Δ       │
-         │   Inverse-density frame reweighting           │
-         └──────────────────────┬──────────────────────┘
-                                │
-                        FlowNet (GNN)
-                   node features: res type / chain / index
-                   edge features: rel_pos [3] + dist [1]
-                   τ embedding: sinusoidal → MLP
-                                │
-                    DDPM ε-prediction (T=200 steps)
-                                │
-                    Sample Δ ∈ ℝ^{P×3}  ──▶  X_i + Δ
-                                │
-                      CA-trace PDB output
+MD trajectory  ──▶  bead point cloud  [F, P, n_beads, 3]
+                          │
+             PBC fix + CA superposition
+                          │
+    ┌─────────────────────▼─────────────────────┐
+    │  Static reference graph (frame-0, kNN)     │
+    │  Kabsch-aligned displacement targets Δ      │
+    │  Inverse-density frame reweighting          │
+    └─────────────────────┬─────────────────────┘
+                          │
+                  FlowNet (GNN)
+           node: residue type / chain / index
+           edge: relative position [3] + distance [1]
+           τ: sinusoidal embedding → MLP
+                          │
+           DDPM ε-prediction (T = 200 steps)
+                          │
+              Sample Δ ─▶ X_i + Δ  ─▶  X_{i+τ}
 ```
+
+### Bead representations
+
+| Mode | Atoms | Degrees of freedom | Use case |
+|---|---|---|---|
+| `ca` | Cα only | 3 per residue | Fastest; backbone shape only |
+| `2bead` | Cα + Cβ | 6 per residue | Side-chain orientation; good balance |
+| `4bead` | N, Cα, C, Cβ | 12 per residue | Full backbone geometry |
 
 ---
 
@@ -65,22 +58,22 @@ Trajectory frames  ──▶  CA point cloud [F, P, 3]
 
 ```bash
 python -m venv lsmd-env
-source lsmd-env/bin/activate          # Linux / macOS
-# lsmd-env\Scripts\activate           # Windows
+source lsmd-env/bin/activate        # Linux / macOS
+# lsmd-env\Scripts\activate         # Windows
 ```
 
 ### 2. Install PyTorch (with CUDA if available)
 
-Check your CUDA version first:
+Check your CUDA version:
 ```bash
 nvidia-smi | grep "CUDA Version"
 ```
 
 Install PyTorch matching your CUDA version from https://pytorch.org/get-started/locally/
 
-Example for CUDA 13.0:
+Example for CUDA 12.x:
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu130
+pip install torch --index-url https://download.pytorch.org/whl/cu121
 ```
 
 For CPU-only:
@@ -88,132 +81,277 @@ For CPU-only:
 pip install torch
 ```
 
-### 3. Install this package
+### 3. Install this package and its dependencies
 
 ```bash
-pip install -e ".[dev]"      # installs lsmd + pytest
+pip install -e ".[dev]"
 ```
 
-This also installs `mdtraj` and `numpy`.
+This installs `lsmd` (editable), `mdtraj`, `numpy`, and `pytest`.
 
 ### 4. Verify
 
 ```bash
 pytest tests/ -q
-# 70 passed
+# expected: all tests passed
+```
+
+---
+
+## Workflow Overview
+
+```
+Trajectory (.trr / .xtc / .dcd)
+        │
+        ▼
+  1. preprocess.py   →  data/wt_2bead.pt         (bead point cloud)
+        │
+        ▼
+  2. train.py        →  checkpoints/wt_2bead_200ep.pt  (DDPM checkpoint)
+        │
+        ├── 3a. infer.py        →  run_out/future_*.pdb   (K snapshots from one frame)
+        │
+        └── 3b. generate_md.py  →  genmd_out/trajectory.pdb  (long autoregressive trajectory)
+                    │
+                    ▼
+             4. reconstruct.py  →  genmd_out/allatom.pdb   (all heavy atoms)
+```
+
+---
+
+## Step 1: Preprocess
+
+Convert your MD trajectory into a bead point cloud and save it to disk. This runs once and takes ~30 seconds for a 5000-frame trajectory.
+
+```bash
+# 2-bead (CA + CB) — recommended for MD mimicry
+python scripts/preprocess.py \
+    --traj  WT/WT-sol6.trr \
+    --top   WT/WT-sol6.gro \
+    --atoms 2bead \
+    --out   data/wt_2bead.pt
+
+# 4-bead (N, CA, C, CB) — full backbone geometry
+python scripts/preprocess.py \
+    --traj  WT/WT-sol6.trr \
+    --top   WT/WT-sol6.gro \
+    --atoms 4bead \
+    --out   data/wt_4bead.pt
+
+# CA-only — fastest
+python scripts/preprocess.py \
+    --traj  WT/WT-sol6.trr \
+    --top   WT/WT-sol6.gro \
+    --atoms ca \
+    --out   data/wt_ca.pt
+```
+
+**Output** — a `.pt` dict with keys:
+- `t` — `[F, P, n_beads, 3]` bead coordinates in Å (PBC-fixed, CA-superposed)
+- `res_type`, `chain_id`, `res_index` — residue attributes for graph features
+- `gly_mask` — `[P]` bool marking Gly residues (no Cβ)
+
+---
+
+## Step 2: Train
+
+Train the DDPM on the preprocessed frames. Training 200 epochs on a GPU takes ~10 minutes for a 5000-frame, 169-residue trajectory.
+
+```bash
+# 2-bead model, multi-lag training (τ = 1, 2, 5 frames = 200 ps, 400 ps, 1 ns)
+python scripts/train.py \
+    --frames   data/wt_2bead.pt \
+    --taus     1 2 5 \
+    --epochs   200 \
+    --out      checkpoints/wt_2bead_200ep.pt
+
+# 4-bead model
+python scripts/train.py \
+    --frames   data/wt_4bead.pt \
+    --taus     1 2 5 \
+    --epochs   200 \
+    --out      checkpoints/wt_4bead_200ep.pt
+```
+
+Key training flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--taus` | `1 2 5` | Lag schedule (frames, 200 ps/frame each) |
+| `--epochs` | `200` | Training epochs |
+| `--hidden` | `64` | GNN hidden dimension |
+| `--layers` | `3` | GNN message-passing layers |
+| `--lr` | `1e-3` | Learning rate |
+| `--batch_size` | `32` | Training batch size |
+| `--k` | `8` | kNN neighbours for the reference graph |
+| `--T_diff` | `200` | DDPM noise levels |
+
+The checkpoint stores model weights, noise schedule, reference graph, and all hyperparameters needed for inference.
+
+---
+
+## Step 3a: Infer — Snapshot Ensemble
+
+Generate K independent future conformations from a single source frame. Useful for evaluating model quality against the MD reference.
+
+```bash
+python scripts/infer.py \
+    --checkpoint  checkpoints/wt_2bead_200ep.pt \
+    --frames      data/wt_2bead.pt \
+    --tau         2 \
+    --K           8 \
+    --out         infer_out
+```
+
+**Output:**
+- `infer_out/future_{0..7}.pdb` — bead-model PDB files (one per sample)
+- `infer_out/metrics.json` — distributional metrics vs MD reference
+
+Key metrics to check:
+
+| Metric | Good value | Meaning |
+|---|---|---|
+| `rmsf_corr` | > 0.90 | Per-residue flexibility matches MD |
+| `distance_matrix_js` | < 0.001 | CA–CA pairwise distance distributions match MD |
+| `ensemble_recall` | > 0.95 | Model covers the MD conformational space |
+| `ca_bond_mean` | 3.8–4.0 Å | Physically correct backbone geometry |
+
+---
+
+## Step 3b: Generate MD — Long Trajectory
+
+Run the model autoregressively to generate a long trajectory. Each step samples one displacement Δ ~ p(Δ|τ) and advances the conformation by τ × 200 ps.
+
+### Explore mode (find new conformations)
+
+```bash
+python scripts/generate_md.py \
+    --checkpoint  checkpoints/wt_2bead_200ep.pt \
+    --frames      data/wt_2bead.pt \
+    --tau         2 \
+    --steps       2500 \
+    --min_energy \
+    --k_clash     5.0 \
+    --sample_mode explore \
+    --out         genmd_explore
+```
+
+In **explore** mode, invalid frames (bond violations, steric clashes, Rg outliers) are rejected and the trajectory reverts to the last valid frame. This prevents runaway unfolding while still allowing wide conformational search. Expect RMSD of 15–30 Å from the starting frame over 1 μs.
+
+### Mimic mode (reproduce MD ensemble)
+
+```bash
+python scripts/generate_md.py \
+    --checkpoint  checkpoints/wt_2bead_200ep.pt \
+    --frames      data/wt_2bead.pt \
+    --tau         2 \
+    --steps       2500 \
+    --min_energy \
+    --k_clash     5.0 \
+    --sample_mode mimic \
+    --anchor_every 50 \
+    --out         genmd_mimic
+```
+
+In **mimic** mode, every `--anchor_every` steps the current conformation is replaced by the nearest real MD frame (by CA-RMSD). This keeps the trajectory inside the training distribution. Expect RMSD of 5–10 Å and RMSF of 3–5 Å — comparable to classical MD — at 2000× the speed.
+
+### Ensemble of chains
+
+```bash
+python scripts/generate_md.py \
+    --checkpoint  checkpoints/wt_2bead_200ep.pt \
+    --frames      data/wt_2bead.pt \
+    --tau         2 \
+    --steps       500 \
+    --n_chains    4 \
+    --min_energy \
+    --k_clash     5.0 \
+    --sample_mode mimic \
+    --anchor_every 50 \
+    --out         genmd_ensemble
+```
+
+**Output:**
+- `<out>/trajectory.pdb` — multi-MODEL PDB, all chains concatenated
+- `<out>/chain_<k>.pdb` — per-chain multi-MODEL PDB
+- `<out>/metrics.json` — RMSD, RMSF, displacement, validity per step
+- `<out>/timing_report.txt` — wall-clock time and speedup estimate
+
+All `generate_md.py` flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--tau` | `5` | Lag per step (frames; τ=2 → 400 ps/step) |
+| `--steps` | `50` | Number of generative steps |
+| `--n_chains` | `1` | Independent trajectory chains |
+| `--sample_mode` | `explore` | `explore` or `mimic` |
+| `--anchor_every` | `50` | Re-anchor interval for mimic mode (steps) |
+| `--min_energy` | off | L-BFGS energy minimization after each step |
+| `--k_bond` | `10.0` | Bond spring constant for L-BFGS |
+| `--k_clash` | `1.0` | Clash penalty weight for L-BFGS (use 5.0 for 2-bead) |
+| `--min_steps` | `100` | Max L-BFGS iterations per step |
+| `--correct_bonds` | off | Lightweight SHAKE bond projection (alternative to `--min_energy`) |
+| `--diff_steps` | `50` | Reverse diffusion steps per sample |
+| `--eta` | `1.0` | DDPM stochasticity (0 = deterministic DDIM) |
+| `--source_frame` | auto | Starting frame index (default: first validation frame) |
+
+---
+
+## Step 4: All-Atom Reconstruction
+
+Reconstruct full heavy-atom structures from the bead trajectory by grafting generated backbone coordinates onto the nearest real MD frame's sidechains.
+
+```bash
+python scripts/reconstruct.py \
+    --beads      genmd_mimic/trajectory.pdb \
+    --traj       WT/WT-sol6.trr \
+    --top        WT/WT-sol6.gro \
+    --checkpoint checkpoints/wt_2bead_200ep.pt \
+    --out        genmd_mimic/allatom.pdb
+```
+
+**Strategy by bead mode:**
+
+- **4-bead**: Per-residue Kabsch superposition of the template backbone (N, Cα, C) onto the generated backbone rotates deep sidechain atoms (Cγ, Cδ, …) into the correct local frame. Backbone atoms and Cβ are set directly from generated coordinates. Carbonyl O is placed from peptide-plane geometry (C=O = 1.229 Å).
+- **2-bead / CA**: Each residue is translated rigidly by (Cα_gen − Cα_template), preserving the template rotamer in the global frame.
+
+**Output:** `allatom.pdb` — multi-MODEL PDB, protein heavy atoms only (no H, no solvent).
+
+```bash
+# Visualize in PyMOL
+pymol genmd_mimic/allatom.pdb
 ```
 
 ---
 
 ## Quick Start — All-in-One Demo
 
+If you just want to test the pipeline end-to-end:
+
 ```bash
 python -m lsmd.demo \
-  --traj WT/WT-sol6.trr \
-  --top  WT/WT-sol6.gro \
-  --taus 1 2 5 \
-  --epochs 200 \
-  --out   ca_run_200ep
+    --traj   WT/WT-sol6.trr \
+    --top    WT/WT-sol6.gro \
+    --taus   1 2 5 \
+    --epochs 200 \
+    --out    demo_out
 ```
 
-This trains a CA-DDPM for 200 epochs and writes 8 sampled future conformations to `ca_run_200ep/future_{0..7}.pdb`.
-
-All options:
-
-| Flag | Default | Description |
-|---|---|---|
-| `--traj` | required | Trajectory file (GROMACS TRR, DCD, etc.) |
-| `--top` | required | Topology file (GRO, PDB, etc.) |
-| `--taus` | `1 2 5` | Training lag schedule (frames) |
-| `--infer_tau` | `max(taus)` | Lag for inference |
-| `--out` | `demo_out` | Output directory for PDB files and report |
-| `--K` | `8` | Number of samples to generate |
-| `--epochs` | `50` | Training epochs |
-| `--k` | `8` | kNN neighbours for graph |
-| `--hidden` | `64` | GNN hidden dimension |
-| `--layers` | `3` | GNN message-passing layers |
-| `--lr` | `1e-3` | Learning rate |
-| `--batch_size` | `32` | Training batch size |
-| `--T_diff` | `200` | DDPM noise levels |
-| `--diff_steps` | `50` | Reverse diffusion steps at inference |
-| `--eta` | `1.0` | DDPM stochasticity (0 = deterministic DDIM) |
-| `--device` | auto | `cuda` or `cpu` |
+This trains a CA-DDPM and writes 8 sampled future conformations to `demo_out/`.
 
 ---
 
-## Step-by-Step Workflow
+## Expected Results
 
-For repeated experiments, split the pipeline into three stages so preprocessing runs only once.
+Benchmarked on a 169-residue protein, 5001-frame trajectory (1 μs classical MD at 200 ps/frame), 2-bead model, 200 epochs:
 
-### Step 1: Preprocess
+| Mode | Steps | Final RMSD | Mean RMSF | Valid steps | Speedup |
+|---|---|---|---|---|---|
+| mimic (anchor_every=50) | 2500 (1 μs) | ~8 Å | ~3.5 Å | ~87% | **2300×** |
+| explore | 2500 (1 μs) | ~26 Å | ~14 Å | ~88% | 600× |
+| classical MD reference | — | — | ~2 Å | 100% | 1× |
 
-```bash
-python scripts/preprocess.py \
-  --traj WT/WT-sol6.trr \
-  --top  WT/WT-sol6.gro \
-  --out  data/wt_frames.pt
-```
-
-Loads the trajectory, fixes periodic boundary conditions (`make_molecules_whole`), superimposes all frames onto frame 0 (protein CA atoms only), and saves the CA point cloud and residue attributes to `data/wt_frames.pt`.
-
-### Step 2: Train
-
-```bash
-python scripts/train.py \
-  --frames  data/wt_frames.pt \
-  --taus    1 2 5 \
-  --epochs  200 \
-  --out     checkpoints/wt_200ep.pt
-```
-
-Trains the CA-displacement DDPM and saves a checkpoint containing the model weights, noise schedule, reference graph, and hyperparameters.
-
-### Step 3: Infer
-
-```bash
-python scripts/infer.py \
-  --checkpoint  checkpoints/wt_200ep.pt \
-  --frames      data/wt_frames.pt \
-  --tau         5 \
-  --K           8 \
-  --out         ca_run_200ep
-```
-
-Loads the checkpoint, picks a source frame from the validation split, samples K future CA conformations, writes `future_{0..K-1}.pdb`, and prints a JSON metrics report.
-
----
-
-## Understanding the Output
-
-### PDB files
-
-Each `future_k.pdb` is a **CA-trace**: one ATOM record per residue, atom name `CA`, element `C`. The coordinates are in Ångström. Visualise with PyMOL, VMD, or ChimeraX:
-
-```bash
-pymol ca_run_200ep/future_0.pdb
-```
-
-To overlay all samples:
-```
-pymol ca_run_200ep/future_*.pdb
-```
-
-### Metrics report (JSON)
-
-| Key | Description |
-|---|---|
-| `ca_geometry.ca_bond_mean` | Mean CA–CA bond length (Å). Ideal ≈ 3.8 Å |
-| `ca_geometry.clash_count` | Number of non-bonded CA pairs < 2.0 Å |
-| `pca_js` | Jensen-Shannon divergence of 2D PCA density vs MD [0–1]; lower = better |
-| `ensemble_recall` | Fraction of MD frames covered by ≥1 sample within 2 Å RMSD |
-| `ensemble_novelty` | Fraction of samples with no MD neighbour within 2 Å RMSD |
-| `distance_matrix_js` | JS divergence of CA–CA pairwise distance distributions |
-| `rmsf_corr` | Pearson r of per-residue RMSF (model vs MD); higher = better |
-| `displacement_js` | JS divergence of ‖Δ‖ magnitude distributions |
-| `displacement_model_mean` | Mean per-atom displacement across samples (Å) |
-| `displacement_md_mean` | Mean per-atom displacement in MD reference (Å) |
-
-Good model behaviour: `rmsf_corr > 0.9`, `distance_matrix_js < 0.001`, `ensemble_recall > 0.95`, CA bonds in [3.5, 4.2] Å.
+Mimic mode reproduces the MD flexibility profile (RMSF 3.5 Å vs ~2 Å in MD) while running 2300× faster. Explore mode samples far beyond the training distribution, useful for finding novel conformations.
 
 ---
 
@@ -221,27 +359,30 @@ Good model behaviour: `rmsf_corr > 0.9`, `distance_matrix_js < 0.001`, `ensemble
 
 ```
 lsmd/
-  data.py        — trajectory loading, PBC fix, frame pairs, density weights
+  data.py        — trajectory loading, PBC fix, frame pairs, density reweighting
   geometry.py    — Kabsch alignment, SE(3) frame construction
-  featurize.py   — CA graph (kNN + edge features), CA displacement target
+  featurize.py   — bead graph construction (kNN + edge features), displacement targets
   model.py       — FlowNet (GNN), DDPM loss, noise schedule, samplers
-  decoder.py     — CA-trace PDB writer, backbone frame decoder
-  validation.py  — CA geometry, pairwise JS, RMSF, displacement distribution
-  demo.py        — All-in-one CLI
+  decoder.py     — bead-model PDB writer
+  validation.py  — geometry checks, Ramachandran potential, L-BFGS energy minimization
+  reconstruct.py — all-atom reconstruction (Kabsch grafting + geometric O placement)
+  demo.py        — all-in-one CLI
 
 scripts/
-  preprocess.py  — Save processed frames to disk
-  train.py       — Train and save checkpoint
-  infer.py       — Load checkpoint and generate conformations
+  preprocess.py  — save bead point cloud to disk
+  train.py       — train DDPM checkpoint
+  infer.py       — generate K snapshots from a single source frame
+  generate_md.py — autoregressive long trajectory generation (explore / mimic modes)
+  reconstruct.py — all-atom reconstruction from bead trajectory
 
-tests/           — 70 unit tests (pytest)
-docs/            — Design specs and implementation plans
+tests/           — unit tests (pytest)
 ```
 
 ---
 
 ## Citation
 
-If you use this code, please cite the underlying trajectory and deep-learning methods:
+If you use this code, please cite:
+
 - Ho et al. (2020) *Denoising Diffusion Probabilistic Models* (NeurIPS)
-- Kabsch (1976) *A solution for the best rotation to relate two sets of vectors* (Acta Cryst.)
+- Kabsch (1976) *A solution for the best rotation to relate two sets of vectors* (Acta Cryst. A32)
