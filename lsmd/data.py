@@ -21,6 +21,7 @@ def load_frames(traj_path, top_path):
             - n_types: number of unique residue types
     """
     traj = md.load(traj_path, top=top_path)
+    traj.superpose(traj, 0)   # align all frames to frame 0 to remove rigid-body drift
     top = traj.topology
     residues = [r for r in top.residues if r.name != "HOH"]
 

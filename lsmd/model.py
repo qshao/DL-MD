@@ -352,13 +352,14 @@ def sample_ddpm(net, node_feats, edge_index, edge_feats, K, tau, schedule,
         # Predicted clean update
         u0_hat = (u - sqrt_1mab_t * eps_pred) / sqrt_ab_t.clamp_min(1e-8)
 
-        # DDPM/DDIM variance
-        pv = schedule.posterior_variance[t].to(dtype) if t > 0 \
-             else torch.tensor(0.0, dtype=dtype, device=device)
-        sigma_t   = eta * pv.sqrt()
+        # DDPM/DDIM variance — use strided predecessor ab_prev, not single-step pv
+        ab_t = schedule.alphas_bar[t].to(dtype)
+        pv = (1 - ab_prev) / (1 - ab_t).clamp_min(1e-8) * \
+             (1 - ab_t / ab_prev.clamp_min(1e-8))
+        sigma_t   = eta * pv.clamp_min(0.0).sqrt()
         dir_coeff = (1 - ab_prev - sigma_t ** 2).clamp_min(0.0).sqrt()
 
-        z = torch.randn_like(u) if t > 0 else torch.zeros_like(u)
+        z = torch.randn_like(u) if t_prev > 0 else torch.zeros_like(u)
         u = ab_prev.sqrt() * u0_hat + dir_coeff * eps_pred + sigma_t * z
 
     return u

@@ -1,3 +1,4 @@
+import math
 import torch
 from lsmd import decoder as dec
 
@@ -166,7 +167,7 @@ def ramachandran_js(atoms_model, atoms_md, bins=36):
     mix = 0.5 * (p + q)
     js = 0.5 * (p * torch.log(p / mix)).sum() + \
          0.5 * (q * torch.log(q / mix)).sum()
-    return js.clamp(0.0, 1.0).item()
+    return (js / math.log(2)).clamp(0.0, 1.0).item()
 
 
 def pca_js(atoms_model, atoms_md, n_components=2, bins=20):
@@ -195,13 +196,21 @@ def pca_js(atoms_model, atoms_md, n_components=2, bins=20):
     cd = (ca_md    - mu).reshape(M, -1)
 
     _, s_vals, Vt = torch.linalg.svd(cd, full_matrices=False)
+    n_components = min(n_components, Vt.shape[0], cd.shape[1])
     total_var = (s_vals ** 2).sum().clamp_min(1e-8)
     var_explained = [(s_vals[i] ** 2 / total_var).item()
                      for i in range(min(n_components, len(s_vals)))]
+    while len(var_explained) < 2:
+        var_explained.append(0.0)
 
     V = Vt[:n_components].T                      # [N*3, n_components]
     pm = cm @ V                                   # [K, n_components]
     pd = cd @ V                                   # [M, n_components]
+
+    # Pad to at least 2 columns so proj[:,1] never raises IndexError
+    if pm.shape[1] < 2:
+        pm = torch.cat([pm, torch.zeros(K, 2 - pm.shape[1], device=pm.device)], dim=1)
+        pd = torch.cat([pd, torch.zeros(M, 2 - pd.shape[1], device=pd.device)], dim=1)
 
     lo = pd[:, :2].min(0).values
     hi = pd[:, :2].max(0).values
@@ -222,8 +231,8 @@ def pca_js(atoms_model, atoms_md, n_components=2, bins=20):
     q = _hist(_idx(pd), M)
     mix = 0.5 * (p + q)
     js = (0.5 * (p * torch.log(p / mix)).sum() +
-          0.5 * (q * torch.log(q / mix)).sum()).clamp(0.0, 1.0).item()
-    return {"js": js, "var_explained": var_explained}
+          0.5 * (q * torch.log(q / mix)).sum()) / math.log(2)
+    return {"js": js.clamp(0.0, 1.0).item(), "var_explained": var_explained}
 
 
 def ensemble_recall(atoms_model, atoms_md, r_ang=2.0):
