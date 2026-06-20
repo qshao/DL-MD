@@ -138,3 +138,120 @@ def test_sampler_is_diverse():
     net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
     samples = m.sample(net, nf, ei, ef, K=8, tau=50, steps=20, sigma=0.2)
     assert samples.std(0).mean() > 0.0
+
+
+# ── NoiseSchedule ──────────────────────────────────────────────────────────────
+
+def test_noise_schedule_shape():
+    sched = m.NoiseSchedule(T=100)
+    for attr in ("alphas_bar", "sqrt_alphas_bar",
+                 "sqrt_one_minus_alphas_bar", "posterior_variance"):
+        assert getattr(sched, attr).shape == (101,), attr
+
+
+def test_noise_schedule_values():
+    sched = m.NoiseSchedule(T=100)
+    # index 0 = ᾱ_0 = 1 (clean); index T = ᾱ_T ≈ 0 (fully noisy)
+    assert abs(sched.alphas_bar[0].item() - 1.0) < 1e-5
+    assert sched.alphas_bar[-1].item() < 0.01
+    # sqrt_alphas_bar must be monotone decreasing
+    assert (sched.sqrt_alphas_bar[1:] <= sched.sqrt_alphas_bar[:-1]).all()
+    # all values non-negative
+    assert (sched.posterior_variance >= 0).all()
+
+
+# ── ddpm_loss ──────────────────────────────────────────────────────────────────
+
+def test_ddpm_loss_unbatched():
+    nf, ei, ef = _dummy_inputs()
+    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
+    sched = m.NoiseSchedule(T=50)
+    u_target = torch.randn(6, 6)
+    loss = m.ddpm_loss(net, u_target, nf, ei, ef, tau=50, schedule=sched)
+    assert loss.shape == ()
+    assert loss.item() > 0
+
+
+def test_ddpm_loss_batched():
+    nf, ei, ef = _dummy_inputs()
+    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
+    sched = m.NoiseSchedule(T=50)
+    B = 4
+    u_target = torch.randn(B, 6, 6)
+    tau_b = torch.tensor([10.0, 25.0, 50.0, 100.0])
+    loss = m.ddpm_loss(net, u_target, nf, ei, ef, tau=tau_b, schedule=sched)
+    assert loss.shape == ()
+    assert loss.item() > 0
+
+
+def test_ddpm_loss_weighted():
+    torch.manual_seed(7)
+    nf, ei, ef = _dummy_inputs()
+    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
+    sched = m.NoiseSchedule(T=50)
+    u_target = torch.randn(4, 6, 6)
+    tau_b = torch.tensor([10.0, 25.0, 50.0, 100.0])
+
+    # Uniform weights == no weights
+    torch.manual_seed(0)
+    loss_no_w = m.ddpm_loss(net, u_target, nf, ei, ef, tau=tau_b, schedule=sched)
+    torch.manual_seed(0)
+    loss_unif = m.ddpm_loss(net, u_target, nf, ei, ef, tau=tau_b, schedule=sched,
+                             pair_weights=torch.ones(4))
+    assert torch.isclose(loss_no_w, loss_unif, atol=1e-5)
+
+    # Non-uniform weights give different result
+    torch.manual_seed(0)
+    loss_w = m.ddpm_loss(net, u_target, nf, ei, ef, tau=tau_b, schedule=sched,
+                          pair_weights=torch.tensor([0.0, 0.0, 2.0, 2.0]))
+    assert not torch.isclose(loss_no_w, loss_w, atol=1e-3)
+
+
+def test_ddpm_can_overfit_constant_target():
+    torch.manual_seed(0)
+    nf, ei, ef = _dummy_inputs()
+    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=64, layers=2)
+    sched = m.NoiseSchedule(T=20)   # small T → fewer noise levels → easier to overfit
+    u_target = torch.randn(6, 6)
+    opt = torch.optim.Adam(net.parameters(), lr=1e-2)
+    for _ in range(300):
+        opt.zero_grad()
+        m.ddpm_loss(net, u_target, nf, ei, ef, tau=50, schedule=sched).backward()
+        opt.step()
+    samples = m.sample_ddpm(net, nf, ei, ef, K=8, tau=50, schedule=sched,
+                             steps=20, eta=1.0)
+    assert samples.shape == (8, 6, 6)
+    assert (samples.mean(0) - u_target).abs().mean() < 0.5
+
+
+# ── sample_ddpm ────────────────────────────────────────────────────────────────
+
+def test_sample_ddpm_shape():
+    nf, ei, ef = _dummy_inputs()
+    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
+    sched = m.NoiseSchedule(T=50)
+    samples = m.sample_ddpm(net, nf, ei, ef, K=8, tau=50, schedule=sched, steps=10)
+    assert samples.shape == (8, 6, 6)
+
+
+def test_sample_ddpm_diverse():
+    nf, ei, ef = _dummy_inputs()
+    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
+    sched = m.NoiseSchedule(T=50)
+    # eta=1 → stochastic reverse → samples must differ
+    samples = m.sample_ddpm(net, nf, ei, ef, K=8, tau=50, schedule=sched,
+                             steps=10, eta=1.0)
+    assert samples.std(0).mean() > 0.0
+
+
+def test_sample_ddpm_eta0_deterministic():
+    nf, ei, ef = _dummy_inputs()
+    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
+    sched = m.NoiseSchedule(T=50)
+    torch.manual_seed(42)
+    s1 = m.sample_ddpm(net, nf, ei, ef, K=4, tau=50, schedule=sched,
+                        steps=10, eta=0.0)
+    torch.manual_seed(42)
+    s2 = m.sample_ddpm(net, nf, ei, ef, K=4, tau=50, schedule=sched,
+                        steps=10, eta=0.0)
+    assert torch.allclose(s1, s2)
