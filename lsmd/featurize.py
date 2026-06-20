@@ -121,6 +121,39 @@ def ca_displacement(X_i, X_j):
     return X_j_aligned - X_i
 
 
+def two_bead_displacement(X_i, X_j):
+    """Kabsch-aligned displacement for 2-bead (CA, CB) conformations.
+
+    Aligns X_j onto X_i using CA atoms (bead index 0), applies the same rigid
+    transform to both beads, then returns the flat per-residue displacement.
+
+    Args:
+        X_i: source conformations [B, P, 2, 3]
+        X_j: target conformations [B, P, 2, 3]
+
+    Returns:
+        Δ: [B, P, 6]  (2 beads × 3 coords, flattened per residue)
+    """
+    B, P = X_i.shape[:2]
+    R, t = g.kabsch(X_i[:, :, 0, :], X_j[:, :, 0, :])   # align on CA
+    X_j_flat    = X_j.reshape(B, P * 2, 3)
+    X_j_aligned = X_j_flat @ R.transpose(-1, -2) + t.unsqueeze(1)
+    return (X_j_aligned.reshape(B, P, 2, 3) - X_i).reshape(B, P, 6)
+
+
+def two_bead_graph(X, k):
+    """kNN graph built on CA positions for the 2-bead model.
+
+    Args:
+        X: 2-bead conformation [P, 2, 3]
+        k: neighbours per node
+
+    Returns:
+        edge_index [2, E], edge_feats [E, 4]
+    """
+    return ca_graph(X[:, 0, :], k)
+
+
 def four_bead_displacement(X_i, X_j):
     """Kabsch-aligned displacement for 4-bead conformations.
 

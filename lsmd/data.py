@@ -60,6 +60,69 @@ def load_frames(traj_path, top_path):
             "res_index": res_index, "n_types": len(uniq), "mode": "ca"}
 
 
+def load_frames_2bead(traj_path, top_path):
+    """Load trajectory and extract CA + CB per residue (2-bead model).
+
+    For Glycine (no CB), CA is used as a CB placeholder and ``gly_mask``
+    records those residues so downstream code can skip the CA-CB bond.
+
+    Returns:
+        dict with keys:
+            t        [F, P, 2, 3] float32 — bead coords in Å, order (CA, CB)
+            res_type [P] long
+            chain_id [P] long
+            res_index[P] long
+            n_types  int
+            gly_mask [P] bool  — True for Glycine residues
+            mode     str       — "2bead"
+    """
+    traj = md.load(traj_path, top=top_path)
+    if traj.unitcell_lengths is not None:
+        traj.make_molecules_whole(inplace=True)
+    ca_idx = traj.topology.select("protein and name CA")
+    if len(ca_idx) > 0:
+        traj.superpose(traj, 0, atom_indices=ca_idx)
+
+    top = traj.topology
+    residues = [r for r in top.residues if r.name != "HOH"]
+
+    def atom_index(res, name):
+        for a in res.atoms:
+            if a.name == name:
+                return a.index
+        return None
+
+    bead_indices = []
+    res_names, chain_ids, is_gly = [], [], []
+    for r in residues:
+        ca_i = atom_index(r, "CA")
+        if ca_i is None:
+            continue
+        cb_idx = atom_index(r, "CB")
+        gly = cb_idx is None
+        if gly:
+            cb_idx = ca_i
+        bead_indices.append((ca_i, cb_idx))
+        res_names.append(r.name)
+        chain_ids.append(r.chain.index)
+        is_gly.append(gly)
+
+    xyz    = np.array(traj.xyz) * 10.0
+    idx    = np.array(bead_indices, dtype=int)          # [P, 2]
+    coords = torch.tensor(xyz[:, idx, :], dtype=torch.float32)  # [F, P, 2, 3]
+
+    uniq     = sorted(set(res_names))
+    type_map = {nm: i for i, nm in enumerate(uniq)}
+    res_type  = torch.tensor([type_map[nm] for nm in res_names], dtype=torch.long)
+    chain_id  = torch.tensor(chain_ids, dtype=torch.long)
+    res_index = torch.arange(len(bead_indices), dtype=torch.long)
+    gly_mask  = torch.tensor(is_gly, dtype=torch.bool)
+
+    return {"t": coords, "res_type": res_type, "chain_id": chain_id,
+            "res_index": res_index, "n_types": len(uniq),
+            "gly_mask": gly_mask, "mode": "2bead"}
+
+
 def load_frames_4bead(traj_path, top_path):
     """Load trajectory and extract N, CA, C, CB per residue.
 
@@ -203,8 +266,10 @@ def compute_frame_weights(frames, n_pca=3, bins=30, density_clip=10.0):
         weights: [F] float32 tensor, mean = 1.0.
     """
     ca = frames["t"].float()
-    if ca.ndim == 4:           # [F, P, 4, 3] — use CA atoms (index 1)
-        ca = ca[:, :, 1, :]
+    if ca.ndim == 4:
+        mode = frames.get("mode", "4bead")
+        ca_idx = 0 if mode == "2bead" else 1   # 2bead: CA=0; 4bead: CA=1
+        ca = ca[:, :, ca_idx, :]
     F, N, _ = ca.shape
     ca_flat = ca.reshape(F, -1)       # [F, N*3]
     ca_flat = ca_flat - ca_flat.mean(0, keepdim=True)

@@ -101,15 +101,21 @@ def main():
     res_names = ["ALA"] * P   # placeholder
 
     if mode == "4bead":
-        beads_init = x_init_c                          # [P, 4, 3]
-        delta_4b   = delta.reshape(args.K, P, 4, 3)   # [K, P, 4, 3]
-        model_out  = beads_init.unsqueeze(0) + delta_4b
+        delta_nb  = delta.reshape(args.K, P, 4, 3)
+        model_out = x_init_c.unsqueeze(0) + delta_nb   # [K, P, 4, 3]
         for k in range(args.K):
             dec.write_4bead_pdb(model_out[k], res_names,
                                 os.path.join(args.out, f"future_{k}.pdb"),
                                 gly_mask=gly_mask)
+    elif mode == "2bead":
+        delta_nb  = delta.reshape(args.K, P, 2, 3)
+        model_out = x_init_c.unsqueeze(0) + delta_nb   # [K, P, 2, 3]
+        for k in range(args.K):
+            dec.write_2bead_pdb(model_out[k], res_names,
+                                os.path.join(args.out, f"future_{k}.pdb"),
+                                gly_mask=gly_mask)
     else:
-        ca_model = x_init_c.unsqueeze(0) + delta      # [K, P, 3]
+        ca_model  = x_init_c.unsqueeze(0) + delta      # [K, P, 3]
         model_out = ca_model
         for k in range(args.K):
             dec.write_ca_pdb(model_out[k], res_names,

@@ -632,6 +632,175 @@ def minimize_energy(ca, bond_target=3.8, clash_dist=3.0,
     return x.detach().to(ca.dtype)
 
 
+# ---------------------------------------------------------------------------
+# 2-bead (CA + CB) physical validity and energy minimization
+# ---------------------------------------------------------------------------
+
+_2B_CACB_RANGE  = (1.38, 1.68)   # Å — CA-CB covalent bond
+_2B_CACA_RANGE  = (3.5,  4.2)    # Å — consecutive CA pseudo-bond
+_2B_CLASH_DIST  = 2.5            # Å — minimum non-bonded heavy-atom distance
+_2B_CACB_TARGET = 1.521          # Å — ideal CA-CB
+_2B_CACA_TARGET = 3.8            # Å — ideal consecutive CA-CA
+
+
+def check_2bead_conformation(beads, gly_mask=None):
+    """Check whether a 2-bead (CA, CB) conformation is physically meaningful.
+
+    Checks:
+        CA-CA consecutive pseudo-bonds (3.5–4.2 Å)
+        CA-CB covalent bonds (1.38–1.68 Å; skipped for Gly)
+        Non-bonded steric clashes (< 2.5 Å)
+        Rg vs Flory scaling
+
+    Args:
+        beads    : [P, 2, 3] — order (CA, CB)
+        gly_mask : optional bool [P], True for Glycine
+    """
+    P      = beads.shape[0]
+    device = beads.device
+    CA, CB = beads[:, 0], beads[:, 1]
+    r      = torch.arange(P, device=device)
+
+    bond_violations = []
+
+    def _chk(a, b, name, lo, hi, ra, rb):
+        d = (b - a).norm(dim=-1)
+        bad = ((d < lo) | (d > hi)).nonzero(as_tuple=False).squeeze(1)
+        for k in bad:
+            bond_violations.append((int(ra[k]), int(rb[k]), name, round(d[k].item(), 3)))
+
+    _chk(CA[:-1], CA[1:], "CA-CA", *_2B_CACA_RANGE, r[:-1], r[1:])
+    if gly_mask is None:
+        _chk(CA, CB, "CA-CB", *_2B_CACB_RANGE, r, r)
+    else:
+        not_gly = ~gly_mask
+        _chk(CA[not_gly], CB[not_gly], "CA-CB", *_2B_CACB_RANGE,
+             r[not_gly], r[not_gly])
+    bond_ok = len(bond_violations) == 0
+
+    # Clashes over flat [2P, 3] excluding bonded pairs
+    n_atoms = P * 2
+    flat = beads.reshape(n_atoms, 3)
+
+    bi_list, bj_list = [], []
+    for res in range(P):
+        bi_list.append(res * 2);     bj_list.append(res * 2 + 1)   # CA-CB (intra)
+    if gly_mask is not None:
+        pairs_filtered = [(i, j) for i, j in zip(bi_list, bj_list)
+                          if not (j == i + 1 and gly_mask[i // 2])]
+        bi_list = [p[0] for p in pairs_filtered]
+        bj_list = [p[1] for p in pairs_filtered]
+
+    bonded_adj = torch.zeros(n_atoms, n_atoms, dtype=torch.bool, device=device)
+    if bi_list:
+        bi_t = torch.tensor(bi_list, device=device)
+        bj_t = torch.tensor(bj_list, device=device)
+        bonded_adj[bi_t, bj_t] = True
+        bonded_adj[bj_t, bi_t] = True
+    # Consecutive CA-CA are pseudo-bonds — don't mark as bonded (allow clash check)
+
+    ii, jj = torch.triu_indices(n_atoms, n_atoms, offset=1, device=device)
+    nb_mask  = ~bonded_adj[ii, jj]
+    nb_i, nb_j = ii[nb_mask], jj[nb_mask]
+    dists_nb = (flat[nb_i] - flat[nb_j]).norm(dim=-1)
+    clash_mask = dists_nb < _2B_CLASH_DIST
+    clashes = [
+        (int(nb_i[k]), int(nb_j[k]), round(dists_nb[k].item(), 3))
+        for k in clash_mask.nonzero(as_tuple=False).squeeze(1)
+    ]
+    clash_free = len(clashes) == 0
+
+    centroid  = CA.mean(0)
+    rg        = ((CA - centroid).pow(2).sum(-1).mean()).sqrt().item()
+    rg_expect = 2.2 * (P ** 0.38)
+    rg_ok     = (0.5 * rg_expect) <= rg <= (2.0 * rg_expect)
+
+    return {
+        "valid":             bond_ok and clash_free and rg_ok,
+        "bond_ok":           bond_ok,
+        "clash_free":        clash_free,
+        "rg_ok":             rg_ok,
+        "n_bond_violations": len(bond_violations),
+        "n_clashes":         len(clashes),
+        "bond_violations":   bond_violations,
+        "clashes":           clashes,
+        "rg_A":              round(rg, 3),
+        "rg_expected_A":     round(rg_expect, 3),
+    }
+
+
+def _build_2bead_bond_tensors(P, gly_mask, device):
+    """Pre-build bond + non-bonded index tensors for a P-residue 2-bead system."""
+    bi, bj, bt = [], [], []
+    for r in range(P):
+        bi.append(r * 2);     bj.append(r * 2 + 1); bt.append(_2B_CACB_TARGET)   # CA-CB
+        if r < P - 1:
+            bi.append(r * 2); bj.append((r + 1) * 2); bt.append(_2B_CACA_TARGET) # CA-CA
+    if gly_mask is not None:
+        keep = [(i, j, t) for i, j, t in zip(bi, bj, bt)
+                if not (j == i + 1 and gly_mask[i // 2])]
+        bi, bj, bt = (zip(*keep) if keep else ([], [], []))
+
+    bond_i = torch.tensor(bi, dtype=torch.long,    device=device)
+    bond_j = torch.tensor(bj, dtype=torch.long,    device=device)
+    bond_t = torch.tensor(bt, dtype=torch.float32, device=device)
+
+    n = P * 2
+    adj = torch.zeros(n, n, dtype=torch.bool, device=device)
+    if len(bi):
+        adj[bond_i, bond_j] = True
+        adj[bond_j, bond_i] = True
+    ii, jj = torch.triu_indices(n, n, offset=1, device=device)
+    nb_mask = ~adj[ii, jj]
+    return bond_i, bond_j, bond_t, ii[nb_mask], jj[nb_mask]
+
+
+def minimize_energy_2bead(beads, gly_mask=None,
+                           k_bond=10.0, k_clash=5.0, n_steps=100,
+                           clash_dist=_2B_CLASH_DIST,
+                           _cache={}):
+    """L-BFGS energy minimization for a 2-bead (CA, CB) conformation.
+
+    Args:
+        beads      : [P, 2, 3] in order (CA, CB)
+        gly_mask   : bool [P], True for Glycine
+        k_bond     : bond spring constant
+        k_clash    : clash penalty weight (default 5.0 — stronger than 4-bead default)
+        n_steps    : max L-BFGS iterations
+        clash_dist : minimum non-bonded distance in Å
+
+    Returns:
+        [P, 2, 3] minimized bead coordinates
+    """
+    P      = beads.shape[0]
+    device = beads.device
+    gly_key   = tuple(gly_mask.tolist()) if gly_mask is not None else None
+    cache_key = (P, gly_key, str(device))
+    if cache_key not in _cache:
+        _cache[cache_key] = _build_2bead_bond_tensors(P, gly_mask, device)
+    bond_i, bond_j, bond_t, nb_i, nb_j = _cache[cache_key]
+
+    n_atoms = P * 2
+    x = beads.detach().clone().float().reshape(n_atoms, 3)
+    x.requires_grad_(True)
+
+    opt = torch.optim.LBFGS([x], lr=1.0, max_iter=n_steps,
+                             line_search_fn="strong_wolfe")
+
+    def closure():
+        opt.zero_grad()
+        b_dist  = (x[bond_j] - x[bond_i]).norm(dim=-1)
+        e_bond  = k_bond  * ((b_dist - bond_t) ** 2).sum()
+        nb_dist = (x[nb_i] - x[nb_j]).norm(dim=-1)
+        e_clash = k_clash * torch.clamp(clash_dist - nb_dist, min=0.0).pow(2).sum()
+        loss = e_bond + e_clash
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    return x.detach().reshape(P, 2, 3).to(beads.dtype)
+
+
 def minimize_energy_4bead(beads, gly_mask=None, bond_target=None,
                            k_bond=10.0, k_clash=1.0, n_steps=100,
                            clash_dist=2.0,

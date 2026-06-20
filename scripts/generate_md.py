@@ -55,23 +55,36 @@ from lsmd import geometry as g
 def write_trajectory_pdb(frames_list, res_names, path, gly_mask=None):
     """Write a list of conformation tensors as a multi-MODEL PDB.
 
-    frames_list : list of tensors, each [P,3] (CA) or [P,4,3] (4-bead)
+    frames_list : list of tensors — [P,3] (CA), [P,2,3] (2-bead), or [P,4,3] (4-bead)
     res_names   : list of P residue name strings
-    gly_mask    : optional bool [P] for 4-bead mode (skip CB for Gly)
+    gly_mask    : optional bool [P] — skip CB for Gly residues in multi-bead modes
     path        : output file path
     """
     from lsmd import decoder as dec_mod
     lines = []
     for model_idx, frame in enumerate(frames_list, start=1):
         lines.append(f"MODEL     {model_idx:4d}")
-        if frame.ndim == 2:          # CA-only [P, 3]
+        if frame.ndim == 2:              # CA-only [P, 3]
             for ri in range(frame.shape[0]):
                 x, y, z = frame[ri].tolist()
                 lines.append(
                     f"ATOM  {ri + 1:5d}  CA  {res_names[ri]:>3s} A{ri + 1:4d}    "
                     f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C"
                 )
-        else:                        # 4-bead [P, 4, 3]
+        elif frame.shape[1] == 2:        # 2-bead [P, 2, 3]
+            serial = 1
+            for ri in range(frame.shape[0]):
+                for ai, (aname, elem) in enumerate(
+                        zip(dec_mod._2BEAD_ATOM_NAMES, dec_mod._2BEAD_ELEMENTS)):
+                    if ai == 1 and gly_mask is not None and gly_mask[ri]:
+                        continue
+                    x, y, z = frame[ri, ai].tolist()
+                    lines.append(
+                        f"ATOM  {serial:5d} {aname} {res_names[ri]:>3s} A{ri + 1:4d}    "
+                        f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           {elem}"
+                    )
+                    serial += 1
+        else:                            # 4-bead [P, 4, 3]
             serial = 1
             for ri in range(frame.shape[0]):
                 for ai, (aname, elem) in enumerate(
@@ -134,44 +147,49 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
                 steps=diff_steps, eta=eta, sigma_init=sigma_init,
             )[0]
 
-            if mode == "4bead":
-                delta = raw.reshape(x.shape[0], 4, 3)   # [P, 4, 3]
+            n_beads = {"4bead": 4, "2bead": 2}.get(mode, 1)
+            if n_beads > 1:
+                delta = raw.reshape(x.shape[0], n_beads, 3)
             else:
                 delta = raw                              # [P, 3]
 
             # Advance
             x = x + delta
 
-            # Geometry correction (applied before re-alignment)
+            # Geometry correction
             if min_energy:
                 if mode == "4bead":
                     x = val.minimize_energy_4bead(x, gly_mask=gly_mask,
+                                                  k_bond=k_bond, k_clash=k_clash,
+                                                  n_steps=min_steps)
+                elif mode == "2bead":
+                    x = val.minimize_energy_2bead(x, gly_mask=gly_mask,
                                                   k_bond=k_bond, k_clash=k_clash,
                                                   n_steps=min_steps)
                 else:
                     x = val.minimize_energy(x, bond_target=bond_target,
                                             k_bond=k_bond, k_clash=k_clash,
                                             n_steps=min_steps)
-            elif bond_correction:
-                if mode == "ca":
-                    ca_x = x.clone()
-                    for _ in range(bond_iters):
-                        vecs  = ca_x[1:] - ca_x[:-1]
-                        dists = vecs.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-                        corr  = vecs * (1.0 - bond_target / dists) * 0.5
-                        ca_x[:-1] = ca_x[:-1] + corr
-                        ca_x[1:]  = ca_x[1:]  - corr
-                    x = ca_x
+            elif bond_correction and mode == "ca":
+                ca_x = x.clone()
+                for _ in range(bond_iters):
+                    vecs  = ca_x[1:] - ca_x[:-1]
+                    dists = vecs.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                    corr  = vecs * (1.0 - bond_target / dists) * 0.5
+                    ca_x[:-1] = ca_x[:-1] + corr
+                    ca_x[1:]  = ca_x[1:]  - corr
+                x = ca_x
 
             # Kabsch re-align onto reference frame using CA positions
-            if mode == "4bead":
-                ca_x     = x[:, 1, :]           # [P, 3]
-                ca_ref   = x_ref_dev[:, 1, :]
+            ca_idx = {"4bead": 1, "2bead": 0}.get(mode, None)
+            P_res  = x.shape[0]
+            if ca_idx is not None:
+                ca_x     = x[:, ca_idx, :]
+                ca_ref   = x_ref_dev[:, ca_idx, :]
                 R, t_vec = g.kabsch(ca_ref, ca_x)
-                P_res    = x.shape[0]
-                x_flat   = x.reshape(P_res * 4, 3)
+                x_flat   = x.reshape(P_res * n_beads, 3)
                 x_flat   = x_flat @ R.transpose(-1, -2) + t_vec.unsqueeze(0)
-                x        = x_flat.reshape(P_res, 4, 3)
+                x        = x_flat.reshape(P_res, n_beads, 3)
             else:
                 R, t_vec = g.kabsch(x_ref_dev, x)
                 x = x @ R.transpose(-1, -2) + t_vec.unsqueeze(-2).squeeze(0)
@@ -186,6 +204,8 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
             # Physical validity check
             if mode == "4bead":
                 check = val.check_4bead_conformation(x_cpu, gly_mask=gly_mask)
+            elif mode == "2bead":
+                check = val.check_2bead_conformation(x_cpu, gly_mask=gly_mask)
             else:
                 check = val.check_conformation(x_cpu)
             validity.append(check)
@@ -207,9 +227,11 @@ def compute_metrics(trajectories, validity_all, tau, ps_per_frame=200):
     n_steps  = len(trajectories[0]) - 1
     ps_step  = tau * ps_per_frame
 
-    # Helper: extract CA positions regardless of bead mode
+    # Extract CA regardless of bead mode: 2bead→index 0, 4bead→index 1, ca→as-is
     def _ca(frame):
-        return frame[:, 1, :] if frame.ndim == 3 else frame   # [P,4,3]→[P,3] or [P,3]
+        if frame.ndim == 2:    return frame           # CA-only [P, 3]
+        if frame.shape[1] == 2: return frame[:, 0, :] # 2-bead [P, 2, 3]
+        return frame[:, 1, :]                         # 4-bead [P, 4, 3]
 
     # RMSD from start per step, per chain (CA-based)
     rmsd_chains = []
@@ -373,8 +395,10 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     res_names = ["ALA"] * P
-    if mode == "4bead":
-        print(f"  Mode           : 4-bead (N, CA, C, CB)  point_dim=12")
+    mode_labels = {"4bead": "4-bead (N, CA, C, CB)  point_dim=12",
+                   "2bead": "2-bead (CA, CB)         point_dim=6",
+                   "ca":    "1-bead (CA only)        point_dim=3"}
+    print(f"  Mode           : {mode_labels.get(mode, mode)}")
 
     # Run chains
     all_trajs     = []
@@ -404,7 +428,10 @@ def main():
         all_validity.append(validity)
         all_times.extend(step_times)
 
-        def _ca_f(f): return f[:, 1, :] if f.ndim == 3 else f
+        def _ca_f(f):
+            if f.ndim == 2:     return f
+            if f.shape[1] == 2: return f[:, 0, :]
+            return f[:, 1, :]
         final_rmsd = (_ca_f(traj[-1]) - _ca_f(traj[0])).norm(dim=-1).pow(2).mean().sqrt().item()
         n_valid = sum(1 for c in validity if c["valid"])
         print(f"  Done. Mean disp/step: {sum(disps)/len(disps):.3f} Å  "

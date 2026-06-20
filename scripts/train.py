@@ -29,6 +29,8 @@ def build_ctx(frames, k, device):
     X0   = frames["t"][0]
     if mode == "4bead":
         edge_index, edge_feats = f.four_bead_graph(X0, k=k)
+    elif mode == "2bead":
+        edge_index, edge_feats = f.two_bead_graph(X0, k=k)
     else:
         edge_index, edge_feats = f.ca_graph(X0, k=k)
     node_feats = f.node_features(
@@ -42,7 +44,7 @@ def train(frames, taus, epochs, k, hidden, layers, lr,
           clip, batch_size, T_diff, sigma_aug, density_clip, device):
 
     mode = frames.get("mode", "ca")
-    point_dim = 12 if mode == "4bead" else 3
+    point_dim = {"4bead": 12, "2bead": 6}.get(mode, 3)
 
     pairs = data.make_multi_lag_pairs(frames["t"].shape[0], taus)
     train_pairs, _ = data.time_split(pairs, val_frac=0.2)
@@ -82,6 +84,8 @@ def train(frames, taus, epochs, k, hidden, layers, lr,
 
             if mode == "4bead":
                 u_batch = f.four_bead_displacement(X_all[batch[:, 0]], X_all[batch[:, 1]])
+            elif mode == "2bead":
+                u_batch = f.two_bead_displacement(X_all[batch[:, 0]], X_all[batch[:, 1]])
             else:
                 u_batch = f.ca_displacement(X_all[batch[:, 0]], X_all[batch[:, 1]])
 
@@ -138,7 +142,7 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     mode      = frames.get("mode", "ca")
-    point_dim = 12 if mode == "4bead" else 3
+    point_dim = {"4bead": 12, "2bead": 6}.get(mode, 3)
     checkpoint = {
         "net_state":      net.state_dict(),
         "schedule_state": schedule.state_dict(),

@@ -135,8 +135,37 @@ def write_pdb(atoms, res_type_names, path):
         fh.write("\n".join(lines) + "\n")
 
 
+_2BEAD_ATOM_NAMES = [" CA ", " CB "]
+_2BEAD_ELEMENTS   = ["C",    "C"  ]
+
 _4BEAD_ATOM_NAMES = [" N  ", " CA ", " C  ", " CB "]
 _4BEAD_ELEMENTS   = ["N",    "C",    "C",    "C"  ]
+
+
+def write_2bead_pdb(beads, res_type_names, path, gly_mask=None):
+    """Write a 2-bead (CA, CB) trace to a PDB file.
+
+    Args:
+        beads:          [P, 2, 3] bead coordinates in Å, order (CA, CB)
+        res_type_names: list of P residue name strings
+        path:           output file path
+        gly_mask:       optional bool tensor [P]; if True, CB is omitted (Glycine)
+    """
+    lines  = []
+    serial = 1
+    for ri in range(beads.shape[0]):
+        for ai, (aname, elem) in enumerate(zip(_2BEAD_ATOM_NAMES, _2BEAD_ELEMENTS)):
+            if ai == 1 and gly_mask is not None and gly_mask[ri]:
+                continue
+            x, y, z = beads[ri, ai].tolist()
+            lines.append(
+                f"ATOM  {serial:5d} {aname} {res_type_names[ri]:>3s} A{ri + 1:4d}    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           {elem}"
+            )
+            serial += 1
+    lines.append("END")
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
 
 
 def write_4bead_pdb(beads, res_type_names, path, gly_mask=None):

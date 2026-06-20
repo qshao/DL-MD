@@ -27,8 +27,8 @@ def main():
     ap.add_argument("--traj",  required=True, help="Trajectory file (TRR, DCD, XTC, …)")
     ap.add_argument("--top",   required=True, help="Topology file (GRO, PDB, …)")
     ap.add_argument("--out",   default="data/frames.pt", help="Output .pt file path")
-    ap.add_argument("--atoms", choices=["ca", "4bead"], default="4bead",
-                    help="Bead representation: 'ca' (1 bead/res) or '4bead' (N,CA,C,CB)")
+    ap.add_argument("--atoms", choices=["ca", "2bead", "4bead"], default="4bead",
+                    help="Bead representation: 'ca' (1 bead), '2bead' (CA+CB), '4bead' (N,CA,C,CB)")
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
@@ -43,7 +43,14 @@ def main():
         n_gly = int(frames["gly_mask"].sum())
         print(f"Frames: {F}   Residues: {P}   Gly (no CB): {n_gly}   "
               f"Residue types: {frames['n_types']}")
-        ca = frames["t"][:, :, 1, :]   # CA for range stats
+        ca = frames["t"][:, :, 1, :]   # CA at index 1 for 4-bead
+    elif args.atoms == "2bead":
+        frames = data.load_frames_2bead(args.traj, args.top)
+        F, P = frames["t"].shape[:2]
+        n_gly = int(frames["gly_mask"].sum())
+        print(f"Frames: {F}   Residues: {P}   Gly (no CB): {n_gly}   "
+              f"Residue types: {frames['n_types']}")
+        ca = frames["t"][:, :, 0, :]   # CA at index 0 for 2-bead
     else:
         frames = data.load_frames(args.traj, args.top)
         F, P = frames["t"].shape[:2]
