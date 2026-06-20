@@ -127,8 +127,7 @@ def run_demo(traj_path, top_path, taus, infer_tau, out_dir, K=8, epochs=50,
         device:     torch device (auto-detected if None)
 
     Returns:
-        dict with keys: model_geometry, diversity, ensemble_overlap_vs_true,
-                        n_residues, taus, infer_tau
+        dict with keys: model_geometry, diversity, n_residues, taus, infer_tau
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -165,13 +164,9 @@ def run_demo(traj_path, top_path, taus, infer_tau, out_dir, K=8, epochs=50,
         dec.write_pdb(atoms, res_names, os.path.join(out_dir, f"future_{kk}.pdb"))
     atoms_K = torch.stack(atoms_K, 0)  # [K, N, 4, 3]
 
-    # True future: frame j0 is exactly infer_tau steps ahead of i0
-    md_ca = frames["t"][j0]  # [N, 3] on CPU
-
     report = {
         "model_geometry": val.geometry_metrics(atoms_K[0]),
         "diversity": val.diversity(atoms_K),
-        "ensemble_overlap_vs_true": val.ensemble_overlap(atoms_K[0][:, 1, :], md_ca),
         "n_residues": frames["R"].shape[1],
         "taus": taus,
         "infer_tau": infer_tau,
