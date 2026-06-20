@@ -1,3 +1,4 @@
+import datetime
 import math
 import torch
 from lsmd import decoder as dec
@@ -412,3 +413,178 @@ def displacement_js(disp_model, disp_md, bins=30):
         "model_mean": disp_model.mean().item(),
         "md_mean": disp_md.mean().item(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Physical validity check
+# ---------------------------------------------------------------------------
+
+def check_conformation(ca,
+                       bond_lo=3.5, bond_hi=4.2,
+                       clash_dist=3.0,
+                       rg_lo_factor=0.5, rg_hi_factor=2.0):
+    """Check whether a CA conformation is physically meaningful.
+
+    Three independent criteria:
+
+    1. **Bond lengths** — every consecutive CA-CA distance must lie in
+       [bond_lo, bond_hi] Å (default 3.5–4.2 Å; ideal ≈ 3.8 Å).
+    2. **Steric clashes** — no non-adjacent CA pair may be closer than
+       clash_dist Å (default 3.0 Å; appropriate for CA-sized pseudo-atoms).
+    3. **Radius of gyration** — Rg must fall in
+       [rg_lo_factor, rg_hi_factor] × Rg_expected, where
+       Rg_expected = 2.2 × P^0.38 Å (Flory scaling for globular proteins).
+
+    Args:
+        ca:            CA coordinates [P, 3] in Angstrom.
+        bond_lo:       Lower CA-CA bond length threshold (Å).
+        bond_hi:       Upper CA-CA bond length threshold (Å).
+        clash_dist:    CA-CA non-bonded clash distance (Å).
+        rg_lo_factor:  Lower Rg multiplier relative to expected.
+        rg_hi_factor:  Upper Rg multiplier relative to expected.
+
+    Returns:
+        dict with keys:
+            valid             bool  — passes ALL three checks
+            bond_ok           bool
+            clash_free        bool
+            rg_ok             bool
+            n_bond_violations int   — number of bonds outside [bond_lo, bond_hi]
+            n_clashes         int   — number of non-bonded CA pairs < clash_dist
+            bond_violations   list  — [(i, j, dist_A), ...]
+            clashes           list  — [(i, j, dist_A), ...]
+            bond_mean_A       float
+            bond_min_A        float
+            bond_max_A        float
+            rg_A              float — actual radius of gyration
+            rg_expected_A     float — Flory-scaling expected Rg
+    """
+    P = ca.shape[0]
+
+    # --- 1. CA-CA bond lengths ---
+    bonds = (ca[1:] - ca[:-1]).norm(dim=-1)            # [P-1]
+    bad_mask = (bonds < bond_lo) | (bonds > bond_hi)
+    bad_idx = bad_mask.nonzero(as_tuple=False).squeeze(1)
+    bond_violations = [
+        (int(i), int(i) + 1, round(bonds[i].item(), 3)) for i in bad_idx
+    ]
+    bond_ok = len(bond_violations) == 0
+
+    # --- 2. Steric clashes (non-adjacent CA pairs) ---
+    d = torch.cdist(ca.unsqueeze(0), ca.unsqueeze(0))[0]   # [P, P]
+    non_bonded = ~torch.eye(P, dtype=torch.bool, device=ca.device)
+    adj = torch.arange(P - 1, device=ca.device)
+    non_bonded[adj, adj + 1] = False
+    non_bonded[adj + 1, adj] = False
+    clash_mat = (d < clash_dist) & non_bonded
+    clash_ij = clash_mat.triu(diagonal=1).nonzero(as_tuple=False)
+    clashes = [
+        (int(r[0]), int(r[1]), round(d[r[0], r[1]].item(), 3))
+        for r in clash_ij
+    ]
+    clash_free = len(clashes) == 0
+
+    # --- 3. Radius of gyration ---
+    centroid = ca.mean(0)
+    rg = ((ca - centroid).pow(2).sum(-1).mean()).sqrt().item()
+    rg_expected = 2.2 * (P ** 0.38)
+    rg_ok = (rg_lo_factor * rg_expected) <= rg <= (rg_hi_factor * rg_expected)
+
+    return {
+        "valid":             bond_ok and clash_free and rg_ok,
+        "bond_ok":           bond_ok,
+        "clash_free":        clash_free,
+        "rg_ok":             rg_ok,
+        "n_bond_violations": len(bond_violations),
+        "n_clashes":         len(clashes),
+        "bond_violations":   bond_violations,
+        "clashes":           clashes,
+        "bond_mean_A":       round(bonds.mean().item(), 3),
+        "bond_min_A":        round(bonds.min().item(), 3),
+        "bond_max_A":        round(bonds.max().item(), 3),
+        "rg_A":              round(rg, 3),
+        "rg_expected_A":     round(rg_expected, 3),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Timing report
+# ---------------------------------------------------------------------------
+
+def timing_report(tau, time_per_step_s, out_path,
+                  target_ns=1000, ps_per_frame=200,
+                  md_ns_per_day=100, md_step_fs=2):
+    """Estimate wall-clock time to simulate target_ns using generative MD and
+    write a human-readable timing report to out_path.
+
+    Args:
+        tau:              Lag per generative step (trajectory frames).
+        time_per_step_s:  Measured wall-clock seconds per DDPM sampling call.
+        out_path:         File path for the written report.
+        target_ns:        Target simulation duration in ns (default 1000).
+        ps_per_frame:     Trajectory save interval in ps (default 200).
+        md_ns_per_day:    Typical GPU classical MD throughput (ns/day).
+        md_step_fs:       Classical MD integration step in fs (default 2).
+
+    Returns:
+        dict with the same key/value pairs written to the report file.
+    """
+    ps_per_step    = tau * ps_per_frame
+    ns_per_step    = ps_per_step / 1000.0
+    steps_needed   = math.ceil(target_ns / ns_per_step)
+    total_s        = steps_needed * time_per_step_s
+    total_min      = total_s / 60
+    total_h        = total_s / 3600
+
+    md_steps       = int(target_ns * 1e6 / md_step_fs)   # ns → fs → steps
+    md_days        = target_ns / md_ns_per_day
+    md_hours       = md_days * 24
+    speedup        = (md_days * 86400) / max(total_s, 1e-9)
+
+    result = {
+        "target_ns":          target_ns,
+        "tau_frames":         tau,
+        "ps_per_step":        ps_per_step,
+        "ns_per_step":        ns_per_step,
+        "steps_needed":       steps_needed,
+        "time_per_step_s":    round(time_per_step_s, 4),
+        "total_s":            round(total_s, 2),
+        "total_min":          round(total_min, 2),
+        "total_h":            round(total_h, 4),
+        "md_step_fs":         md_step_fs,
+        "md_steps":           md_steps,
+        "md_days":            round(md_days, 1),
+        "md_hours":           round(md_hours, 1),
+        "speedup_vs_classical_md": round(speedup, 0),
+    }
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "Generative MD Timing Report",
+        "=" * 52,
+        f"Generated : {now}",
+        f"Target    : {target_ns} ns",
+        "",
+        "── Generative MD (this model) ─────────────────────",
+        f"  τ per step           : {tau} frames = {ps_per_step} ps = {ns_per_step:.2f} ns",
+        f"  Steps required       : {steps_needed:,}",
+        f"  Time per step        : {time_per_step_s:.4f} s  (measured)",
+        f"  Total wall-clock     : {total_s:.1f} s"
+                                f"  /  {total_min:.1f} min"
+                                f"  /  {total_h:.2f} h",
+        "",
+        "── Classical MD (reference GPU estimate) ───────────",
+        f"  Integration step     : {md_step_fs} fs",
+        f"  Steps required       : {md_steps:,}",
+        f"  Typical throughput   : ~{md_ns_per_day} ns/day on GPU",
+        f"  Total wall-clock     : ~{md_days:.0f} days  /  ~{md_hours:.0f} h",
+        "",
+        "── Speedup ─────────────────────────────────────────",
+        f"  Generative MD vs classical MD : {speedup:.0f}×  faster",
+        "=" * 52,
+    ]
+
+    with open(out_path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+    return result

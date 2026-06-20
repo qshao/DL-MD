@@ -1,3 +1,4 @@
+import math
 import torch
 import pytest
 from lsmd import geometry as g
@@ -171,3 +172,84 @@ def test_recall_accepts_ca_pointcloud():
     ca = torch.randn(5, 12, 3)
     assert val.ensemble_recall(ca, ca, r_ang=0.01) == 1.0
     assert val.ensemble_novelty(ca, ca, r_ang=0.01) == 0.0
+
+
+# ── check_conformation ────────────────────────────────────────────────────────
+
+def _helix_chain(n=20):
+    """Alpha-helix CA positions — compact, valid bonds ~3.82 Å, passes Rg check."""
+    r, rise, twist = 2.3, 1.5, math.radians(100.0)
+    ca = torch.zeros(n, 3)
+    for i in range(n):
+        ca[i, 0] = r * math.cos(i * twist)
+        ca[i, 1] = r * math.sin(i * twist)
+        ca[i, 2] = rise * i
+    return ca
+
+
+def _linear_chain(n=10):
+    """Straight CA chain with 3.8 Å spacing — valid bonds, no clashes."""
+    ca = torch.zeros(n, 3)
+    ca[:, 0] = torch.arange(n, dtype=torch.float32) * 3.8
+    return ca
+
+
+def test_check_conformation_valid_chain():
+    ca = _helix_chain(20)
+    out = val.check_conformation(ca)
+    assert out["valid"] is True
+    assert out["bond_ok"] is True
+    assert out["clash_free"] is True
+    assert out["rg_ok"] is True
+    assert out["n_bond_violations"] == 0
+    assert out["n_clashes"] == 0
+
+
+def test_check_conformation_bond_violation():
+    ca = _linear_chain(10)
+    ca[5, 0] = ca[4, 0] + 10.0   # stretch bond 4→5 to 10 Å
+    out = val.check_conformation(ca)
+    assert not out["bond_ok"]
+    assert out["n_bond_violations"] >= 1
+    bond_pairs = [(i, j) for i, j, _ in out["bond_violations"]]
+    assert (4, 5) in bond_pairs
+
+
+def test_check_conformation_clash():
+    ca = _linear_chain(10)
+    ca[8] = ca[0].clone()   # move residue 8 onto residue 0 → clash
+    out = val.check_conformation(ca)
+    assert not out["clash_free"]
+    assert out["n_clashes"] >= 1
+
+
+def test_check_conformation_keys():
+    out = val.check_conformation(_helix_chain(15))
+    expected = {
+        "valid", "bond_ok", "clash_free", "rg_ok",
+        "n_bond_violations", "n_clashes",
+        "bond_violations", "clashes",
+        "bond_mean_A", "bond_min_A", "bond_max_A",
+        "rg_A", "rg_expected_A",
+    }
+    assert set(out.keys()) == expected
+
+
+# ── timing_report ─────────────────────────────────────────────────────────────
+
+def test_timing_report_writes_file(tmp_path):
+    out = tmp_path / "timing.txt"
+    result = val.timing_report(tau=5, time_per_step_s=0.5, out_path=str(out))
+    assert out.exists()
+    text = out.read_text()
+    assert "1000 ns" in text
+    assert "Speedup" in text
+    assert result["steps_needed"] == 1000      # 1000 ns / (5×200ps/step = 1 ns/step)
+    assert abs(result["total_s"] - 500.0) < 1e-6
+
+
+def test_timing_report_speedup_positive():
+    result = val.timing_report(tau=1, time_per_step_s=0.3,
+                               out_path="/dev/null", target_ns=100)
+    assert result["speedup_vs_classical_md"] > 0
+    assert result["steps_needed"] == 500       # 100 ns / 0.2 ns/step

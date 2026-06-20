@@ -42,6 +42,7 @@ import argparse
 import json
 import math
 import os
+import time
 import torch
 from lsmd import data, model as m, decoder as dec, validation as val
 from lsmd import geometry as g
@@ -85,20 +86,27 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
       1. Sample displacement Δ ~ DDPM(τ)
       2. Advance: x ← x + Δ
       3. Kabsch-realign x onto x_ref to prevent orientation drift
+      4. Check physical validity with val.check_conformation
 
     Returns
     -------
-    trajectory : list of n_steps+1 tensors [P,3] on CPU (step 0 = start)
+    trajectory    : list of n_steps+1 tensors [P,3] on CPU (step 0 = start)
     displacements : list of n_steps floats — mean per-atom ‖Δ‖ per step
+    validity      : list of n_steps dicts from val.check_conformation
+    step_times    : list of n_steps floats — wall-clock seconds per step
     """
     x = x_start.to(device).clone()
     x_ref_dev = x_ref.to(device)
     trajectory = [x.cpu()]
     displacements = []
+    validity = []
+    step_times = []
 
     net.eval()
     with torch.no_grad():
         for step in range(n_steps):
+            t0 = time.perf_counter()
+
             # Sample one displacement
             delta = m.sample_ddpm(
                 net, node_feats, edge_index, edge_feats,
@@ -115,39 +123,43 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
             R, t = g.kabsch(x_ref_dev, x)                # aligns x onto x_ref
             x = x @ R.transpose(-1, -2) + t.unsqueeze(-2).squeeze(0)
 
-            trajectory.append(x.cpu())
+            step_times.append(time.perf_counter() - t0)
+
+            x_cpu = x.cpu()
+            trajectory.append(x_cpu)
             disp = delta.norm(dim=-1).pow(2).mean().sqrt().item()
             displacements.append(disp)
 
-    return trajectory, displacements
+            # Physical validity check on the generated conformation
+            check = val.check_conformation(x_cpu)
+            validity.append(check)
+
+    return trajectory, displacements, validity, step_times
 
 
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
 
-def compute_metrics(trajectories, tau, ps_per_frame=200):
+def compute_metrics(trajectories, validity_all, tau, ps_per_frame=200):
     """Compute per-step and aggregate metrics over one or more chains.
 
-    trajectories : list of chains, each a list of [P,3] tensors (step 0 = start)
+    trajectories  : list of chains, each a list of [P,3] tensors (step 0 = start)
+    validity_all  : list of chains, each a list of check_conformation dicts (n_steps each)
     """
     n_chains = len(trajectories)
     n_steps  = len(trajectories[0]) - 1
-    P        = trajectories[0][0].shape[0]
     ps_step  = tau * ps_per_frame
 
     # RMSD from start per step, per chain
     rmsd_chains = []
     for traj in trajectories:
         x0 = traj[0]
-        rmsd_chain = []
-        for step_idx in range(1, len(traj)):
-            diff = traj[step_idx] - x0
-            rmsd = diff.norm(dim=-1).pow(2).mean().sqrt().item()
-            rmsd_chain.append(round(rmsd, 4))
-        rmsd_chains.append(rmsd_chain)
+        rmsd_chains.append([
+            round((traj[s] - x0).norm(dim=-1).pow(2).mean().sqrt().item(), 4)
+            for s in range(1, len(traj))
+        ])
 
-    # Mean RMSD across chains at each step
     mean_rmsd = [
         round(sum(c[s] for c in rmsd_chains) / n_chains, 4)
         for s in range(n_steps)
@@ -156,25 +168,39 @@ def compute_metrics(trajectories, tau, ps_per_frame=200):
     # RMSF over the generated trajectory (all chains pooled)
     all_frames = torch.stack([
         frame for traj in trajectories for frame in traj[1:]
-    ], dim=0)                                              # [n_chains*n_steps, P, 3]
-    mu = all_frames.mean(0)                                # [P,3]
-    rmsf = (all_frames - mu).norm(dim=-1).pow(2).mean(0).sqrt()  # [P]
+    ], dim=0)
+    mu   = all_frames.mean(0)
+    rmsf = (all_frames - mu).norm(dim=-1).pow(2).mean(0).sqrt()
 
-    max_rmsf_res = int(rmsf.argmax().item())
+    # Physical validity summary across all chains × steps
+    all_checks = [c for chain_v in validity_all for c in chain_v]
+    n_total    = len(all_checks)
+    n_valid    = sum(1 for c in all_checks if c["valid"])
+    n_bond_vio = sum(1 for c in all_checks if not c["bond_ok"])
+    n_clash    = sum(1 for c in all_checks if not c["clash_free"])
+    n_rg_vio   = sum(1 for c in all_checks if not c["rg_ok"])
 
     return {
-        "n_chains":            n_chains,
-        "n_steps":             n_steps,
-        "tau":                 tau,
-        "time_per_step_ps":    ps_step,
-        "total_time_ns":       round(n_steps * ps_step / 1000, 2),
-        "timescale_vs_2fs_MD": f"{tau * ps_per_frame * 1000 // 2}x per step",
+        "n_chains":               n_chains,
+        "n_steps":                n_steps,
+        "tau":                    tau,
+        "time_per_step_ps":       ps_step,
+        "total_time_ns":          round(n_steps * ps_step / 1000, 2),
+        "timescale_vs_2fs_MD":    f"{tau * ps_per_frame * 1000 // 2}x per step",
         "mean_rmsd_from_start_A": mean_rmsd,
-        "final_mean_rmsd_A":   mean_rmsd[-1] if mean_rmsd else 0.0,
-        "rmsf_mean_A":         round(rmsf.mean().item(), 4),
-        "rmsf_max_A":          round(rmsf.max().item(), 4),
-        "rmsf_max_residue":    max_rmsf_res,
-        "rmsf_per_residue_A":  [round(v, 4) for v in rmsf.tolist()],
+        "final_mean_rmsd_A":      mean_rmsd[-1] if mean_rmsd else 0.0,
+        "rmsf_mean_A":            round(rmsf.mean().item(), 4),
+        "rmsf_max_A":             round(rmsf.max().item(), 4),
+        "rmsf_max_residue":       int(rmsf.argmax().item()),
+        "rmsf_per_residue_A":     [round(v, 4) for v in rmsf.tolist()],
+        "validity": {
+            "n_steps_checked":    n_total,
+            "n_valid":            n_valid,
+            "valid_fraction":     round(n_valid / max(n_total, 1), 4),
+            "n_bond_violations":  n_bond_vio,
+            "n_clashes":          n_clash,
+            "n_rg_violations":    n_rg_vio,
+        },
     }
 
 
@@ -266,23 +292,28 @@ def main():
     res_names = ["ALA"] * P
 
     # Run chains
-    all_trajs    = []
-    all_disps    = []
-    time_labels  = [f"{i * ps_step / 1000:.2f} ns" for i in range(args.steps + 1)]
+    all_trajs     = []
+    all_disps     = []
+    all_validity  = []
+    all_times     = []
+    time_labels   = [f"{i * ps_step / 1000:.2f} ns" for i in range(args.steps + 1)]
 
     for chain_idx in range(args.n_chains):
         print(f"Chain {chain_idx + 1}/{args.n_chains} ...", flush=True)
-        traj, disps = run_chain(
+        traj, disps, validity, step_times = run_chain(
             net, schedule, node_feats, edge_index, edge_feats,
             x_start, x_ref, args.tau, args.steps,
             args.diff_steps, args.eta, args.sigma_init, device,
         )
         all_trajs.append(traj)
         all_disps.append(disps)
-        print(f"  Done. Mean displacement/step: "
-              f"{sum(disps)/len(disps):.3f} Å  "
-              f"Final RMSD from start: "
-              f"{(traj[-1] - traj[0]).norm(dim=-1).pow(2).mean().sqrt().item():.3f} Å")
+        all_validity.append(validity)
+        all_times.extend(step_times)
+
+        n_valid = sum(1 for c in validity if c["valid"])
+        print(f"  Done. Mean disp/step: {sum(disps)/len(disps):.3f} Å  "
+              f"Final RMSD: {(traj[-1]-traj[0]).norm(dim=-1).pow(2).mean().sqrt().item():.3f} Å  "
+              f"Valid steps: {n_valid}/{len(validity)}")
 
         # Per-chain multi-model PDB
         if args.n_chains > 1:
@@ -302,7 +333,7 @@ def main():
         print(f"Trajectory tensor saved: shape {list(traj_tensor.shape)}")
 
     # Metrics
-    metrics = compute_metrics(all_trajs, args.tau)
+    metrics = compute_metrics(all_trajs, all_validity, args.tau)
     metrics["source_frame"] = src
     metrics["checkpoint"]   = args.checkpoint
     metrics["time_labels"]  = time_labels
@@ -311,7 +342,18 @@ def main():
     with open(metrics_path, "w") as fh:
         json.dump(metrics, fh, indent=2)
 
+    # Timing report
+    mean_step_s    = sum(all_times) / len(all_times)
+    timing_path    = os.path.join(args.out, "timing_report.txt")
+    timing_info    = val.timing_report(
+        tau=args.tau,
+        time_per_step_s=mean_step_s,
+        out_path=timing_path,
+        target_ns=1000,
+    )
+
     # Summary printout
+    v = metrics["validity"]
     print()
     print("=" * 60)
     print(f"Generated {total_ns:.1f} ns of CA dynamics")
@@ -320,9 +362,18 @@ def main():
     print(f"  Final RMSD      : {metrics['final_mean_rmsd_A']:.3f} Å from start")
     print(f"  RMSF (mean/max) : {metrics['rmsf_mean_A']:.3f} / {metrics['rmsf_max_A']:.3f} Å")
     print(f"  Most flexible   : residue {metrics['rmsf_max_residue']}")
+    print(f"  Valid steps     : {v['n_valid']}/{v['n_steps_checked']} "
+          f"({v['valid_fraction']*100:.1f}%)  "
+          f"[bond viol={v['n_bond_violations']}, "
+          f"clashes={v['n_clashes']}, "
+          f"Rg viol={v['n_rg_violations']}]")
+    print(f"  Time/step       : {mean_step_s:.3f} s  "
+          f"→ {timing_info['total_min']:.1f} min for 1000 ns "
+          f"({timing_info['speedup_vs_classical_md']:.0f}× vs classical MD)")
     print(f"Output → {args.out}/")
     print(f"  trajectory.pdb  ({args.steps + 1} MODEL records per chain)")
     print(f"  metrics.json")
+    print(f"  timing_report.txt")
     print("=" * 60)
 
 
