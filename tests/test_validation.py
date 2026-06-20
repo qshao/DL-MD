@@ -120,3 +120,54 @@ def test_ensemble_novelty_zero():
     # Model = MD clone → no sample is novel
     novelty = val.ensemble_novelty(atoms, atoms.clone(), r_ang=2.0)
     assert novelty == 0.0
+
+
+# ── CA-specific metrics ───────────────────────────────────────────────────────
+
+def test_ca_geometry_keys():
+    ca = torch.randn(10, 3)
+    out = val.ca_geometry(ca)
+    assert set(out) == {"ca_bond_mean", "ca_bond_min", "ca_bond_max", "clash_count"}
+
+
+def test_distance_matrix_js_identical_is_zero():
+    torch.manual_seed(0)
+    ca = torch.randn(6, 12, 3)
+    js = val.distance_matrix_js(ca, ca)
+    assert js < 1e-3
+
+
+def test_distance_matrix_js_bounded():
+    a = torch.randn(5, 12, 3)
+    b = torch.randn(5, 12, 3) * 5.0 + 20.0
+    js = val.distance_matrix_js(a, b)
+    assert 0.0 <= js <= 1.0
+
+
+def test_rmsf_profile_identical_corr_one():
+    torch.manual_seed(0)
+    ca = torch.randn(8, 10, 3)
+    out = val.rmsf_profile(ca, ca)
+    assert len(out["model"]) == 10
+    assert abs(out["corr"] - 1.0) < 1e-4
+
+
+def test_displacement_js_identical_is_zero():
+    d = torch.rand(50)
+    out = val.displacement_js(d, d)
+    assert out["js"] < 1e-3
+    assert abs(out["model_mean"] - out["md_mean"]) < 1e-6
+
+
+def test_pca_js_accepts_ca_pointcloud():
+    torch.manual_seed(0)
+    ca = torch.randn(6, 12, 3)
+    out = val.pca_js(ca, ca)              # [K,P,3] inputs, not [K,N,4,3]
+    assert out["js"] < 1e-3
+
+
+def test_recall_accepts_ca_pointcloud():
+    torch.manual_seed(0)
+    ca = torch.randn(5, 12, 3)
+    assert val.ensemble_recall(ca, ca, r_ang=0.01) == 1.0
+    assert val.ensemble_novelty(ca, ca, r_ang=0.01) == 0.0

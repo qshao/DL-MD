@@ -3,6 +3,12 @@ import torch
 from lsmd import decoder as dec
 
 
+def _ca(x):
+    """Return CA coords [.,P,3]. Accepts a CA point cloud [.,P,3] (used as-is)
+    or a full backbone tensor [.,N,4,3] (CA = atom index 1 extracted)."""
+    return x if x.dim() == 3 else x[:, :, 1, :]
+
+
 def geometry_metrics(atoms):
     """Compute CA bond length, peptide bond violation, and clash count.
 
@@ -187,8 +193,8 @@ def pca_js(atoms_model, atoms_md, n_components=2, bins=20):
             js:            JS divergence ∈ [0, 1]
             var_explained: [float, float] — per-component variance fraction
     """
-    ca_model = atoms_model[:, :, 1, :].float()   # [K, N, 3]
-    ca_md    = atoms_md[:,    :, 1, :].float()   # [M, N, 3]
+    ca_model = _ca(atoms_model).float()   # [K, P, 3]
+    ca_md    = _ca(atoms_md).float()      # [M, P, 3]
     K, M = ca_model.shape[0], ca_md.shape[0]
 
     mu = ca_md.mean(0)                            # [N, 3]
@@ -249,8 +255,8 @@ def ensemble_recall(atoms_model, atoms_md, r_ang=2.0):
     Returns:
         float in [0, 1].
     """
-    ca_model = atoms_model[:, :, 1, :]   # [K, N, 3]
-    ca_md    = atoms_md[:,    :, 1, :]   # [M, N, 3]
+    ca_model = _ca(atoms_model)   # [K, P, 3]
+    ca_md    = _ca(atoms_md)      # [M, P, 3]
     M = ca_md.shape[0]
     covered = 0
     for m_idx in range(M):
@@ -276,8 +282,8 @@ def ensemble_novelty(atoms_model, atoms_md, r_ang=2.0):
     Returns:
         float in [0, 1].
     """
-    ca_model = atoms_model[:, :, 1, :]   # [K, N, 3]
-    ca_md    = atoms_md[:,    :, 1, :]   # [M, N, 3]
+    ca_model = _ca(atoms_model)   # [K, P, 3]
+    ca_md    = _ca(atoms_md)      # [M, P, 3]
     K = ca_model.shape[0]
     novel = 0
     for k_idx in range(K):
@@ -286,3 +292,123 @@ def ensemble_novelty(atoms_model, atoms_md, r_ang=2.0):
         if rmsd.min().item() >= r_ang:
             novel += 1
     return novel / K
+
+
+def ca_geometry(ca):
+    """Sequential CA-CA bond statistics and clash count for one CA trace.
+
+    Args:
+        ca: CA coordinates [P, 3]
+
+    Returns:
+        dict: ca_bond_mean, ca_bond_min, ca_bond_max (Å), clash_count
+              (non-adjacent CA pairs closer than 2.0 Å).
+    """
+    bonds = (ca[1:] - ca[:-1]).norm(dim=-1)
+    d = torch.cdist(ca, ca)
+    n = ca.shape[0]
+    mask = ~torch.eye(n, dtype=torch.bool, device=ca.device)
+    for i in range(n - 1):
+        mask[i, i + 1] = mask[i + 1, i] = False
+    clash_count = ((d < 2.0) & mask).sum().item() / 2
+    return {
+        "ca_bond_mean": bonds.mean().item(),
+        "ca_bond_min": bonds.min().item(),
+        "ca_bond_max": bonds.max().item(),
+        "clash_count": clash_count,
+    }
+
+
+def _pairwise_dists(ca):
+    """Pooled upper-triangle CA-CA distances over an ensemble [K,P,3] → 1-D."""
+    K, P, _ = ca.shape
+    iu = torch.triu_indices(P, P, offset=1)
+    d = torch.cdist(ca, ca)                 # [K,P,P]
+    return d[:, iu[0], iu[1]].reshape(-1)   # [K * P(P-1)/2]
+
+
+def _hist_js(a, b, bins, lo=None, hi=None):
+    """JS divergence (bits) between two 1-D samples via shared-range histograms."""
+    if lo is None:
+        lo = torch.min(a.min(), b.min())
+    if hi is None:
+        hi = torch.max(a.max(), b.max())
+    span = (hi - lo).clamp_min(1e-8)
+
+    def _h(x):
+        idx = ((x - lo) / span * bins).long().clamp(0, bins - 1)
+        h = torch.zeros(bins, device=x.device)
+        h.scatter_add_(0, idx, torch.ones_like(x))
+        h = h + 1e-8
+        return h / h.sum()
+
+    p, q = _h(a), _h(b)
+    mix = 0.5 * (p + q)
+    js = 0.5 * (p * torch.log(p / mix)).sum() + 0.5 * (q * torch.log(q / mix)).sum()
+    return (js / math.log(2)).clamp(0.0, 1.0).item()
+
+
+def distance_matrix_js(ca_model, ca_md, bins=30):
+    """JS divergence between pooled pairwise CA-CA distance distributions.
+
+    Captures whether the model reproduces the overall conformational geometry
+    (contact distances) of the MD ensemble.
+
+    Args:
+        ca_model: [K, P, 3]
+        ca_md:    [M, P, 3]
+        bins:     histogram bins.
+
+    Returns:
+        JS divergence in [0, 1]. 0 = identical distance distributions.
+    """
+    a = _pairwise_dists(ca_model)
+    b = _pairwise_dists(ca_md)
+    return _hist_js(a, b, bins)
+
+
+def rmsf_profile(ca_model, ca_md):
+    """Per-residue CA positional fluctuation (RMSF) for both ensembles.
+
+    Args:
+        ca_model: [K, P, 3]
+        ca_md:    [M, P, 3]
+
+    Returns:
+        dict: model [P], md [P] (per-residue std magnitude, Å),
+              corr (Pearson correlation of the two profiles).
+    """
+    def _rmsf(ca):
+        mu = ca.mean(0, keepdim=True)               # [1,P,3]
+        return (ca - mu).pow(2).sum(-1).mean(0).sqrt()   # [P]
+
+    rm = _rmsf(ca_model)
+    rd = _rmsf(ca_md)
+    rmc = rm - rm.mean()
+    rdc = rd - rd.mean()
+    denom = (rmc.norm() * rdc.norm()).clamp_min(1e-8)
+    corr = (rmc * rdc).sum() / denom
+    return {"model": rm.tolist(), "md": rd.tolist(), "corr": corr.item()}
+
+
+def displacement_js(disp_model, disp_md, bins=30):
+    """JS divergence between two displacement-magnitude distributions.
+
+    disp_* are per-sample RMSD magnitudes (Å): for the model, ‖Δ‖ of sampled
+    displacements; for MD, per-pair ‖Δ‖ at the chosen lag. Separates the
+    fluctuation bulk (small ‖Δ‖) from the transition tail (large ‖Δ‖).
+
+    Args:
+        disp_model: 1-D tensor of model displacement magnitudes.
+        disp_md:    1-D tensor of MD displacement magnitudes.
+        bins:       histogram bins.
+
+    Returns:
+        dict: js (in [0,1]), model_mean, md_mean.
+    """
+    js = _hist_js(disp_model, disp_md, bins)
+    return {
+        "js": js,
+        "model_mean": disp_model.mean().item(),
+        "md_mean": disp_md.mean().item(),
+    }
