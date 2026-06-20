@@ -58,7 +58,7 @@ def knn_graph(t, k):
     d.fill_diagonal_(float("inf"))
     k = min(k, n - 1)
     idx = d.topk(k, largest=False).indices  # [n,k]
-    src = torch.arange(n).unsqueeze(1).expand(n, k).reshape(-1)
+    src = torch.arange(n, device=t.device).unsqueeze(1).expand(n, k).reshape(-1)
     dst = idx.reshape(-1)
     return torch.stack([src, dst], dim=0)
 

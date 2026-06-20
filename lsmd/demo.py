@@ -24,7 +24,7 @@ def _build_ctx(frames, k):
     return node_feats, edge_index, edge_feats
 
 
-def train(frames, tau, epochs, k, hidden, layers, sigma, lr):
+def train(frames, tau, epochs, k, hidden, layers, sigma, lr, clip=1.0, device=None):
     """Train FlowNet on a loaded trajectory.
 
     Args:
@@ -36,41 +36,61 @@ def train(frames, tau, epochs, k, hidden, layers, sigma, lr):
         layers: number of message-passing layers
         sigma: prior scale for conditional flow matching
         lr: Adam learning rate
+        clip: max gradient norm (0 to disable)
+        device: torch device; auto-selects CUDA if available when None
 
     Returns:
         (net, ctx) where ctx = (node_feats, edge_index, edge_feats) from frame 0
     """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training on {device}")
+
     pairs = data.make_pairs(frames["R"].shape[0], tau)
     train_pairs, _ = data.time_split(pairs, val_frac=0.2)
     if train_pairs.shape[0] == 0:
         raise ValueError("No training pairs: tau too large relative to trajectory length.")
 
     node_feats, edge_index, edge_feats = _build_ctx(frames, k)
+    node_feats = node_feats.to(device)
+    edge_index  = edge_index.to(device)
+    edge_feats  = edge_feats.to(device)
+    # pre-move all frames to device once (avoids per-step transfer overhead)
+    R_all = frames["R"].to(device)
+    t_all = frames["t"].to(device)
 
     net = m.FlowNet(
         node_dim=node_feats.shape[1],
         edge_dim=edge_feats.shape[1],
         hidden=hidden,
         layers=layers,
-    )
+    ).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
 
-    for _ in range(epochs):
+    import time
+    for epoch in range(epochs):
         perm = train_pairs[torch.randperm(train_pairs.shape[0])]
+        epoch_loss, t0 = 0.0, time.time()
         for i, j in perm.tolist():
-            R_t, t_t = frames["R"][i], frames["t"][i]
-            R_f, t_f = frames["R"][j], frames["t"][j]
-            u_target = f.relative_update(R_t, t_t, R_f, t_f)
+            R_t = R_all[i].to(device)
+            t_t = t_all[i].to(device)
+            R_fwd = R_all[j].to(device)
+            t_fwd = t_all[j].to(device)
+            u_target = f.relative_update(R_t, t_t, R_fwd, t_fwd)
             opt.zero_grad()
             loss = m.cfm_loss(net, u_target, node_feats, edge_index, edge_feats, sigma=sigma)
             loss.backward()
+            if clip > 0:
+                torch.nn.utils.clip_grad_norm_(net.parameters(), clip)
             opt.step()
+            epoch_loss += loss.item()
+        print(f"Epoch {epoch+1}/{epochs}  loss={epoch_loss/len(perm):.4f}  t={time.time()-t0:.1f}s")
 
     return net, (node_feats, edge_index, edge_feats)
 
 
 def run_demo(traj_path, top_path, tau, out_dir, K=8, epochs=50,
-             k=8, hidden=64, layers=3, sigma=0.1, lr=1e-3):
+             k=8, hidden=64, layers=3, sigma=0.1, lr=1e-3, clip=1.0, device=None):
     """Full demo: load trajectory, train, sample K futures, write PDBs, return metrics.
 
     Args:
@@ -92,31 +112,35 @@ def run_demo(traj_path, top_path, tau, out_dir, K=8, epochs=50,
     """
     os.makedirs(out_dir, exist_ok=True)
 
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     frames = data.load_frames(traj_path, top_path)
     net, (node_feats, edge_index, edge_feats) = train(
-        frames, tau, epochs, k, hidden, layers, sigma, lr,
+        frames, tau, epochs, k, hidden, layers, sigma, lr, clip=clip, device=device,
     )
 
     # Identify the first validation pair to use as the query frame
     pairs = data.make_pairs(frames["R"].shape[0], tau)
     _, val_pairs = data.time_split(pairs, val_frac=0.2)
     i0 = int(val_pairs[0, 0])
-    R_t, t_t = frames["R"][i0], frames["t"][i0]
+    R_t = frames["R"][i0].to(device)
+    t_t = frames["t"][i0].to(device)
 
-    # Sample K future structures
+    # Sample K future structures (net and ctx already on device)
     u = m.sample(net, node_feats, edge_index, edge_feats, K=K, sigma=sigma)
     R_f, t_f = dec.decode_frames(R_t, t_t, u)
 
-    # Build, idealize, and write each sample
+    # Build, idealize, and write each sample (move back to CPU for geometry ops)
     res_names = ["ALA"] * frames["R"].shape[1]  # cosmetic; backbone-only demo
     atoms_K = []
     for kk in range(K):
-        atoms = dec.idealize(dec.build_structure(R_f[kk], t_f[kk]))
+        atoms = dec.idealize(dec.build_structure(R_f[kk].cpu(), t_f[kk].cpu()))
         atoms_K.append(atoms)
         dec.write_pdb(atoms, res_names, os.path.join(out_dir, f"future_{kk}.pdb"))
     atoms_K = torch.stack(atoms_K, 0)  # [K, N, 4, 3]
 
-    # True future CA positions for ensemble overlap
+    # True future CA positions for ensemble overlap (CPU)
     md_ca = frames["t"][int(val_pairs[0, 1])]  # [N, 3]
 
     report = {
@@ -145,12 +169,15 @@ if __name__ == "__main__":
     ap.add_argument("--layers", type=int, default=3, help="FlowNet layers")
     ap.add_argument("--sigma", type=float, default=0.1, help="Prior scale")
     ap.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    ap.add_argument("--clip", type=float, default=1.0, help="Gradient clip norm (0=off)")
+    ap.add_argument("--device", default=None, help="Device: cuda / cpu (auto if omitted)")
     args = ap.parse_args()
 
+    dev = torch.device(args.device) if args.device else None
     rep = run_demo(
         args.traj, args.top, args.tau, args.out,
         K=args.K, epochs=args.epochs, k=args.k,
         hidden=args.hidden, layers=args.layers,
-        sigma=args.sigma, lr=args.lr,
+        sigma=args.sigma, lr=args.lr, clip=args.clip, device=dev,
     )
     print(json.dumps(rep, indent=2))
