@@ -334,8 +334,9 @@ def main():
                     help="Bond spring constant for --min_energy (default 10.0)")
     ap.add_argument("--k_clash",      type=float, default=1.0,
                     help="Clash penalty weight for --min_energy (default 1.0)")
-    ap.add_argument("--k_rama",       type=float, default=1.0,
-                    help="Ramachandran penalty weight for 4-bead --min_energy (default 1.0)")
+    ap.add_argument("--k_rama",       type=float, default=0.0,
+                    help="Ramachandran penalty weight for 4-bead --min_energy (default 0 = disabled; "
+                         "coupling to bond/clash terms is problematic; check validation output instead)")
     ap.add_argument("--min_steps",    type=int,   default=100,
                     help="Max L-BFGS iterations per step for --min_energy (default 100)")
     ap.add_argument("--device",       default=None)

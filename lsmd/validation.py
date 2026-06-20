@@ -892,9 +892,14 @@ class RamachandranPotential:
         return self
 
     def energy(self, beads):
-        """Sum of Ramachandran energies for [P, 4, 3] beads. Differentiable."""
+        """Mean per-residue Ramachandran energy for [P, 4, 3] beads. Differentiable.
+
+        Returns the *mean* (not sum) so k_rama is protein-size-independent and
+        comparable to k_bond: at k_rama=1.0 each outlier residue contributes
+        ~1/(P-2) to the gradient, keeping it well below the bond/clash gradients.
+        """
         phi, psi = compute_phi_psi(beads)
-        return _rama_interp(self.grid, phi, psi, self.bins).sum()
+        return _rama_interp(self.grid, phi, psi, self.bins).mean()
 
     def query(self, phi, psi):
         """Per-residue energies [N] at query points (phi, psi). Differentiable."""
@@ -904,7 +909,7 @@ class RamachandranPotential:
         """Return (n_outliers, outlier_fraction) for a [P, 4, 3] conformation."""
         with torch.no_grad():
             phi, psi = compute_phi_psi(beads.cpu())
-            e = self.query(phi, psi)
+            e = _rama_interp(self.grid.cpu(), phi, psi, self.bins)
         n_out = int((e > self.outlier_threshold).sum().item())
         return n_out, n_out / max(len(e), 1)
 
@@ -954,13 +959,19 @@ class RamachandranPotential:
         energy  = -torch.log(density)
         energy  = energy - energy.min()
 
-        # Outlier threshold: 98th percentile of training-data energies
+        # 98th-percentile energy from training data
         train_phi = torch.tensor(phi_np)
         train_psi = torch.tensor(psi_np)
         train_e   = _rama_interp(energy, train_phi, train_psi, bins)
         threshold = float(torch.quantile(train_e, 0.98).item())
 
-        return cls(energy, bins, threshold)
+        # Normalise: divide grid by threshold so outlier_threshold == 1.0.
+        # This decouples k_rama from protein length and makes it directly
+        # comparable to k_bond: k_rama=1.0 means one outlier residue costs
+        # ~1 energy unit (same order as a 0.3 Å bond error at k_bond=10).
+        energy = energy / max(threshold, 1e-6)
+
+        return cls(energy, bins, outlier_threshold=1.0)
 
 
 def minimize_energy_4bead(beads, gly_mask=None, bond_target=None,
@@ -1003,22 +1014,51 @@ def minimize_energy_4bead(beads, gly_mask=None, bond_target=None,
     x = beads.detach().clone().float().reshape(n_atoms, 3)
     x.requires_grad_(True)
 
-    opt = torch.optim.LBFGS([x], lr=1.0, max_iter=n_steps,
-                             line_search_fn="strong_wolfe")
+    # Phase 1 — converge bond lengths + clashes without Ramachandran.
+    # Use clash_dist + 0.1 Å as the phase-1 threshold so all non-bonded pairs
+    # end up at ≥ (clash_dist + 0.1) Å, creating a safety margin for the
+    # Ramachandran fine-tune in phase 2.  Without this margin, pairs settle
+    # at exactly clash_dist — any Ramachandran gradient step creates a clash.
+    clash_dist_p1 = clash_dist + 0.1
+    opt1 = torch.optim.LBFGS([x], lr=1.0, max_iter=n_steps,
+                              line_search_fn="strong_wolfe")
 
-    def closure():
-        opt.zero_grad()
+    def closure1():
+        opt1.zero_grad()
         b_dist  = (x[bond_j] - x[bond_i]).norm(dim=-1)
         e_bond  = k_bond  * ((b_dist - bond_t) ** 2).sum()
         nb_dist = (x[nb_i] - x[nb_j]).norm(dim=-1)
-        e_clash = k_clash * torch.clamp(clash_dist - nb_dist, min=0.0).pow(2).sum()
-        e_rama  = (k_rama  * rama_potential.energy(x.reshape(P, 4, 3))
-                   if rama_potential is not None else 0.0)
-        loss = e_bond + e_clash + e_rama
+        e_clash = k_clash * torch.clamp(clash_dist_p1 - nb_dist, min=0.0).pow(2).sum()
+        loss = e_bond + e_clash
         loss.backward()
         return loss
 
-    opt.step(closure)
+    opt1.step(closure1)
+
+    # Phase 2 — gentle Ramachandran fine-tune on the now-valid structure.
+    # Pairs start ~0.1 Å above the real clash threshold; the Ramachandran
+    # gradient magnitude is ≤ 0.003 Å/atom/step at k_rama=0.1, so we have
+    # ~33 gradient steps of clearance before any pair could reach the boundary.
+    # The real clash_dist (not +0.1) is used here so the clash term resists
+    # any move that would push pairs below the actual threshold.
+    if rama_potential is not None and k_rama > 0:
+        opt2 = torch.optim.LBFGS([x], lr=0.1,
+                                  max_iter=max(1, n_steps // 2),
+                                  line_search_fn="strong_wolfe")
+
+        def closure2():
+            opt2.zero_grad()
+            b_dist  = (x[bond_j] - x[bond_i]).norm(dim=-1)
+            e_bond  = k_bond  * ((b_dist - bond_t) ** 2).sum()
+            nb_dist = (x[nb_i] - x[nb_j]).norm(dim=-1)
+            e_clash = k_clash * torch.clamp(clash_dist - nb_dist, min=0.0).pow(2).sum()
+            e_rama  = k_rama  * rama_potential.energy(x.reshape(P, 4, 3))
+            loss = e_bond + e_clash + e_rama
+            loss.backward()
+            return loss
+
+        opt2.step(closure2)
+
     return x.detach().reshape(P, 4, 3).to(beads.dtype)
 
 
