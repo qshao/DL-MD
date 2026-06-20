@@ -56,3 +56,29 @@ def test_make_multi_lag_pairs():
     assert (pairs[1:, 0] >= pairs[:-1, 0]).all(), "must be sorted by start frame"
     train, val = d.time_split(pairs, val_frac=0.2)
     assert train[:, 0].max() <= val[:, 0].min()
+
+
+def test_compute_frame_weights_shape_and_mean(tmp_path):
+    path = _tiny_traj(tmp_path)
+    frames = d.load_frames(path, path)
+    weights = d.compute_frame_weights(frames)
+    F = frames["R"].shape[0]
+    assert weights.shape == (F,)
+    assert abs(weights.mean().item() - 1.0) < 0.01
+    assert (weights > 0).all()
+
+
+def test_compute_frame_weights_uniform():
+    """Identical CA positions → uniform density → all weights equal."""
+    F, N = 10, 4
+    # All frames have the same CA positions
+    t_identical = torch.zeros(F, N, 3)
+    for i in range(N):
+        t_identical[:, i, 0] = i * 3.8
+    frames = {
+        "R": torch.eye(3).unsqueeze(0).unsqueeze(0).expand(F, N, 3, 3).clone(),
+        "t": t_identical,
+    }
+    weights = d.compute_frame_weights(frames)
+    assert weights.std().item() < 1e-3
+    assert abs(weights.mean().item() - 1.0) < 0.01

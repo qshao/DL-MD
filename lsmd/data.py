@@ -109,3 +109,48 @@ def time_split(pairs, val_frac):
     n = pairs.shape[0]
     cut = int(n * (1 - val_frac))
     return pairs[:cut], pairs[cut:]
+
+
+def compute_frame_weights(frames, n_pca=3, bins=30, density_clip=10.0):
+    """Inverse-density weights for training pairs (source-frame correction).
+
+    Projects all CA frames to a 2D PCA space, bins into a density histogram,
+    and weights each frame by 1/count so rare conformations are upweighted.
+    Corrects for the over-representation of dominant MD basins.
+
+    Args:
+        frames:       dict from load_frames — uses frames["t"] [F, N, 3].
+        n_pca:        Number of PCA components to compute (only PC1-PC2 used).
+        bins:         Grid resolution for the 2D density histogram.
+        density_clip: Max weight relative to mean (prevents extreme upweighting).
+
+    Returns:
+        weights: [F] float32 tensor, mean = 1.0.
+    """
+    ca = frames["t"].float()          # [F, N, 3]
+    F, N, _ = ca.shape
+    ca_flat = ca.reshape(F, -1)       # [F, N*3]
+    ca_flat = ca_flat - ca_flat.mean(0, keepdim=True)
+
+    _, _, Vt = torch.linalg.svd(ca_flat, full_matrices=False)   # Vt: [min(F,N*3), N*3]
+    n_comp = min(n_pca, Vt.shape[0])
+    pc = ca_flat @ Vt[:n_comp].T      # [F, n_comp]
+
+    # 2D histogram in PC1-PC2
+    lo = pc[:, :2].min(0).values      # [2]
+    hi = pc[:, :2].max(0).values      # [2]
+    span = (hi - lo).clamp_min(1e-8)
+
+    x_bin = ((pc[:, 0] - lo[0]) / span[0] * bins).long().clamp(0, bins - 1)
+    y_bin = ((pc[:, 1] - lo[1]) / span[1] * bins).long().clamp(0, bins - 1)
+    bin_idx = x_bin * bins + y_bin    # [F]
+
+    counts = torch.zeros(bins * bins)
+    counts.scatter_add_(0, bin_idx, torch.ones(F))
+
+    frame_counts = counts[bin_idx].clamp_min(1.0)   # [F]
+    weights = 1.0 / frame_counts
+    mean_w = weights.mean()
+    weights = weights.clamp(max=mean_w * density_clip)
+    weights = weights / weights.mean()
+    return weights
