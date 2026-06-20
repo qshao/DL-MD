@@ -44,3 +44,40 @@ def test_place_backbone_reproduces_frame():
     R2, t2 = g.build_frames(atoms[:, 0], atoms[:, 1], atoms[:, 2])
     assert torch.allclose(R, R2, atol=1e-4)
     assert torch.allclose(t, t2, atol=1e-4)
+
+
+def test_kabsch_identity():
+    X = torch.randn(10, 3)
+    R, t = g.kabsch(X, X)
+    assert torch.allclose(R, torch.eye(3), atol=1e-5)
+    assert torch.allclose(t, torch.zeros(3), atol=1e-5)
+
+
+def test_kabsch_recovers_known_transform():
+    torch.manual_seed(0)
+    Y = torch.randn(20, 3)
+    # Build a known rotation via QR (proper rotation) and a translation
+    A = torch.randn(3, 3)
+    Q, _ = torch.linalg.qr(A)
+    if torch.linalg.det(Q) < 0:
+        Q[:, 0] = -Q[:, 0]
+    trans = torch.tensor([1.0, -2.0, 3.0])
+    X = Y @ Q.T + trans                     # X is Y rotated+translated
+    R, t = g.kabsch(X, Y)                    # align Y onto X
+    Y_aligned = Y @ R.transpose(-1, -2) + t
+    assert torch.allclose(Y_aligned, X, atol=1e-4)
+    assert abs(torch.linalg.det(R).item() - 1.0) < 1e-4   # proper rotation
+
+
+def test_kabsch_batched():
+    torch.manual_seed(1)
+    X = torch.randn(4, 15, 3)
+    Y = torch.randn(4, 15, 3)
+    R, t = g.kabsch(X, Y)
+    assert R.shape == (4, 3, 3)
+    assert t.shape == (4, 3)
+    Y_aligned = Y @ R.transpose(-1, -2) + t.unsqueeze(-2)
+    # alignment reduces RMSD vs unaligned
+    rmsd_before = (X - Y).norm(dim=-1).mean()
+    rmsd_after = (X - Y_aligned).norm(dim=-1).mean()
+    assert rmsd_after <= rmsd_before + 1e-5

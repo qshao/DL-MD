@@ -82,3 +82,46 @@ def test_compute_frame_weights_uniform():
     weights = d.compute_frame_weights(frames)
     assert weights.std().item() < 1e-3
     assert abs(weights.mean().item() - 1.0) < 0.01
+
+
+def test_load_frames_unwraps_pbc(tmp_path):
+    """A protein split across the periodic box yields physical CA-CA bonds after load."""
+    n_res = 4
+    box = 2.0  # nm
+    top = md.Topology()
+    chain = top.add_chain()
+    atoms = []
+    for i in range(n_res):
+        res = top.add_residue("ALA", chain, resSeq=i + 1)
+        a = {nm: top.add_atom(nm, md.element.get_by_symbol(el), res)
+             for nm, el in [("N", "N"), ("CA", "C"), ("C", "C"), ("O", "O")]}
+        atoms.append(a)
+    # bond consecutive backbone so make_molecules_whole keeps the chain together
+    for i in range(n_res):
+        top.add_bond(atoms[i]["N"], atoms[i]["CA"])
+        top.add_bond(atoms[i]["CA"], atoms[i]["C"])
+        top.add_bond(atoms[i]["C"], atoms[i]["O"])
+        if i + 1 < n_res:
+            top.add_bond(atoms[i]["C"], atoms[i + 1]["N"])
+
+    # Build a straight chain (CA-CA ~0.38 nm), then wrap the last two residues by -box
+    xyz = np.zeros((1, n_res * 4, 3), np.float32)
+    for i in range(n_res):
+        ca = np.array([i * 0.38, 0.0, 0.0], np.float32)
+        base = i * 4
+        xyz[0, base + 0] = ca + [-0.05, 0.14, 0.0]   # N
+        xyz[0, base + 1] = ca                         # CA
+        xyz[0, base + 2] = ca + [0.15, 0.0, 0.0]      # C
+        xyz[0, base + 3] = ca + [0.22, -0.11, 0.0]    # O
+    xyz[0, 2 * 4:] += np.array([box, 0.0, 0.0], np.float32)  # wrap last 2 residues
+
+    traj = md.Trajectory(xyz, top)
+    traj.unitcell_lengths = np.array([[box, box, box]], np.float32)
+    traj.unitcell_angles = np.array([[90.0, 90.0, 90.0]], np.float32)
+    p = tmp_path / "wrapped.pdb"
+    traj.save_pdb(str(p))
+
+    frames = d.load_frames(str(p), str(p))
+    ca = frames["t"][0]                       # [N,3] in Angstrom
+    bonds = (ca[1:] - ca[:-1]).norm(dim=-1)
+    assert bonds.max().item() < 6.0           # ~3.8 Å, not ~box length (20 Å)

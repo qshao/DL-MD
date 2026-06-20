@@ -21,6 +21,8 @@ def load_frames(traj_path, top_path):
             - n_types: number of unique residue types
     """
     traj = md.load(traj_path, top=top_path)
+    if traj.unitcell_lengths is not None:
+        traj.make_molecules_whole(inplace=True)   # undo PBC wrapping (protein split across box)
     ca_idx = traj.topology.select("protein and name CA")
     if len(ca_idx) > 0:
         traj.superpose(traj, 0, atom_indices=ca_idx)

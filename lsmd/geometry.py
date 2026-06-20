@@ -80,3 +80,30 @@ def place_backbone(R, t):
     # global = t + R @ local
     placed = (R.unsqueeze(-3) @ local.unsqueeze(-1)).squeeze(-1) + t.unsqueeze(-2)
     return placed  # [...,4,3]
+
+
+def kabsch(X, Y):
+    """Rigid transform aligning Y onto X (minimizes ‖Y@R.T + t − X‖).
+
+    Args:
+        X: target points [P, 3] or [B, P, 3]
+        Y: source points [P, 3] or [B, P, 3]
+
+    Returns:
+        (R, t): R [3,3] or [B,3,3] (proper rotation, det=+1),
+                t [3] or [B,3] s.t. Y @ R.transpose(-1,-2) + t ≈ X.
+    """
+    muX = X.mean(dim=-2, keepdim=True)            # [...,1,3]
+    muY = Y.mean(dim=-2, keepdim=True)
+    Xc = X - muX
+    Yc = Y - muY
+    H = Yc.transpose(-1, -2) @ Xc                 # [...,3,3]
+    U, _, Vt = torch.linalg.svd(H)
+    V = Vt.transpose(-1, -2)
+    d = torch.linalg.det(V @ U.transpose(-1, -2))  # [...] sign for proper rotation
+    D = torch.eye(3, device=X.device, dtype=X.dtype).expand_as(H).clone()
+    D[..., 2, 2] = d
+    R = V @ D @ U.transpose(-1, -2)               # [...,3,3]
+    # t = muX - muY @ R.T
+    t = muX.squeeze(-2) - (muY @ R.transpose(-1, -2)).squeeze(-2)
+    return R, t
