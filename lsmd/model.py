@@ -132,7 +132,7 @@ class FlowNet(nn.Module):
         """
         unbatched = u_s.dim() == 2
         if unbatched:
-            u_s = u_s.unsqueeze(0)      # [1, N, 6]
+            u_s = u_s.unsqueeze(0)      # [1, N, point_dim]
 
         B, N, _ = u_s.shape
 
@@ -158,20 +158,20 @@ class FlowNet(nn.Module):
         for layer in self.layers:
             h = layer(h, edge_index, edge_feats)
 
-        out = self.head(h)              # [B, N, 6]
+        out = self.head(h)              # [B, N, point_dim]
         return out.squeeze(0) if unbatched else out
 
 
 def cfm_loss(net, u_target, node_feats, edge_index, edge_feats, tau, sigma=0.1):
     """Conditional flow-matching (rectified-flow) loss.
 
-    Supports both [N, 6] (single pair) and [B, N, 6] (mini-batch) targets.
+    Supports both [N, point_dim] (single pair) and [B, N, point_dim] (mini-batch) targets.
     For batched inputs a separate flow-time s is sampled per batch item,
     giving better coverage of the flow path.
 
     Args:
         net:        FlowNet instance
-        u_target:   [N, 6] or [B, N, 6]
+        u_target:   [N, point_dim] or [B, N, point_dim]
         node_feats: [N, node_dim]
         edge_index: [2, E]
         edge_feats: [E, edge_dim]
@@ -220,7 +220,7 @@ def sample(net, node_feats, edge_index, edge_feats, K, tau, steps=50, sigma=0.1)
     u = torch.randn(K, n, net.point_dim, device=node_feats.device, dtype=node_feats.dtype) * sigma  # [K, N, point_dim]
     for i in range(steps):
         s = torch.tensor(i / steps, dtype=node_feats.dtype, device=node_feats.device)
-        v = net(u, s, node_feats, edge_index, edge_feats, tau)  # [K, N, 6]
+        v = net(u, s, node_feats, edge_index, edge_feats, tau)  # [K, N, point_dim]
         u = u + v / steps
     return u
 
@@ -257,13 +257,13 @@ def ddpm_loss(net, u_target, node_feats, edge_index, edge_feats, tau, schedule,
               pair_weights=None, sigma_aug=0.0):
     """DDPM ε-prediction loss.
 
-    Supports [N, 6] (single pair) and [B, N, 6] (mini-batch) targets.
+    Supports [N, point_dim] (single pair) and [B, N, point_dim] (mini-batch) targets.
     Per-batch-item noise level t is sampled from [t_min, T] so the network
     learns the score at every noise level simultaneously.
 
     Args:
         net:          FlowNet instance.
-        u_target:     [N, 6] or [B, N, 6] — clean target updates.
+        u_target:     [N, point_dim] or [B, N, point_dim] — clean target updates.
         node_feats:   [N, node_dim]
         edge_index:   [2, E]
         edge_feats:   [E, edge_dim]
@@ -277,7 +277,7 @@ def ddpm_loss(net, u_target, node_feats, edge_index, edge_feats, tau, schedule,
     """
     batched = u_target.dim() == 3
     if not batched:
-        u_target = u_target.unsqueeze(0)    # [1, N, 6]
+        u_target = u_target.unsqueeze(0)    # [1, N, point_dim]
     B = u_target.shape[0]
     T = schedule.T
     t_min = max(1, T // 20)
