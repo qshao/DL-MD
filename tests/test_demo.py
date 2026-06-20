@@ -30,10 +30,24 @@ def test_run_demo_smoke(tmp_path):
         path, path,
         taus=[3, 5, 8], infer_tau=5,
         out_dir=str(out), K=4, epochs=30, batch_size=8,
+        T_diff=20,          # small T for speed
+        diff_steps=5,       # few inference steps for speed
     )
+    # Structure keys
     assert "model_geometry" in report
-    assert "diversity" in report
+    assert "diversity_rmsd" in report
+    assert "ramachandran_js" in report
+    assert "pca_js" in report
+    assert "ensemble_recall" in report
+    assert "ensemble_novelty" in report
+    assert "n_md_reference" in report
     assert report["taus"] == [3, 5, 8]
     assert report["infer_tau"] == 5
+    # PDB files written
     pdbs = list(out.glob("future_*.pdb"))
     assert len(pdbs) == 4
+    # Metrics in valid ranges
+    assert 0.0 <= report["ramachandran_js"] <= 1.0
+    assert 0.0 <= report["ensemble_recall"]  <= 1.0
+    assert 0.0 <= report["ensemble_novelty"] <= 1.0
+    assert report["diversity_rmsd"] >= 0.0
