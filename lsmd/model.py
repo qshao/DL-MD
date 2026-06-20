@@ -120,7 +120,7 @@ class FlowNet(nn.Module):
         """Predict velocity in delta-space conditioned on lag time tau.
 
         Args:
-            u_s:        [N, 6] or [B, N, 6]
+            u_s:        [N, point_dim] or [B, N, point_dim]
             s:          Scalar, or [B] tensor (one flow-time per batch item).
             node_feats: [N, node_dim]  (broadcast across batch)
             edge_index: [2, E]
@@ -217,7 +217,7 @@ def sample(net, node_feats, edge_index, edge_feats, K, tau, steps=50, sigma=0.1)
     """
     n = node_feats.shape[0]
     # All K draws in one [K, N, point_dim] tensor — batched forward each step
-    u = torch.randn(K, n, net.point_dim, device=node_feats.device, dtype=node_feats.dtype) * sigma
+    u = torch.randn(K, n, net.point_dim, device=node_feats.device, dtype=node_feats.dtype) * sigma  # [K, N, point_dim]
     for i in range(steps):
         s = torch.tensor(i / steps, dtype=node_feats.dtype, device=node_feats.device)
         v = net(u, s, node_feats, edge_index, edge_feats, tau)  # [K, N, 6]
@@ -344,7 +344,7 @@ def sample_ddpm(net, node_feats, edge_index, edge_feats, K, tau, schedule,
         t_prev = t_full[i + 1].item()
 
         s = torch.tensor(t / T, dtype=dtype, device=device)
-        eps_pred = net(u, s, node_feats, edge_index, edge_feats, tau)   # [K, N, 6]
+        eps_pred = net(u, s, node_feats, edge_index, edge_feats, tau)   # [K, N, net.point_dim]
 
         sqrt_ab_t   = schedule.sqrt_alphas_bar[t].to(dtype)
         sqrt_1mab_t = schedule.sqrt_one_minus_alphas_bar[t].to(dtype)
