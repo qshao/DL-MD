@@ -12,6 +12,13 @@ def test_build_frames_orthonormal():
     assert torch.allclose(gram, torch.eye(3), atol=1e-5)
     assert torch.isclose(torch.det(R[0]), torch.tensor(1.0), atol=1e-5)
     assert torch.allclose(t[0], CA[0])
+    # dtype checks
+    assert R.dtype == torch.float32
+    assert t.dtype == torch.float32
+    # e1-direction assertion
+    e1_expected = (C[0] - CA[0])
+    e1_expected = e1_expected / e1_expected.norm()
+    assert torch.allclose(R[0, :, 0], e1_expected, atol=1e-5)
 
 
 def test_so3_exp_log_roundtrip():
