@@ -207,12 +207,16 @@ def compute_metrics(trajectories, validity_all, tau, ps_per_frame=200):
     n_steps  = len(trajectories[0]) - 1
     ps_step  = tau * ps_per_frame
 
-    # RMSD from start per step, per chain
+    # Helper: extract CA positions regardless of bead mode
+    def _ca(frame):
+        return frame[:, 1, :] if frame.ndim == 3 else frame   # [P,4,3]→[P,3] or [P,3]
+
+    # RMSD from start per step, per chain (CA-based)
     rmsd_chains = []
     for traj in trajectories:
-        x0 = traj[0]
+        x0_ca = _ca(traj[0])
         rmsd_chains.append([
-            round((traj[s] - x0).norm(dim=-1).pow(2).mean().sqrt().item(), 4)
+            round((_ca(traj[s]) - x0_ca).norm(dim=-1).pow(2).mean().sqrt().item(), 4)
             for s in range(1, len(traj))
         ])
 
@@ -221,12 +225,12 @@ def compute_metrics(trajectories, validity_all, tau, ps_per_frame=200):
         for s in range(n_steps)
     ]
 
-    # RMSF over the generated trajectory (all chains pooled)
-    all_frames = torch.stack([
-        frame for traj in trajectories for frame in traj[1:]
-    ], dim=0)
-    mu   = all_frames.mean(0)
-    rmsf = (all_frames - mu).norm(dim=-1).pow(2).mean(0).sqrt()
+    # RMSF over the generated trajectory, CA-based
+    ca_frames = torch.stack([
+        _ca(frame) for traj in trajectories for frame in traj[1:]
+    ], dim=0)                                          # [N, P, 3]
+    mu   = ca_frames.mean(0)
+    rmsf = (ca_frames - mu).norm(dim=-1).pow(2).mean(0).sqrt()
 
     # Physical validity summary across all chains × steps
     all_checks = [c for chain_v in validity_all for c in chain_v]
@@ -323,7 +327,8 @@ def main():
     edge_feats = ckpt["edge_feats"].to(device)
     taus_trained = hp["taus"]
     mode         = hp.get("mode", "ca")
-    gly_mask     = ckpt.get("gly_mask")   # [P] bool or None
+    gly_mask_raw = ckpt.get("gly_mask")
+    gly_mask     = gly_mask_raw.cpu() if gly_mask_raw is not None else None
 
     if args.tau not in taus_trained:
         print(f"Warning: --tau {args.tau} not in training taus {taus_trained}. "
@@ -399,9 +404,11 @@ def main():
         all_validity.append(validity)
         all_times.extend(step_times)
 
+        def _ca_f(f): return f[:, 1, :] if f.ndim == 3 else f
+        final_rmsd = (_ca_f(traj[-1]) - _ca_f(traj[0])).norm(dim=-1).pow(2).mean().sqrt().item()
         n_valid = sum(1 for c in validity if c["valid"])
         print(f"  Done. Mean disp/step: {sum(disps)/len(disps):.3f} Å  "
-              f"Final RMSD: {(traj[-1]-traj[0]).norm(dim=-1).pow(2).mean().sqrt().item():.3f} Å  "
+              f"Final RMSD: {final_rmsd:.3f} Å  "
               f"Valid steps: {n_valid}/{len(validity)}")
 
         # Per-chain multi-model PDB
