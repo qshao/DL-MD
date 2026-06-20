@@ -75,18 +75,50 @@ def write_trajectory_pdb(frames_list, res_names, path):
 
 
 # ---------------------------------------------------------------------------
+# Bond-length correction
+# ---------------------------------------------------------------------------
+
+def correct_bond_lengths(ca, target=3.8, n_iter=10):
+    """Project CA positions so all consecutive CA-CA distances equal target Å.
+
+    Uses symmetric SHAKE-style constraint projection: each bond's two atoms
+    are each moved by half the correction, preserving their shared midpoint.
+    Repeating n_iter times converges to within ~0.01 Å of target for typical
+    MD-generated conformations.
+
+    Args:
+        ca      : [P, 3] CA coordinates (modified in-place clone)
+        target  : ideal CA-CA bond length in Å (default 3.8)
+        n_iter  : number of projection passes (default 10)
+
+    Returns:
+        [P, 3] corrected CA coordinates
+    """
+    ca = ca.clone()
+    for _ in range(n_iter):
+        vecs  = ca[1:] - ca[:-1]                                   # [P-1, 3]
+        dists = vecs.norm(dim=-1, keepdim=True).clamp(min=1e-6)    # [P-1, 1]
+        corr  = vecs * (1.0 - target / dists) * 0.5               # [P-1, 3]
+        ca[:-1] = ca[:-1] + corr
+        ca[1:]  = ca[1:]  - corr
+    return ca
+
+
+# ---------------------------------------------------------------------------
 # Generative MD core
 # ---------------------------------------------------------------------------
 
 def run_chain(net, schedule, node_feats, edge_index, edge_feats,
-              x_start, x_ref, tau, n_steps, diff_steps, eta, sigma_init, device):
+              x_start, x_ref, tau, n_steps, diff_steps, eta, sigma_init,
+              device, bond_correction=False, bond_target=3.8, bond_iters=10):
     """Run a single autoregressive trajectory chain.
 
     At each step:
       1. Sample displacement Δ ~ DDPM(τ)
       2. Advance: x ← x + Δ
-      3. Kabsch-realign x onto x_ref to prevent orientation drift
-      4. Check physical validity with val.check_conformation
+      3. (optional) Project bond lengths back to bond_target Å
+      4. Kabsch-realign x onto x_ref to prevent orientation drift
+      5. Check physical validity with val.check_conformation
 
     Returns
     -------
@@ -116,6 +148,10 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
 
             # Advance
             x = x + delta
+
+            # Bond-length correction: project each CA-CA bond back to target length
+            if bond_correction:
+                x = correct_bond_lengths(x, target=bond_target, n_iter=bond_iters)
 
             # Kabsch re-align onto reference frame (frame-0 canonical orientation)
             # This prevents slow orientation drift over many steps while preserving
@@ -231,6 +267,12 @@ def main():
     ap.add_argument("--sigma_init",   type=float, default=1.0)
     ap.add_argument("--save_pt",      action="store_true",
                     help="Also save trajectory as .pt tensor [chains, steps+1, P, 3]")
+    ap.add_argument("--correct_bonds", action="store_true",
+                    help="Project CA-CA bonds back to 3.8 Å after each step")
+    ap.add_argument("--bond_target",  type=float, default=3.8,
+                    help="Target CA-CA bond length for --correct_bonds (default 3.8 Å)")
+    ap.add_argument("--bond_iters",   type=int,   default=10,
+                    help="Projection passes per step for --correct_bonds (default 10)")
     ap.add_argument("--device",       default=None)
     args = ap.parse_args()
 
@@ -285,6 +327,8 @@ def main():
     print(f"  Chains         : {args.n_chains}")
     print(f"  Total time     : {total_ns:.1f} ns  "
           f"({args.steps * args.tau * 200 * 1000 // 2}× faster than 2 fs MD)")
+    if args.correct_bonds:
+        print(f"  Bond correction: ON  (target={args.bond_target} Å, {args.bond_iters} iters/step)")
     print(f"  Device         : {device}")
     print()
 
@@ -304,6 +348,9 @@ def main():
             net, schedule, node_feats, edge_index, edge_feats,
             x_start, x_ref, args.tau, args.steps,
             args.diff_steps, args.eta, args.sigma_init, device,
+            bond_correction=args.correct_bonds,
+            bond_target=args.bond_target,
+            bond_iters=args.bond_iters,
         )
         all_trajs.append(traj)
         all_disps.append(disps)
@@ -334,9 +381,10 @@ def main():
 
     # Metrics
     metrics = compute_metrics(all_trajs, all_validity, args.tau)
-    metrics["source_frame"] = src
-    metrics["checkpoint"]   = args.checkpoint
-    metrics["time_labels"]  = time_labels
+    metrics["source_frame"]    = src
+    metrics["checkpoint"]      = args.checkpoint
+    metrics["time_labels"]     = time_labels
+    metrics["bond_correction"] = args.correct_bonds
 
     metrics_path = os.path.join(args.out, "metrics.json")
     with open(metrics_path, "w") as fh:
