@@ -57,11 +57,11 @@ def load_bead_trajectory(pdb_path, mode):
     for r in top.residues:
         ai_map = {a.name: a.index for a in r.atoms}
         indices = [ai_map.get(nm) for nm in bead_atom_names]
-        if any(v is None for v in indices[:2]):   # need at least CA (index 1 or 0)
-            continue
-        # Glycine may lack CB — fall back to CA index for the CB slot
+        # Glycine may lack CB — apply fallback BEFORE the None-check
         if n_beads > 1 and indices[-1] is None:
             indices[-1] = ai_map.get("CA")
+        if any(v is None for v in indices[:2]):   # need at least CA (index 1 or 0)
+            continue
         if None in indices:
             continue
         bead_indices.append(indices)
