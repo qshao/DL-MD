@@ -102,3 +102,39 @@ def node_features(res_type, chain_id, res_index, n_types):
     pos = res_index.float().unsqueeze(-1)
     pe = torch.cat([torch.sin(pos / 100.0), torch.cos(pos / 100.0)], dim=-1)
     return torch.cat([rt, ch, pe], dim=-1)
+
+
+def ca_displacement(X_i, X_j):
+    """Per-pair Kabsch-aligned CA displacement Δ = align(X_j→X_i) − X_i.
+
+    Removes whole-protein tumbling so Δ reflects internal conformational change.
+
+    Args:
+        X_i: source CA coords [P,3] or [B,P,3]
+        X_j: target CA coords [P,3] or [B,P,3]
+
+    Returns:
+        Δ: same shape as inputs.
+    """
+    R, t = g.kabsch(X_i, X_j)                       # align X_j onto X_i
+    X_j_aligned = X_j @ R.transpose(-1, -2) + t.unsqueeze(-2)
+    return X_j_aligned - X_i
+
+
+def ca_graph(X, k):
+    """kNN graph + invariant edge features from CA positions.
+
+    Args:
+        X: CA coords [P,3] (reference structure, frame-0 orientation).
+        k: neighbours per node.
+
+    Returns:
+        edge_index [2,E], edge_feats [E,4] = [rel_pos(3), dist(1)].
+        rel_pos is in the (canonicalized) frame-0 orientation.
+    """
+    edge_index = knn_graph(X, k)
+    src, dst = edge_index
+    rel_pos = X[dst] - X[src]                        # [E,3]
+    dist = rel_pos.norm(dim=-1, keepdim=True)        # [E,1]
+    edge_feats = torch.cat([rel_pos, dist], dim=-1)  # [E,4]
+    return edge_index, edge_feats

@@ -49,3 +49,50 @@ def test_edge_features_invariant():
     R2, t2 = Rg @ R, (Rg @ t.unsqueeze(-1)).squeeze(-1) + tg
     feats2 = f.edge_features(R2, t2, ei)
     assert torch.allclose(feats, feats2, atol=1e-4)
+
+
+def test_ca_displacement_identical_is_zero():
+    X = torch.randn(12, 3)
+    d = f.ca_displacement(X, X)
+    assert d.shape == (12, 3)
+    assert d.abs().max().item() < 1e-5
+
+
+def test_ca_displacement_pure_translation():
+    X = torch.randn(8, 3)
+    shift = torch.tensor([1.0, 2.0, -3.0])
+    Y = X + shift
+    d = f.ca_displacement(X, Y)
+    # Kabsch removes the global translation → near-zero internal displacement
+    assert d.abs().max().item() < 1e-4
+
+
+def test_ca_displacement_rotation_invariant_norms():
+    torch.manual_seed(0)
+    X_i = torch.randn(15, 3)
+    X_j = X_i + 0.1 * torch.randn(15, 3)        # small internal change
+    d1 = f.ca_displacement(X_i, X_j)
+    # Rotate BOTH frames by the same proper rotation Q
+    A = torch.randn(3, 3)
+    Q, _ = torch.linalg.qr(A)
+    if torch.linalg.det(Q) < 0:
+        Q[:, 0] = -Q[:, 0]
+    d2 = f.ca_displacement(X_i @ Q.T, X_j @ Q.T)
+    # displacement is equivariant → per-node magnitudes are invariant
+    assert torch.allclose(d1.norm(dim=-1), d2.norm(dim=-1), atol=1e-4)
+
+
+def test_ca_displacement_batched():
+    X_i = torch.randn(4, 10, 3)
+    X_j = torch.randn(4, 10, 3)
+    d = f.ca_displacement(X_i, X_j)
+    assert d.shape == (4, 10, 3)
+
+
+def test_ca_graph_shapes():
+    X = torch.randn(20, 3)
+    ei, ef = f.ca_graph(X, k=6)
+    assert ei.shape[0] == 2
+    assert ei.shape[1] == ef.shape[0]
+    assert ef.shape[1] == 4
+    assert ei.shape[1] == 20 * 6        # k edges per node
