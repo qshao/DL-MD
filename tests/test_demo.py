@@ -28,26 +28,23 @@ def test_run_demo_smoke(tmp_path):
     out = tmp_path / "out"
     report = demo.run_demo(
         path, path,
-        taus=[3, 5, 8], infer_tau=5,
-        out_dir=str(out), K=4, epochs=30, batch_size=8,
-        T_diff=20,          # small T for speed
-        diff_steps=5,       # few inference steps for speed
+        taus=[1, 2, 3], infer_tau=2,
+        out_dir=str(out), K=4, epochs=20, batch_size=8,
+        T_diff=20, diff_steps=5,
     )
-    # Structure keys
-    assert "model_geometry" in report
-    assert "diversity_rmsd" in report
-    assert "ramachandran_js" in report
-    assert "pca_js" in report
-    assert "ensemble_recall" in report
-    assert "ensemble_novelty" in report
-    assert "n_md_reference" in report
-    assert report["taus"] == [3, 5, 8]
-    assert report["infer_tau"] == 5
-    # PDB files written
+    for key in ("ca_geometry", "pca_js", "ensemble_recall", "ensemble_novelty",
+                "distance_matrix_js", "rmsf_corr", "displacement_js",
+                "n_md_reference"):
+        assert key in report
+    assert report["taus"] == [1, 2, 3]
+    assert report["infer_tau"] == 2
+    # CA-trace PDBs written, one per sample
     pdbs = list(out.glob("future_*.pdb"))
     assert len(pdbs) == 4
-    # Metrics in valid ranges
-    assert 0.0 <= report["ramachandran_js"] <= 1.0
-    assert 0.0 <= report["ensemble_recall"]  <= 1.0
+    # metrics in valid ranges
+    assert 0.0 <= report["pca_js"] <= 1.0
+    assert 0.0 <= report["distance_matrix_js"] <= 1.0
+    assert 0.0 <= report["displacement_js"] <= 1.0
+    assert 0.0 <= report["ensemble_recall"] <= 1.0
     assert 0.0 <= report["ensemble_novelty"] <= 1.0
-    assert report["diversity_rmsd"] >= 0.0
+    assert report["ca_geometry"]["clash_count"] >= 0
