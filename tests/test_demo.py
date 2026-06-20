@@ -36,6 +36,8 @@ def test_run_demo_smoke(tmp_path):
                 "distance_matrix_js", "rmsf_corr", "displacement_js",
                 "n_md_reference"):
         assert key in report
+    for key in ("pca_var_explained", "displacement_model_mean", "displacement_md_mean", "n_residues"):
+        assert key in report
     assert report["taus"] == [1, 2, 3]
     assert report["infer_tau"] == 2
     # CA-trace PDBs written, one per sample

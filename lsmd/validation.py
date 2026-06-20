@@ -260,7 +260,7 @@ def ensemble_recall(atoms_model, atoms_md, r_ang=2.0):
     M = ca_md.shape[0]
     covered = 0
     for m_idx in range(M):
-        diff = ca_model - ca_md[m_idx].unsqueeze(0)    # [K, N, 3]
+        diff = ca_model - ca_md[m_idx].unsqueeze(0)    # [K, P, 3]
         rmsd = diff.norm(dim=-1).pow(2).mean(dim=-1).sqrt()   # [K]
         if rmsd.min().item() < r_ang:
             covered += 1
@@ -287,7 +287,7 @@ def ensemble_novelty(atoms_model, atoms_md, r_ang=2.0):
     K = ca_model.shape[0]
     novel = 0
     for k_idx in range(K):
-        diff = ca_md - ca_model[k_idx].unsqueeze(0)    # [M, N, 3]
+        diff = ca_md - ca_model[k_idx].unsqueeze(0)    # [M, P, 3]
         rmsd = diff.norm(dim=-1).pow(2).mean(dim=-1).sqrt()   # [M]
         if rmsd.min().item() >= r_ang:
             novel += 1
