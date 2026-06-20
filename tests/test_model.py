@@ -255,3 +255,26 @@ def test_sample_ddpm_eta0_deterministic():
     s2 = m.sample_ddpm(net, nf, ei, ef, K=4, tau=50, schedule=sched,
                         steps=10, eta=0.0)
     assert torch.allclose(s1, s2)
+
+
+# ── point_dim parameter ────────────────────────────────────────────────────────
+
+def test_flownet_point_dim_3():
+    nf, ei, ef = _dummy_inputs(n=6, node_dim=8, edge_dim=4)
+    net = m.FlowNet(node_dim=8, edge_dim=4, hidden=32, layers=2, point_dim=3)
+    u_s = torch.randn(6, 3)
+    out = net(u_s, torch.tensor(0.4), nf, ei, ef, tau=50)
+    assert out.shape == (6, 3)
+
+
+def test_sample_ddpm_point_dim_3():
+    nf, ei, ef = _dummy_inputs(n=6, node_dim=8, edge_dim=4)
+    net = m.FlowNet(node_dim=8, edge_dim=4, hidden=32, layers=2, point_dim=3)
+    sched = m.NoiseSchedule(T=50)
+    samples = m.sample_ddpm(net, nf, ei, ef, K=5, tau=50, schedule=sched, steps=10)
+    assert samples.shape == (5, 6, 3)
+
+
+def test_default_point_dim_is_6():
+    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=16, layers=1)
+    assert net.point_dim == 6

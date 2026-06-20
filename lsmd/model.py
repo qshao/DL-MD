@@ -98,21 +98,22 @@ class FlowNet(nn.Module):
     """Conditional flow-matching graph network.
 
     Operates entirely in the invariant delta-space. Accepts both unbatched
-    [N, 6] and batched [B, N, 6] inputs; the batch path is used during
+    [N, point_dim] and batched [B, N, point_dim] inputs; the batch path is used during
     mini-batch training and for parallel sampling.
     """
 
-    def __init__(self, node_dim, edge_dim, hidden=64, layers=3, tau_emb_dim=16):
+    def __init__(self, node_dim, edge_dim, hidden=64, layers=3, tau_emb_dim=16, point_dim=6):
         super().__init__()
         self.tau_emb_dim = tau_emb_dim
-        # input: node features + u (6) + flow-time s (1) + tau embedding (tau_emb_dim)
-        self.embed = nn.Linear(node_dim + 6 + 1 + tau_emb_dim, hidden)
+        self.point_dim = point_dim
+        # input: node features + u (point_dim) + flow-time s (1) + tau embedding
+        self.embed = nn.Linear(node_dim + point_dim + 1 + tau_emb_dim, hidden)
         self.layers = nn.ModuleList(
             [MessageLayer(hidden, edge_dim) for _ in range(layers)]
         )
         self.head = nn.Sequential(
             nn.Linear(hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, 6),
+            nn.Linear(hidden, point_dim),
         )
 
     def forward(self, u_s, s, node_feats, edge_index, edge_feats, tau):
@@ -212,11 +213,11 @@ def sample(net, node_feats, edge_index, edge_feats, K, tau, steps=50, sigma=0.1)
         sigma:      Prior scale (must match training).
 
     Returns:
-        samples: [K, N, 6]
+        samples: [K, N, net.point_dim]
     """
     n = node_feats.shape[0]
-    # All K draws in one [K, N, 6] tensor — batched forward each step
-    u = torch.randn(K, n, 6, device=node_feats.device, dtype=node_feats.dtype) * sigma
+    # All K draws in one [K, N, point_dim] tensor — batched forward each step
+    u = torch.randn(K, n, net.point_dim, device=node_feats.device, dtype=node_feats.dtype) * sigma
     for i in range(steps):
         s = torch.tensor(i / steps, dtype=node_feats.dtype, device=node_feats.device)
         v = net(u, s, node_feats, edge_index, edge_feats, tau)  # [K, N, 6]
@@ -324,14 +325,14 @@ def sample_ddpm(net, node_feats, edge_index, edge_feats, K, tau, schedule,
         sigma_init:  Scale of the initial noise.
 
     Returns:
-        samples: [K, N, 6]
+        samples: [K, N, net.point_dim]
     """
     T = schedule.T
     N = node_feats.shape[0]
     device = node_feats.device
     dtype = node_feats.dtype
 
-    u = torch.randn(K, N, 6, device=device, dtype=dtype) * sigma_init
+    u = torch.randn(K, N, net.point_dim, device=device, dtype=dtype) * sigma_init
 
     # Strided timesteps T-1..0, steps+1 values
     t_full = torch.round(

@@ -41,3 +41,14 @@ def test_write_pdb(tmp_path):
     dec.write_pdb(atoms, ["ALA", "GLY", "ALA"], str(p))
     text = p.read_text()
     assert "ATOM" in text and "CA" in text
+
+
+def test_write_ca_pdb(tmp_path):
+    ca = torch.randn(5, 3)
+    path = tmp_path / "ca.pdb"
+    dec.write_ca_pdb(ca, ["ALA"] * 5, str(path))
+    lines = path.read_text().splitlines()
+    atom_lines = [l for l in lines if l.startswith("ATOM")]
+    assert len(atom_lines) == 5
+    assert atom_lines[0][12:16].strip() == "CA"
+    assert lines[-1].strip() == "END"

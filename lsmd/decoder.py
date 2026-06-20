@@ -133,3 +133,26 @@ def write_pdb(atoms, res_type_names, path):
     lines.append("END")
     with open(path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
+
+
+def write_ca_pdb(ca, res_type_names, path):
+    """Write a CA-only trace to a PDB file (one CA atom per residue).
+
+    Args:
+        ca: CA coordinates [P, 3]
+        res_type_names: list of residue names (length P), e.g. ["ALA", ...]
+        path: output file path
+
+    Returns:
+        None (writes to file).
+    """
+    lines = []
+    for ri in range(ca.shape[0]):
+        x, y, z = ca[ri].tolist()
+        lines.append(
+            f"ATOM  {ri + 1:5d}  CA  {res_type_names[ri]:>3s} A{ri + 1:4d}    "
+            f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C"
+        )
+    lines.append("END")
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
