@@ -21,7 +21,9 @@ def load_frames(traj_path, top_path):
             - n_types: number of unique residue types
     """
     traj = md.load(traj_path, top=top_path)
-    traj.superpose(traj, 0)   # align all frames to frame 0 to remove rigid-body drift
+    ca_idx = traj.topology.select("protein and name CA")
+    if len(ca_idx) > 0:
+        traj.superpose(traj, 0, atom_indices=ca_idx)
     top = traj.topology
     residues = [r for r in top.residues if r.name != "HOH"]
 
