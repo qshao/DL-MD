@@ -107,40 +107,73 @@ def write_trajectory_pdb(frames_list, res_names, path, gly_mask=None):
 # Generative MD core
 # ---------------------------------------------------------------------------
 
+def _ca_from_frame(x, mode):
+    """Extract CA positions [P, 3] from a bead frame regardless of mode."""
+    if x.ndim == 2:      return x               # CA-only [P, 3]
+    if x.shape[1] == 2:  return x[:, 0, :]      # 2-bead  CA at index 0
+    return x[:, 1, :]                            # 4-bead  CA at index 1
+
+
+def _nearest_md_frame(x, frames_t, mode, device):
+    """Return the training frame closest to x by mean-centred CA-RMSD."""
+    ca_cur = _ca_from_frame(x, mode)                        # [P, 3]
+    if frames_t.ndim == 3:
+        ca_ref = frames_t                                    # [F, P, 3]
+    elif frames_t.shape[2] == 2:
+        ca_ref = frames_t[:, :, 0, :]                       # 2-bead
+    else:
+        ca_ref = frames_t[:, :, 1, :]                       # 4-bead
+
+    # Mean-centre to make comparison rotation-invariant
+    ca_q = ca_cur - ca_cur.mean(0)
+    ca_r = ca_ref.to(device) - ca_ref.to(device).mean(1, keepdim=True)
+    sq   = ((ca_r - ca_q.unsqueeze(0)) ** 2).sum(-1).mean(-1)   # [F]
+    return frames_t[int(sq.argmin().item())].to(device)
+
+
 def run_chain(net, schedule, node_feats, edge_index, edge_feats,
               x_start, x_ref, tau, n_steps, diff_steps, eta, sigma_init,
               device, bond_correction=False, bond_target=3.8, bond_iters=10,
               min_energy=False, k_bond=10.0, k_clash=1.0, min_steps=100,
-              mode="ca", gly_mask=None, rama_potential=None, k_rama=1.0):
+              mode="ca", gly_mask=None, rama_potential=None, k_rama=1.0,
+              sample_mode="explore", anchor_every=50, frames_t=None):
     """Run a single autoregressive trajectory chain.
 
-    At each step:
-      1. Sample displacement Δ ~ DDPM(τ)
-      2. Advance: x ← x + Δ
-      3. (optional) Project bond lengths back to bond_target Å
-      4. Kabsch-realign x onto x_ref to prevent orientation drift
-      5. Check physical validity with val.check_conformation
+    sample_mode controls how errors are managed between steps:
+
+      "explore"  (default) — after each step, if the conformation is invalid
+          (bond / clash / Rg violation), the next step starts from the last
+          valid frame rather than the bad one.  This prevents runaway unfolding
+          while still allowing wide conformational exploration.
+
+      "mimic"  — every ``anchor_every`` steps the current position is replaced
+          by the nearest real MD frame (by CA-RMSD).  This keeps the trajectory
+          inside the training distribution and reproduces the MD ensemble rather
+          than exploring beyond it.
 
     Returns
     -------
-    trajectory    : list of n_steps+1 tensors [P,3] on CPU (step 0 = start)
+    trajectory    : list of n_steps+1 tensors [P,…] on CPU (step 0 = start)
     displacements : list of n_steps floats — mean per-atom ‖Δ‖ per step
     validity      : list of n_steps dicts from val.check_conformation
     step_times    : list of n_steps floats — wall-clock seconds per step
+    n_events      : int — revert count (explore) or re-anchor count (mimic)
     """
     x = x_start.to(device).clone()
-    x_ref_dev = x_ref.to(device)
-    trajectory = [x.cpu()]
-    displacements = []
-    validity = []
-    step_times = []
+    x_ref_dev   = x_ref.to(device)
+    trajectory  = [x.cpu()]
+    displacements, validity, step_times = [], [], []
+
+    # explore mode: fall back to last valid frame on failure
+    x_last_valid = x.clone()
+    n_events = 0          # reverts (explore) or re-anchors (mimic)
 
     net.eval()
     with torch.no_grad():
         for step in range(n_steps):
             t0 = time.perf_counter()
 
-            # Sample one displacement  [P,3] for CA, [P,12] for 4-bead
+            # ── 1. Sample displacement ──────────────────────────────────
             raw = m.sample_ddpm(
                 net, node_feats, edge_index, edge_feats,
                 K=1, tau=tau, schedule=schedule,
@@ -148,15 +181,12 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
             )[0]
 
             n_beads = {"4bead": 4, "2bead": 2}.get(mode, 1)
-            if n_beads > 1:
-                delta = raw.reshape(x.shape[0], n_beads, 3)
-            else:
-                delta = raw                              # [P, 3]
+            delta   = raw.reshape(x.shape[0], n_beads, 3) if n_beads > 1 else raw
 
-            # Advance
+            # ── 2. Advance ──────────────────────────────────────────────
             x = x + delta
 
-            # Geometry correction
+            # ── 3. Geometry correction ──────────────────────────────────
             if min_energy:
                 if mode == "4bead":
                     x = val.minimize_energy_4bead(x, gly_mask=gly_mask,
@@ -182,12 +212,12 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
                     ca_x[1:]  = ca_x[1:]  - corr
                 x = ca_x
 
-            # Kabsch re-align onto reference frame using CA positions
-            ca_idx = {"4bead": 1, "2bead": 0}.get(mode, None)
-            P_res  = x.shape[0]
-            if ca_idx is not None:
-                ca_x     = x[:, ca_idx, :]
-                ca_ref   = x_ref_dev[:, ca_idx, :]
+            # ── 4. Kabsch re-align onto reference frame ─────────────────
+            ca_bead_idx = {"4bead": 1, "2bead": 0}.get(mode, None)
+            P_res       = x.shape[0]
+            if ca_bead_idx is not None:
+                ca_x     = x[:, ca_bead_idx, :]
+                ca_ref   = x_ref_dev[:, ca_bead_idx, :]
                 R, t_vec = g.kabsch(ca_ref, ca_x)
                 x_flat   = x.reshape(P_res * n_beads, 3)
                 x_flat   = x_flat @ R.transpose(-1, -2) + t_vec.unsqueeze(0)
@@ -203,7 +233,7 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
             disp = delta.norm(dim=-1).pow(2).mean().sqrt().item()
             displacements.append(disp)
 
-            # Physical validity check
+            # ── 5. Physical validity check ──────────────────────────────
             if mode == "4bead":
                 check = val.check_4bead_conformation(x_cpu, gly_mask=gly_mask,
                                                      rama_potential=rama_potential)
@@ -213,7 +243,24 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
                 check = val.check_conformation(x_cpu)
             validity.append(check)
 
-    return trajectory, displacements, validity, step_times
+            # ── 6. Sample-mode corrections ──────────────────────────────
+            if sample_mode == "explore":
+                # Revert starting point to last valid frame when the step
+                # fails, so errors don't compound into runaway unfolding.
+                if check["valid"]:
+                    x_last_valid = x.clone()
+                else:
+                    x = x_last_valid
+                    n_events += 1
+
+            elif sample_mode == "mimic" and frames_t is not None:
+                # Periodically snap back to the nearest real MD frame so
+                # the trajectory stays inside the training distribution.
+                if (step + 1) % anchor_every == 0:
+                    x = _nearest_md_frame(x, frames_t, mode, device)
+                    n_events += 1
+
+    return trajectory, displacements, validity, step_times, n_events
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +386,14 @@ def main():
                          "coupling to bond/clash terms is problematic; check validation output instead)")
     ap.add_argument("--min_steps",    type=int,   default=100,
                     help="Max L-BFGS iterations per step for --min_energy (default 100)")
+    ap.add_argument("--sample_mode",  default="explore",
+                    choices=["explore", "mimic"],
+                    help="'explore' (default): revert to last valid frame on failure, "
+                         "enabling wide conformational search without runaway unfolding. "
+                         "'mimic': re-anchor to nearest MD frame every --anchor_every steps "
+                         "to reproduce the training-data ensemble.")
+    ap.add_argument("--anchor_every", type=int,   default=50,
+                    help="Re-anchor interval for --sample_mode mimic (default 50 steps)")
     ap.add_argument("--device",       default=None)
     args = ap.parse_args()
 
@@ -405,6 +460,11 @@ def main():
     elif args.correct_bonds:
         print(f"  Bond correction: ON  (SHAKE, target={args.bond_target} Å, "
               f"{args.bond_iters} iters/step)")
+    if args.sample_mode == "explore":
+        print(f"  Sample mode    : explore  (revert to last valid frame on failure)")
+    else:
+        print(f"  Sample mode    : mimic  (re-anchor to nearest MD frame every "
+              f"{args.anchor_every} steps)")
     print(f"  Device         : {device}")
     print()
 
@@ -416,15 +476,16 @@ def main():
     print(f"  Mode           : {mode_labels.get(mode, mode)}")
 
     # Run chains
-    all_trajs     = []
-    all_disps     = []
-    all_validity  = []
-    all_times     = []
-    time_labels   = [f"{i * ps_step / 1000:.2f} ns" for i in range(args.steps + 1)]
+    all_trajs       = []
+    all_disps       = []
+    all_validity    = []
+    all_times       = []
+    total_events    = 0
+    time_labels     = [f"{i * ps_step / 1000:.2f} ns" for i in range(args.steps + 1)]
 
     for chain_idx in range(args.n_chains):
         print(f"Chain {chain_idx + 1}/{args.n_chains} ...", flush=True)
-        traj, disps, validity, step_times = run_chain(
+        traj, disps, validity, step_times, n_events = run_chain(
             net, schedule, node_feats, edge_index, edge_feats,
             x_start, x_ref, args.tau, args.steps,
             args.diff_steps, args.eta, args.sigma_init, device,
@@ -439,11 +500,15 @@ def main():
             gly_mask=gly_mask,
             rama_potential=rama_pot,
             k_rama=args.k_rama,
+            sample_mode=args.sample_mode,
+            anchor_every=args.anchor_every,
+            frames_t=X_all,
         )
         all_trajs.append(traj)
         all_disps.append(disps)
         all_validity.append(validity)
         all_times.extend(step_times)
+        total_events += n_events
 
         def _ca_f(f):
             if f.ndim == 2:     return f
@@ -451,9 +516,11 @@ def main():
             return f[:, 1, :]
         final_rmsd = (_ca_f(traj[-1]) - _ca_f(traj[0])).norm(dim=-1).pow(2).mean().sqrt().item()
         n_valid = sum(1 for c in validity if c["valid"])
+        event_label = ("reverts" if args.sample_mode == "explore" else "re-anchors")
         print(f"  Done. Mean disp/step: {sum(disps)/len(disps):.3f} Å  "
               f"Final RMSD: {final_rmsd:.3f} Å  "
-              f"Valid steps: {n_valid}/{len(validity)}")
+              f"Valid steps: {n_valid}/{len(validity)}  "
+              f"{event_label}: {n_events}")
 
         # Per-chain multi-model PDB
         if args.n_chains > 1:
@@ -520,6 +587,10 @@ def main():
           f"clashes={v['n_clashes']}, "
           f"Rg viol={v['n_rg_violations']}"
           f"{rama_str}]")
+    event_label = "reverts" if args.sample_mode == "explore" else "re-anchors"
+    print(f"  Sample mode     : {args.sample_mode}"
+          + (f"  (anchor every {args.anchor_every} steps)" if args.sample_mode == "mimic" else "")
+          + f"  {event_label}: {total_events}")
     print(f"  Time/step       : {mean_step_s:.3f} s  "
           f"→ {timing_info['total_min']:.1f} min for 1000 ns "
           f"({timing_info['speedup_vs_classical_md']:.0f}× vs classical MD)")
