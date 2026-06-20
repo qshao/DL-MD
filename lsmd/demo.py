@@ -42,6 +42,8 @@ def train(frames, tau, epochs, k, hidden, layers, sigma, lr):
     """
     pairs = data.make_pairs(frames["R"].shape[0], tau)
     train_pairs, _ = data.time_split(pairs, val_frac=0.2)
+    if train_pairs.shape[0] == 0:
+        raise ValueError("No training pairs: tau too large relative to trajectory length.")
 
     node_feats, edge_index, edge_feats = _build_ctx(frames, k)
 

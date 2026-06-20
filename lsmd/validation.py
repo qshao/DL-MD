@@ -15,7 +15,7 @@ def geometry_metrics(atoms):
     ca_bonds = (ca[1:] - ca[:-1]).norm(dim=-1)
     d = torch.cdist(ca, ca)
     n = ca.shape[0]
-    mask = ~torch.eye(n, dtype=torch.bool)
+    mask = ~torch.eye(n, dtype=torch.bool, device=ca.device)
     for i in range(n - 1):
         mask[i, i + 1] = mask[i + 1, i] = False
     clash_count = ((d < 2.0) & mask).sum().item() / 2
@@ -40,7 +40,7 @@ def diversity(atoms_K):
     total, count = 0.0, 0
     for i in range(K):
         for j in range(i + 1, K):
-            total += (ca[i] - ca[j]).pow(2).mean().sqrt().item()
+            total += (ca[i] - ca[j]).norm(dim=-1).pow(2).mean().sqrt().item()
             count += 1
     return total / max(count, 1)
 
@@ -56,6 +56,8 @@ def ensemble_overlap(ca_gen, ca_md, bins=30):
     Returns:
         float: Overlap in [0, 1]
     """
+    if ca_gen.shape[0] < 2 or ca_md.shape[0] < 2:
+        return 0.0
     dg = torch.pdist(ca_gen)
     dm = torch.pdist(ca_md)
     lo = min(dg.min(), dm.min()).item()
