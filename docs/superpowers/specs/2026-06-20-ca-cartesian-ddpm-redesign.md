@@ -60,9 +60,28 @@ the per-point dimension (always 3). This is the single extensibility hook.
   (chosen: per-pair Kabsch). Align `X_j` onto `X_i` (rotation + translation that
   minimizes CA-RMSD), then `Δ = X_j^{aligned} − X_i ∈ ℝ^{P×3}`. This isolates
   internal conformational change from whole-protein tumbling.
-- Inference: condition on `X_i`, sample `Δ`, output `X_j = X_i + Δ` (expressed in
-  the `X_i` frame; global orientation is unobservable and irrelevant to
-  conformational dynamics).
+- Inference: pick a source frame `X_i`, sample `Δ`, output `X_j = X_i + Δ`
+  (expressed in the `X_i` frame; global orientation is unobservable and
+  irrelevant to conformational dynamics).
+
+### Conditioning and equivariance
+
+- **Static reference graph.** As in the existing SE(3) pipeline, the kNN graph
+  and edge features are built once from a reference structure (frame 0's CA
+  positions) and shared across the batch — this keeps the batched message
+  passing intact. The network learns the displacement distribution `P(Δ | τ)`
+  conditioned on the reference graph and the lag embedding; sampled `Δ` are
+  applied to the chosen source frame at decode time. Conditioning on the
+  *specific* source conformation `X_i` (per-state graph or `X_i` node features)
+  is a documented future improvement, deferred to keep this iteration a minimal,
+  correct CA port.
+- **Edge features (CA-only).** `[rel_pos(3), dist(1)]` in the frame-0 orientation
+  → `edge_dim = 4`. There is no per-residue rotation, so the rotation-based
+  terms of the SE(3) `edge_features` are dropped.
+- **Equivariance.** Global CA superposition to frame 0 canonicalizes orientation
+  across the whole dataset, so a plain (non-equivariant) graph net suffices —
+  displacements live in the common frame-0 frame. No equivariant architecture
+  is introduced.
 
 ### Components
 
@@ -71,7 +90,7 @@ the per-point dimension (always 3). This is the single extensibility hook.
 | `data.py` | Add `make_molecules_whole()`; CA-only superposition (protein CA atoms, not all atoms). Return CA point cloud `X [F, P, 3]` plus residue node attributes. `compute_frame_weights` already operates on CA coordinates — unchanged. |
 | `geometry.py` | Add `kabsch(X, Y) → (R, t)` returning the rigid transform aligning `Y` onto `X`. |
 | `featurize.py` | Add `ca_displacement(X_i, X_j)` (Kabsch-align `X_j`→`X_i`, return `Δ`). Add CA kNN graph + node features (residue identity / index / chain). SE(3) `relative_update`/`apply_update` retained for the future backbone path but unused by the CA pipeline. |
-| `model.py` | Parametrize the hardcoded point dimension `6 → point_dim` (default `3`) in `FlowNet.__init__`, `sample`, and `sample_ddpm`. DDPM loss, schedule, and message passing are otherwise unchanged (they already generalize over the last dim). |
+| `model.py` | Add a `point_dim` parameter to `FlowNet.__init__` (default `6`, preserving the SE(3) path and all existing tests). Store it as `self.point_dim`; use it for the embed input width and head output width. `sample` and `sample_ddpm` read `net.point_dim` instead of the literal `6`. The CA pipeline constructs `FlowNet(point_dim=3)`. DDPM loss, schedule, and message passing are unchanged (already generalize over the last dim). |
 | `decoder.py` | CA path: `X_i + Δ` → write CA trace (one CA per residue) as PDB with element C. SE(3) frame→atom decoder retained for the future backbone path. |
 | `validation.py` | Drop Ramachandran JS from the CA path (needs N/C — revisit with backbone atoms). Keep PCA-JS and recall/novelty (CA-RMSD based). Add `distance_matrix_js` (CA–CA pairwise distance distribution), `rmsf_profile` (per-residue fluctuation, model vs MD), and `displacement_distribution` (‖Δ‖ histogram per τ, separating fluctuation bulk from transition tail). |
 | `demo.py` | Wire the CA pipeline: load → whole+superpose → multi-lag Kabsch displacement targets → DDPM train → sample Δ → reconstruct CA → CA-appropriate metrics. |
@@ -91,18 +110,19 @@ def ca_displacement(X_i, X_j):
 def ca_graph(X, k):
     """kNN graph + edge features from CA positions X [P,3]. Returns (edge_index, edge_feats)."""
 
-# model.py  (point_dim default 3)
+# model.py  (point_dim default 6 = SE(3); CA path passes point_dim=3)
 class FlowNet(nn.Module):
     def __init__(self, node_dim, edge_dim, hidden=64, layers=3,
-                 tau_emb_dim=16, point_dim=3): ...
-
-def sample_ddpm(net, node_feats, edge_index, edge_feats, K, tau, schedule,
-                steps=50, eta=1.0, sigma_init=1.0, point_dim=3) -> "[K,P,3]": ...
+                 tau_emb_dim=16, point_dim=6): ...
+# sample_ddpm/sample read net.point_dim → return [K, P, net.point_dim]
 
 # validation.py
-def distance_matrix_js(ca_model, ca_md, bins=30) -> float
+# pca_js, ensemble_recall, ensemble_novelty accept EITHER [.,N,4,3] (extract CA)
+# OR a CA point cloud [.,P,3] directly (rank-3 input used as-is).
+def ca_geometry(ca) -> {"ca_bond_mean", "ca_bond_min", "ca_bond_max", "clash_count"}  # ca [P,3]
+def distance_matrix_js(ca_model, ca_md, bins=30) -> float   # ca_* [.,P,3]
 def rmsf_profile(ca_model, ca_md) -> {"model": [P], "md": [P], "corr": float}
-def displacement_distribution(ca_model, ca_md, x_init, bins=30) -> {"js": float, ...}
+def displacement_js(disp_model, disp_md, bins=30) -> {"js", "model_mean", "md_mean"}  # disp_* 1-D RMSD magnitudes
 ```
 
 ## Test plan
@@ -124,11 +144,13 @@ def displacement_distribution(ca_model, ca_md, x_init, bins=30) -> {"js": float,
 ## CLI changes
 
 - Remove SE(3)-specific assumptions; `--taus` default becomes `1 2 5`.
-- Add `--atoms` (default `CA`) reserved for the future backbone/all-atom path
-  (only `CA` supported in this iteration; validated and errors otherwise).
-- Report keys: `ca_geometry` (CA–CA bond stats), `pca_js`, `pca_var_explained`,
-  `ensemble_recall`, `ensemble_novelty`, `distance_matrix_js`, `rmsf_corr`,
-  `displacement_js`, `n_residues`, `n_md_reference`, `taus`, `infer_tau`.
+- No `--atoms` flag this iteration (YAGNI): CA-only is hardwired. The
+  point-cloud representation still permits a clean backbone extension later;
+  the flag is added when that path is built.
+- Report keys: `ca_geometry` (CA–CA bond stats dict), `pca_js`,
+  `pca_var_explained`, `ensemble_recall`, `ensemble_novelty`,
+  `distance_matrix_js`, `rmsf_corr`, `displacement_js`, `displacement_model_mean`,
+  `displacement_md_mean`, `n_residues`, `n_md_reference`, `taus`, `infer_tau`.
 
 ## Limitations
 
