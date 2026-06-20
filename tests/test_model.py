@@ -9,20 +9,103 @@ def _dummy_inputs(n=6, node_dim=8, edge_dim=13):
     return node_feats, edge_index, edge_feats
 
 
-def test_flownet_output_shape():
+# ── tau_embedding ──────────────────────────────────────────────────────────────
+
+def test_tau_embedding_scalar_shape():
+    emb = m.tau_embedding(50, dim=16)
+    assert emb.shape == (16,)
+
+
+def test_tau_embedding_batched_shape():
+    taus = torch.tensor([10.0, 50.0, 200.0])
+    emb = m.tau_embedding(taus, dim=16)
+    assert emb.shape == (3, 16)
+
+
+def test_tau_embedding_varies_with_tau():
+    emb10 = m.tau_embedding(10, dim=16)
+    emb200 = m.tau_embedding(200, dim=16)
+    assert not torch.allclose(emb10, emb200)
+
+
+# ── FlowNet unbatched ──────────────────────────────────────────────────────────
+
+def test_flownet_unbatched_shape():
     nf, ei, ef = _dummy_inputs()
     net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
     u_s = torch.randn(6, 6)
-    s = torch.tensor(0.4)
-    v = net(u_s, s, nf, ei, ef, tau=50)
+    v = net(u_s, torch.tensor(0.4), nf, ei, ef, tau=50)
     assert v.shape == (6, 6)
 
 
-def test_tau_embedding_shape_and_varies():
-    emb10 = m.tau_embedding(10, dim=16)
-    emb100 = m.tau_embedding(100, dim=16)
-    assert emb10.shape == (16,)
-    assert not torch.allclose(emb10, emb100), "tau=10 and tau=100 must produce different embeddings"
+def test_flownet_batched_shape():
+    nf, ei, ef = _dummy_inputs()
+    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
+    B = 4
+    u_s = torch.randn(B, 6, 6)
+    tau_b = torch.tensor([10.0, 25.0, 50.0, 100.0])
+    s_b = torch.rand(B)
+    v = net(u_s, s_b, nf, ei, ef, tau=tau_b)
+    assert v.shape == (B, 6, 6)
+
+
+def test_batched_matches_unbatched():
+    """Batched forward must produce the same result as B sequential unbatched calls."""
+    torch.manual_seed(42)
+    nf, ei, ef = _dummy_inputs()
+    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
+    net.eval()
+
+    taus = [10, 50, 100]
+    s_vals = [0.1, 0.5, 0.9]
+    u_list = [torch.randn(6, 6) for _ in taus]
+
+    # Unbatched reference
+    v_ref = torch.stack([
+        net(u, torch.tensor(s), nf, ei, ef, tau=tau)
+        for u, s, tau in zip(u_list, s_vals, taus)
+    ])  # [3, 6, 6]
+
+    # Batched
+    u_batch = torch.stack(u_list)               # [3, 6, 6]
+    s_batch = torch.tensor(s_vals)              # [3]
+    tau_batch = torch.tensor(taus, dtype=torch.float32)  # [3]
+    v_batch = net(u_batch, s_batch, nf, ei, ef, tau=tau_batch)
+
+    assert torch.allclose(v_ref, v_batch, atol=1e-5), \
+        f"max diff: {(v_ref - v_batch).abs().max().item():.2e}"
+
+
+def test_different_tau_gives_different_output():
+    nf, ei, ef = _dummy_inputs()
+    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
+    u_s = torch.randn(6, 6)
+    s = torch.tensor(0.5)
+    v10 = net(u_s, s, nf, ei, ef, tau=10)
+    v200 = net(u_s, s, nf, ei, ef, tau=200)
+    assert not torch.allclose(v10, v200)
+
+
+# ── cfm_loss ───────────────────────────────────────────────────────────────────
+
+def test_cfm_loss_unbatched():
+    nf, ei, ef = _dummy_inputs()
+    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
+    u_target = torch.randn(6, 6)
+    loss = m.cfm_loss(net, u_target, nf, ei, ef, tau=50)
+    assert loss.shape == ()
+    assert loss.item() > 0
+
+
+def test_cfm_loss_batched():
+    nf, ei, ef = _dummy_inputs()
+    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
+    B = 4
+    u_target = torch.randn(B, 6, 6)
+    tau_b = torch.tensor([10.0, 25.0, 50.0, 100.0])
+    loss = m.cfm_loss(net, u_target, nf, ei, ef, tau=tau_b)
+    assert loss.shape == ()
+    assert loss.item() > 0
 
 
 def test_cfm_can_overfit_constant_target():
@@ -38,24 +121,20 @@ def test_cfm_can_overfit_constant_target():
         opt.step()
     samples = m.sample(net, nf, ei, ef, K=8, tau=50, steps=50, sigma=0.1)
     assert samples.shape == (8, 6, 6)
-    # sampled mean should be near the target it was trained to reproduce
     assert (samples.mean(0) - u_target).abs().mean() < 0.3
+
+
+# ── sample ─────────────────────────────────────────────────────────────────────
+
+def test_sample_shape():
+    nf, ei, ef = _dummy_inputs()
+    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
+    samples = m.sample(net, nf, ei, ef, K=8, tau=50, steps=20, sigma=0.2)
+    assert samples.shape == (8, 6, 6)
 
 
 def test_sampler_is_diverse():
     nf, ei, ef = _dummy_inputs()
     net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
     samples = m.sample(net, nf, ei, ef, K=8, tau=50, steps=20, sigma=0.2)
-    spread = samples.std(0).mean()
-    assert spread > 0.0
-
-
-def test_different_tau_gives_different_output():
-    """Network conditioned on different taus must produce different velocities."""
-    nf, ei, ef = _dummy_inputs()
-    net = m.FlowNet(node_dim=8, edge_dim=13, hidden=32, layers=2)
-    u_s = torch.randn(6, 6)
-    s = torch.tensor(0.5)
-    v10 = net(u_s, s, nf, ei, ef, tau=10)
-    v200 = net(u_s, s, nf, ei, ef, tau=200)
-    assert not torch.allclose(v10, v200)
+    assert samples.std(0).mean() > 0.0

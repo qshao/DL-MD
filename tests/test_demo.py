@@ -29,12 +29,11 @@ def test_run_demo_smoke(tmp_path):
     report = demo.run_demo(
         path, path,
         taus=[3, 5, 8], infer_tau=5,
-        out_dir=str(out), K=4, epochs=30,
+        out_dir=str(out), K=4, epochs=30, batch_size=8,
     )
     assert "model_geometry" in report
     assert "diversity" in report
     assert report["taus"] == [3, 5, 8]
     assert report["infer_tau"] == 5
-    # K PDB files were written
     pdbs = list(out.glob("future_*.pdb"))
     assert len(pdbs) == 4

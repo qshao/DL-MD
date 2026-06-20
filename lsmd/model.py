@@ -2,37 +2,48 @@
 
 All inputs and outputs live in the invariant delta-space, so a plain
 graph net suffices — equivariance is guaranteed by construction.
+
+Both FlowNet and MessageLayer support unbatched [N, ...] and batched
+[B, N, ...] inputs via a shared forward path.
 """
 import torch
 import torch.nn as nn
 
 
 def tau_embedding(tau, dim=16, device=None, dtype=torch.float32):
-    """Log-sinusoidal embedding of a lag-time scalar.
+    """Log-sinusoidal embedding of lag time tau.
 
     Uses log(tau) so the embedding varies smoothly across orders of magnitude.
-    At inference, any tau value (seen or unseen during training) can be passed.
+    Works for any tau at inference, including values not seen during training.
 
     Args:
-        tau:    Lag time in frames — Python int, float, or scalar tensor.
+        tau:    Scalar int/float/tensor, or [B] tensor for batched input.
         dim:    Embedding dimension (must be even).
         device: Target device.
         dtype:  Target dtype.
 
     Returns:
-        emb: [dim] float32 tensor
+        [dim] for scalar input, [B, dim] for [B] input.
     """
     tau = torch.as_tensor(tau, dtype=dtype, device=device)
-    log_tau = torch.log(tau.clamp_min(1.0))                   # log-scale
+    scalar = tau.dim() == 0
+    if scalar:
+        tau = tau.unsqueeze(0)          # [1]
+    log_tau = torch.log(tau.clamp_min(1.0))          # [B]
     half = dim // 2
     freqs = torch.arange(half, dtype=dtype, device=device) / half
-    freqs = 10.0 ** freqs                                      # log-spaced frequencies
-    args = log_tau * freqs
-    return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # [dim]
+    freqs = 10.0 ** freqs               # [half] — log-spaced frequencies
+    args = log_tau.unsqueeze(-1) * freqs.unsqueeze(0)   # [B, half]
+    emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # [B, dim]
+    return emb.squeeze(0) if scalar else emb
 
 
 class MessageLayer(nn.Module):
-    """Single message-passing layer with mean aggregation and residual update."""
+    """Single message-passing layer with mean aggregation and residual update.
+
+    Accepts both unbatched [N, H] and batched [B, N, H] node features.
+    The graph topology (edge_index, edge_feats) is shared across the batch.
+    """
 
     def __init__(self, hidden, edge_dim):
         super().__init__()
@@ -46,22 +57,49 @@ class MessageLayer(nn.Module):
         )
 
     def forward(self, h, edge_index, edge_feats):
-        src, dst = edge_index
-        msg = self.msg(torch.cat([h[src], h[dst], edge_feats], dim=-1))
-        agg = torch.zeros_like(h)
-        agg.index_add_(0, dst, msg)
-        deg = torch.zeros(h.shape[0], 1, device=h.device).index_add_(
-            0, dst, torch.ones(dst.shape[0], 1, device=h.device))
-        agg = agg / deg.clamp_min(1.0)
-        return h + self.upd(torch.cat([h, agg], dim=-1))
+        """
+        Args:
+            h:          [N, H] or [B, N, H]
+            edge_index: [2, E]
+            edge_feats: [E, edge_dim]
+        Returns:
+            same shape as h
+        """
+        src, dst = edge_index           # [E]
+        unbatched = h.dim() == 2
+        if unbatched:
+            h = h.unsqueeze(0)          # [1, N, H]
+
+        B, N, H = h.shape
+        E = edge_index.shape[1]
+
+        h_src = h[:, src]               # [B, E, H]
+        h_dst = h[:, dst]               # [B, E, H]
+        ef = edge_feats.unsqueeze(0).expand(B, -1, -1)  # [B, E, edge_dim]
+
+        msg = self.msg(torch.cat([h_src, h_dst, ef], dim=-1))  # [B, E, H]
+
+        # Scatter-sum messages to destination nodes
+        agg = torch.zeros(B, N, H, device=h.device, dtype=h.dtype)
+        idx = dst.unsqueeze(0).unsqueeze(-1).expand(B, E, H)
+        agg.scatter_add_(1, idx, msg)
+
+        # Degree normalization — same for all batch items (shared graph)
+        deg = torch.zeros(N, 1, device=h.device, dtype=h.dtype)
+        deg.scatter_add_(0, dst.unsqueeze(-1),
+                         torch.ones(E, 1, device=h.device, dtype=h.dtype))
+        agg = agg / deg.unsqueeze(0).clamp_min(1.0)    # [B, N, H]
+
+        out = h + self.upd(torch.cat([h, agg], dim=-1))
+        return out.squeeze(0) if unbatched else out
 
 
 class FlowNet(nn.Module):
     """Conditional flow-matching graph network.
 
-    Operates entirely in the invariant delta-space.  Takes node features,
-    edge features, the current interpolated update u_s, and the flow-time
-    scalar s, and predicts the rectified-flow velocity field.
+    Operates entirely in the invariant delta-space. Accepts both unbatched
+    [N, 6] and batched [B, N, 6] inputs; the batch path is used during
+    mini-batch training and for parallel sampling.
     """
 
     def __init__(self, node_dim, edge_dim, hidden=64, layers=3, tau_emb_dim=16):
@@ -81,56 +119,76 @@ class FlowNet(nn.Module):
         """Predict velocity in delta-space conditioned on lag time tau.
 
         Args:
-            u_s:        Interpolated update  [N, 6]  float32
-            s:          Flow-time scalar      []      float32
-            node_feats: Node features         [N, node_dim]
-            edge_index: Edge indices          [2, E]
-            edge_feats: Edge features         [E, edge_dim]
-            tau:        Lag time (frames)     scalar int/float/tensor
+            u_s:        [N, 6] or [B, N, 6]
+            s:          Scalar, or [B] tensor (one flow-time per batch item).
+            node_feats: [N, node_dim]  (broadcast across batch)
+            edge_index: [2, E]
+            edge_feats: [E, edge_dim]
+            tau:        Scalar or [B] tensor — lag time in frames.
 
         Returns:
-            velocity:   Predicted velocity    [N, 6]  float32
+            velocity:   Same shape as u_s.
         """
-        n = node_feats.shape[0]
-        s_col = (
-            torch.as_tensor(s, dtype=u_s.dtype, device=u_s.device)
-            .reshape(1, 1)
-            .expand(n, 1)
-        )
-        tau_emb = (
-            tau_embedding(tau, dim=self.tau_emb_dim,
-                          device=u_s.device, dtype=u_s.dtype)
-            .reshape(1, -1)
-            .expand(n, -1)
-        )
-        h = self.embed(torch.cat([node_feats, u_s, s_col, tau_emb], dim=-1))
+        unbatched = u_s.dim() == 2
+        if unbatched:
+            u_s = u_s.unsqueeze(0)      # [1, N, 6]
+
+        B, N, _ = u_s.shape
+
+        # Flow-time embedding: [B, N, 1]
+        s_t = torch.as_tensor(s, dtype=u_s.dtype, device=u_s.device)
+        if s_t.dim() == 0:
+            s_col = s_t.reshape(1, 1, 1).expand(B, N, 1)
+        else:
+            s_col = s_t.reshape(B, 1, 1).expand(B, N, 1)
+
+        # Tau embedding: [B, N, tau_emb_dim]
+        tau_emb_raw = tau_embedding(tau, dim=self.tau_emb_dim,
+                                    device=u_s.device, dtype=u_s.dtype)
+        if tau_emb_raw.dim() == 1:      # scalar tau → [tau_emb_dim]
+            tau_emb = tau_emb_raw.reshape(1, 1, -1).expand(B, N, -1)
+        else:                           # batched tau → [B, tau_emb_dim]
+            tau_emb = tau_emb_raw.unsqueeze(1).expand(B, N, -1)
+
+        # Node features: [N, F] → [B, N, F]
+        nf = node_feats.unsqueeze(0).expand(B, -1, -1)
+
+        h = self.embed(torch.cat([nf, u_s, s_col, tau_emb], dim=-1))  # [B, N, hidden]
         for layer in self.layers:
             h = layer(h, edge_index, edge_feats)
-        return self.head(h)
+
+        out = self.head(h)              # [B, N, 6]
+        return out.squeeze(0) if unbatched else out
 
 
 def cfm_loss(net, u_target, node_feats, edge_index, edge_feats, tau, sigma=0.1):
     """Conditional flow-matching (rectified-flow) loss.
 
-    Samples a random flow-time s ~ Uniform[0,1] and a random prior sample
-    u0 ~ N(0, sigma^2), linearly interpolates to u_s, then regresses the
-    network's velocity prediction onto the straight-line target velocity.
+    Supports both [N, 6] (single pair) and [B, N, 6] (mini-batch) targets.
+    For batched inputs a separate flow-time s is sampled per batch item,
+    giving better coverage of the flow path.
 
     Args:
         net:        FlowNet instance
-        u_target:   Ground-truth delta-space update  [N, 6]
-        node_feats: Node features                    [N, node_dim]
-        edge_index: Edge indices                     [2, E]
-        edge_feats: Edge features                    [E, edge_dim]
-        tau:        Lag time used for this pair (frames) — conditions the net
-        sigma:      Prior scale (small motions)
+        u_target:   [N, 6] or [B, N, 6]
+        node_feats: [N, node_dim]
+        edge_index: [2, E]
+        edge_feats: [E, edge_dim]
+        tau:        Scalar or [B] tensor — lag time(s) in frames.
+        sigma:      Prior scale.
 
     Returns:
-        loss: Scalar MSE loss
+        loss: Scalar MSE.
     """
     u0 = torch.randn_like(u_target) * sigma
-    s = torch.rand(())
-    u_s = (1 - s) * u0 + s * u_target
+    batched = u_target.dim() == 3
+    if batched:
+        B = u_target.shape[0]
+        s = torch.rand(B, device=u_target.device, dtype=u_target.dtype)    # [B]
+        u_s = (1 - s[:, None, None]) * u0 + s[:, None, None] * u_target
+    else:
+        s = torch.rand((), device=u_target.device, dtype=u_target.dtype)
+        u_s = (1 - s) * u0 + s * u_target
     target_v = u_target - u0
     pred_v = net(u_s, s, node_feats, edge_index, edge_feats, tau)
     return ((pred_v - target_v) ** 2).mean()
@@ -140,29 +198,27 @@ def cfm_loss(net, u_target, node_feats, edge_index, edge_feats, tau, sigma=0.1):
 def sample(net, node_feats, edge_index, edge_feats, K, tau, steps=50, sigma=0.1):
     """Draw K samples by Euler integration of the learned flow.
 
-    Integrates from u ~ N(0, sigma^2) at s=0 toward s=1 using K
-    independent noise draws.
+    All K samples are processed in a single batched forward pass per Euler
+    step, fully utilising GPU parallelism.
 
     Args:
         net:        FlowNet instance
-        node_feats: Node features  [N, node_dim]
-        edge_index: Edge indices   [2, E]
-        edge_feats: Edge features  [E, edge_dim]
-        K:          Number of samples
-        tau:        Desired lag time (frames) — can differ from training taus
-        steps:      Number of Euler integration steps
-        sigma:      Prior scale (must match training)
+        node_feats: [N, node_dim]
+        edge_index: [2, E]
+        edge_feats: [E, edge_dim]
+        K:          Number of samples.
+        tau:        Desired lag time (frames) — any value, scalar.
+        steps:      Euler integration steps.
+        sigma:      Prior scale (must match training).
 
     Returns:
-        samples: [K, N, 6] float32
+        samples: [K, N, 6]
     """
     n = node_feats.shape[0]
-    outs = []
-    for _ in range(K):
-        u = torch.randn(n, 6, device=node_feats.device, dtype=node_feats.dtype) * sigma
-        for i in range(steps):
-            s = torch.tensor(i / steps, dtype=node_feats.dtype, device=node_feats.device)
-            v = net(u, s, node_feats, edge_index, edge_feats, tau)
-            u = u + v / steps
-        outs.append(u)
-    return torch.stack(outs, dim=0)
+    # All K draws in one [K, N, 6] tensor — batched forward each step
+    u = torch.randn(K, n, 6, device=node_feats.device, dtype=node_feats.dtype) * sigma
+    for i in range(steps):
+        s = torch.tensor(i / steps, dtype=node_feats.dtype, device=node_feats.device)
+        v = net(u, s, node_feats, edge_index, edge_feats, tau)  # [K, N, 6]
+        u = u + v / steps
+    return u

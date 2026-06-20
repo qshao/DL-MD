@@ -99,11 +99,11 @@ def time_split(pairs, val_frac):
     """Split pairs into train and validation sets with time-ordered guarantee.
 
     Args:
-        pairs: LongTensor [P, 2] of frame pairs
+        pairs: LongTensor [P, 2] or [P, 3] of frame pairs (sorted by start frame)
         val_frac: fraction of pairs for validation (0..1)
 
     Returns:
-        (train_pairs, val_pairs) where train_pairs[:, 0].max() < val_pairs[:, 0].min()
+        (train_pairs, val_pairs) where train_pairs[:, 0].max() <= val_pairs[:, 0].min()
         This guarantees no temporal leakage.
     """
     n = pairs.shape[0]

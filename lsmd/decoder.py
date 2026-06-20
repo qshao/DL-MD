@@ -12,17 +12,16 @@ def decode_frames(R_t, t_t, u_samples):
     Args:
         R_t: Target rotation [N, 3, 3]
         t_t: Target translation [N, 3]
-        u_samples: Update samples [K, N, 6] where each entry is [local_trans(3), axis_angle(3)]
+        u_samples: Update samples [K, N, 6]
 
     Returns:
         (R_f, t_f): Frame rotations [K, N, 3, 3] and translations [K, N, 3]
     """
-    Rs, ts = [], []
-    for k in range(u_samples.shape[0]):
-        R_f, t_f = f.apply_update(R_t, t_t, u_samples[k])
-        Rs.append(R_f)
-        ts.append(t_f)
-    return torch.stack(Rs, 0), torch.stack(ts, 0)
+    K = u_samples.shape[0]
+    # Broadcast R_t, t_t over K dim and apply all updates in one vectorised call
+    R_t_b = R_t.unsqueeze(0).expand(K, -1, -1, -1)   # [K, N, 3, 3]
+    t_t_b = t_t.unsqueeze(0).expand(K, -1, -1)        # [K, N, 3]
+    return f.apply_update(R_t_b, t_t_b, u_samples)    # [K, N, 3, 3], [K, N, 3]
 
 
 def build_structure(R, t):
@@ -89,7 +88,7 @@ def idealize(atoms, steps=50):
     """
     # optimize a per-residue translation that closes peptide bonds and removes clashes,
     # keeping each residue rigid (only CA position shifts; relative atom geometry preserved)
-    delta = torch.zeros(atoms.shape[0], 3, requires_grad=True)
+    delta = torch.zeros(atoms.shape[0], 3, requires_grad=True, device=atoms.device)
     opt = torch.optim.Adam([delta], lr=0.05)
     base = atoms.detach()
     for _ in range(steps):
