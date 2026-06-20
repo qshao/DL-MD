@@ -21,7 +21,7 @@ import argparse
 import os
 import time
 import torch
-from lsmd import data, featurize as f, model as m
+from lsmd import data, featurize as f, model as m, validation as val
 
 
 def build_ctx(frames, k, device):
@@ -143,13 +143,23 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     mode      = frames.get("mode", "ca")
     point_dim = {"4bead": 12, "2bead": 6}.get(mode, 3)
+
+    # Build Ramachandran potential from training frames (4-bead only)
+    rama_sd = None
+    if mode == "4bead":
+        print("Building Ramachandran potential from training data...", end=" ", flush=True)
+        rama_pot = val.RamachandranPotential.from_frames(frames["t"].cpu())
+        rama_sd  = rama_pot.state_dict()
+        print(f"done  (outlier threshold = {rama_pot.outlier_threshold:.3f})")
+
     checkpoint = {
-        "net_state":      net.state_dict(),
-        "schedule_state": schedule.state_dict(),
-        "node_feats":     node_feats.cpu(),
-        "edge_index":     edge_index.cpu(),
-        "edge_feats":     edge_feats.cpu(),
-        "gly_mask":       frames.get("gly_mask"),
+        "net_state":       net.state_dict(),
+        "schedule_state":  schedule.state_dict(),
+        "node_feats":      node_feats.cpu(),
+        "edge_index":      edge_index.cpu(),
+        "edge_feats":      edge_feats.cpu(),
+        "gly_mask":        frames.get("gly_mask"),
+        "rama_potential":  rama_sd,
         "hparams": {
             "taus":        args.taus,
             "node_dim":    node_feats.shape[1],

@@ -1,7 +1,25 @@
 import datetime
 import math
+import numpy as np
 import torch
+import torch.nn.functional as _F
 from lsmd import decoder as dec
+
+
+# ---------------------------------------------------------------------------
+# Shared dihedral primitive (differentiable — used by torsion check + minimizer)
+# ---------------------------------------------------------------------------
+
+def _dihedral(a, b, c, d):
+    """Compute dihedral angles. Inputs broadcastable [..., 3]. Returns [...] in (-π, π].
+    Differentiable w.r.t. all four position tensors.
+    """
+    b1 = b - a;  b2 = c - b;  b3 = d - c
+    n1 = torch.cross(b1, b2, dim=-1)
+    n2 = torch.cross(b2, b3, dim=-1)
+    b2n = b2 / b2.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    m1 = torch.cross(n1, b2n, dim=-1)
+    return torch.atan2((m1 * n2).sum(-1), (n1 * n2).sum(-1))
 
 
 def _ca(x):
@@ -94,24 +112,10 @@ def backbone_torsions(atoms):
         phi: [N-2] tensor in (-π, π]
         psi: [N-2] tensor in (-π, π]
     """
-    def _dihedral(a, b, c, d):
-        b1 = b - a; b2 = c - b; b3 = d - c
-        n1 = torch.cross(b1, b2, dim=-1)
-        n2 = torch.cross(b2, b3, dim=-1)
-        b2n = b2 / b2.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-        m1 = torch.cross(n1, b2n, dim=-1)
-        return torch.atan2((m1 * n2).sum(-1), (n1 * n2).sum(-1))
-
-    # phi_i = dihedral(C(i-1), N(i), CA(i), C(i))  for i = 1..N-2
-    phi = _dihedral(
-        atoms[:-2, 2, :], atoms[1:-1, 0, :],
-        atoms[1:-1, 1, :], atoms[1:-1, 2, :]
-    )
-    # psi_i = dihedral(N(i), CA(i), C(i), N(i+1))  for i = 1..N-2
-    psi = _dihedral(
-        atoms[1:-1, 0, :], atoms[1:-1, 1, :],
-        atoms[1:-1, 2, :], atoms[2:, 0, :]
-    )
+    phi = _dihedral(atoms[:-2, 2, :], atoms[1:-1, 0, :],
+                    atoms[1:-1, 1, :], atoms[1:-1, 2, :])
+    psi = _dihedral(atoms[1:-1, 0, :], atoms[1:-1, 1, :],
+                    atoms[1:-1, 2, :], atoms[2:, 0, :])
     return phi, psi
 
 
@@ -124,14 +128,6 @@ def _batch_torsions(atoms_batch):
     Returns:
         (phi, psi) each [K*(N-2)]
     """
-    def _dihedral(a, b, c, d):  # each [K, N-2, 3]
-        b1 = b - a; b2 = c - b; b3 = d - c
-        n1 = torch.cross(b1, b2, dim=-1)
-        n2 = torch.cross(b2, b3, dim=-1)
-        b2n = b2 / b2.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-        m1 = torch.cross(n1, b2n, dim=-1)
-        return torch.atan2((m1 * n2).sum(-1), (n1 * n2).sum(-1))
-
     phi = _dihedral(
         atoms_batch[:, :-2, 2, :], atoms_batch[:, 1:-1, 0, :],
         atoms_batch[:, 1:-1, 1, :], atoms_batch[:, 1:-1, 2, :]
@@ -140,6 +136,24 @@ def _batch_torsions(atoms_batch):
         atoms_batch[:, 1:-1, 0, :], atoms_batch[:, 1:-1, 1, :],
         atoms_batch[:, 1:-1, 2, :], atoms_batch[:, 2:,   0, :]
     ).reshape(-1)
+    return phi, psi
+
+
+def compute_phi_psi(beads):
+    """Compute φ/ψ backbone torsions from 4-bead coordinates.
+
+    Atom order: N=0, CA=1, C=2, CB=3.
+    Defined for interior residues i = 1..P-2 (P-2 values each).
+
+    Args:
+        beads: [P, 4, 3]
+
+    Returns:
+        phi [P-2], psi [P-2] in radians — differentiable w.r.t. beads.
+    """
+    N_a, CA, C_a = beads[:, 0], beads[:, 1], beads[:, 2]
+    phi = _dihedral(C_a[:-2], N_a[1:-1], CA[1:-1], C_a[1:-1])   # C(i-1),N(i),CA(i),C(i)
+    psi = _dihedral(N_a[1:-1], CA[1:-1], C_a[1:-1], N_a[2:])    # N(i),CA(i),C(i),N(i+1)
     return phi, psi
 
 
@@ -429,7 +443,7 @@ _4B_BOND_RANGES = {
 _4B_CLASH_DIST = 2.0   # Å — minimum non-bonded heavy-atom distance
 
 
-def check_4bead_conformation(beads, gly_mask=None):
+def check_4bead_conformation(beads, gly_mask=None, rama_potential=None):
     """Check whether a 4-bead (N, CA, C, CB) conformation is physically meaningful.
 
     Checks four bond types:
@@ -529,17 +543,27 @@ def check_4bead_conformation(beads, gly_mask=None):
     rg_expected = 2.2 * (P ** 0.38)
     rg_ok = (0.5 * rg_expected) <= rg <= (2.0 * rg_expected)
 
+    # Ramachandran check (only when potential is provided)
+    if rama_potential is not None:
+        n_rama_out, rama_frac = rama_potential.check(beads)
+        rama_ok = rama_frac < 0.02        # <2% outliers → OK
+    else:
+        n_rama_out, rama_frac, rama_ok = 0, 0.0, True
+
     return {
-        "valid":             bond_ok and clash_free and rg_ok,
-        "bond_ok":           bond_ok,
-        "clash_free":        clash_free,
-        "rg_ok":             rg_ok,
-        "n_bond_violations": len(bond_violations),
-        "n_clashes":         len(clashes),
-        "bond_violations":   bond_violations,
-        "clashes":           clashes,
-        "rg_A":              round(rg, 3),
-        "rg_expected_A":     round(rg_expected, 3),
+        "valid":              bond_ok and clash_free and rg_ok and rama_ok,
+        "bond_ok":            bond_ok,
+        "clash_free":         clash_free,
+        "rg_ok":              rg_ok,
+        "rama_ok":            rama_ok,
+        "n_bond_violations":  len(bond_violations),
+        "n_clashes":          len(clashes),
+        "n_rama_outliers":    n_rama_out,
+        "rama_outlier_pct":   round(rama_frac * 100, 1),
+        "bond_violations":    bond_violations,
+        "clashes":            clashes,
+        "rg_A":               round(rg, 3),
+        "rg_expected_A":      round(rg_expected, 3),
     }
 
 
@@ -801,9 +825,147 @@ def minimize_energy_2bead(beads, gly_mask=None,
     return x.detach().reshape(P, 2, 3).to(beads.dtype)
 
 
+# ---------------------------------------------------------------------------
+# Ramachandran potential (differentiable KDE grid built from training data)
+# ---------------------------------------------------------------------------
+
+def _rama_smooth(counts, sigma_bins):
+    """2D Gaussian smoothing of a histogram grid [H, W] using conv2d."""
+    radius = max(1, int(3 * sigma_bins))
+    size   = 2 * radius + 1
+    x      = torch.arange(-radius, radius + 1, dtype=torch.float32)
+    k1d    = torch.exp(-0.5 * (x / sigma_bins) ** 2)
+    k1d   /= k1d.sum()
+    k2d    = (k1d.unsqueeze(0) * k1d.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
+    g      = counts.float().unsqueeze(0).unsqueeze(0)
+    return _F.conv2d(g, k2d, padding=radius).squeeze()
+
+
+def _rama_interp(grid, phi, psi, bins):
+    """Differentiable bilinear interpolation of a [bins, bins] energy grid.
+
+    Gradient flows through the fractional weights wx, wy → phi, psi → atom coords.
+
+    Args:
+        grid : [bins, bins] energy tensor (on same device as phi/psi)
+        phi  : [N] angles in [-π, π]
+        psi  : [N] angles in [-π, π]
+    Returns:
+        [N] energy values
+    """
+    x  = (phi + math.pi) / (2 * math.pi) * (bins - 1)
+    y  = (psi + math.pi) / (2 * math.pi) * (bins - 1)
+    x0 = torch.clamp(torch.floor(x).long(), 0, bins - 2)
+    y0 = torch.clamp(torch.floor(y).long(), 0, bins - 2)
+    x1, y1 = x0 + 1, y0 + 1
+    wx1 = (x - x0.float()).clamp(0.0, 1.0)
+    wy1 = (y - y0.float()).clamp(0.0, 1.0)
+    wx0, wy0 = 1.0 - wx1, 1.0 - wy1
+    return (wx0 * wy0 * grid[x0, y0] + wx1 * wy0 * grid[x1, y0] +
+            wx0 * wy1 * grid[x0, y1] + wx1 * wy1 * grid[x1, y1])
+
+
+class RamachandranPotential:
+    """Differentiable Ramachandran energy grid derived from MD training data.
+
+    The energy is −log(KDE density + ε), shifted so the global minimum is 0.
+    High energy → disallowed region. The 98th-percentile training energy is stored
+    as ``outlier_threshold`` so check functions can flag unusual residues.
+
+    Usage::
+
+        pot = RamachandranPotential.from_frames(frames["t"])   # build once
+        ckpt["rama_potential"] = pot.state_dict()              # save with model
+
+        pot = RamachandranPotential.from_state_dict(sd).to(device)
+        energy = pot.energy(beads)                             # differentiable
+    """
+
+    def __init__(self, grid, bins, outlier_threshold):
+        self.grid               = grid               # [bins, bins] float32
+        self.bins               = bins
+        self.outlier_threshold  = float(outlier_threshold)
+
+    # ------------------------------------------------------------------
+    def to(self, device):
+        self.grid = self.grid.to(device)
+        return self
+
+    def energy(self, beads):
+        """Sum of Ramachandran energies for [P, 4, 3] beads. Differentiable."""
+        phi, psi = compute_phi_psi(beads)
+        return _rama_interp(self.grid, phi, psi, self.bins).sum()
+
+    def query(self, phi, psi):
+        """Per-residue energies [N] at query points (phi, psi). Differentiable."""
+        return _rama_interp(self.grid, phi, psi, self.bins)
+
+    def check(self, beads):
+        """Return (n_outliers, outlier_fraction) for a [P, 4, 3] conformation."""
+        with torch.no_grad():
+            phi, psi = compute_phi_psi(beads.cpu())
+            e = self.query(phi, psi)
+        n_out = int((e > self.outlier_threshold).sum().item())
+        return n_out, n_out / max(len(e), 1)
+
+    # ------------------------------------------------------------------
+    def state_dict(self):
+        return {"grid": self.grid.cpu(), "bins": self.bins,
+                "outlier_threshold": self.outlier_threshold}
+
+    @classmethod
+    def from_state_dict(cls, sd):
+        return cls(sd["grid"], int(sd["bins"]), sd["outlier_threshold"])
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_frames(cls, frames_t, bins=72, sigma_deg=5.0):
+        """Build potential from 4-bead training frames [F, P, 4, 3].
+
+        Uses all interior residues across all frames to build a KDE-smoothed
+        2D histogram over (φ, ψ) space. sigma_deg controls smoothing width
+        in degrees (default 5° ≈ 1 grid cell at 72-bin resolution).
+        """
+        # Vectorised φ/ψ over all frames at once
+        N_a = frames_t[:, :, 0, :]   # [F, P, 3]
+        CA  = frames_t[:, :, 1, :]
+        C_a = frames_t[:, :, 2, :]
+
+        phi = _dihedral(C_a[:, :-2], N_a[:, 1:-1], CA[:, 1:-1], C_a[:, 1:-1])
+        psi = _dihedral(N_a[:, 1:-1], CA[:, 1:-1], C_a[:, 1:-1], N_a[:, 2:])
+
+        phi_np = phi.detach().cpu().numpy().ravel()   # [F*(P-2)]
+        psi_np = psi.detach().cpu().numpy().ravel()
+
+        # 2D histogram
+        counts = np.zeros((bins, bins), dtype=np.float32)
+        phi_idx = np.clip(((phi_np + math.pi) / (2 * math.pi) * bins).astype(int),
+                          0, bins - 1)
+        psi_idx = np.clip(((psi_np + math.pi) / (2 * math.pi) * bins).astype(int),
+                          0, bins - 1)
+        np.add.at(counts, (phi_idx, psi_idx), 1)
+
+        # Gaussian smoothing (pure PyTorch conv2d — no scipy dependency)
+        sigma_bins = sigma_deg / (360.0 / bins)
+        counts_t   = _rama_smooth(torch.tensor(counts), sigma_bins)
+
+        # Convert to energy: −log(density + ε), shift minimum to 0
+        density = (counts_t / counts_t.sum()).clamp_min(1e-10)
+        energy  = -torch.log(density)
+        energy  = energy - energy.min()
+
+        # Outlier threshold: 98th percentile of training-data energies
+        train_phi = torch.tensor(phi_np)
+        train_psi = torch.tensor(psi_np)
+        train_e   = _rama_interp(energy, train_phi, train_psi, bins)
+        threshold = float(torch.quantile(train_e, 0.98).item())
+
+        return cls(energy, bins, threshold)
+
+
 def minimize_energy_4bead(beads, gly_mask=None, bond_target=None,
                            k_bond=10.0, k_clash=1.0, n_steps=100,
-                           clash_dist=2.0,
+                           clash_dist=2.0, rama_potential=None, k_rama=1.0,
                            _cache={}):
     """L-BFGS energy minimization for a 4-bead (N, CA, C, CB) conformation.
 
@@ -846,14 +1008,13 @@ def minimize_energy_4bead(beads, gly_mask=None, bond_target=None,
 
     def closure():
         opt.zero_grad()
-        b_vec  = x[bond_j] - x[bond_i]
-        b_dist = b_vec.norm(dim=-1)
-        e_bond = k_bond * ((b_dist - bond_t) ** 2).sum()
-
+        b_dist  = (x[bond_j] - x[bond_i]).norm(dim=-1)
+        e_bond  = k_bond  * ((b_dist - bond_t) ** 2).sum()
         nb_dist = (x[nb_i] - x[nb_j]).norm(dim=-1)
         e_clash = k_clash * torch.clamp(clash_dist - nb_dist, min=0.0).pow(2).sum()
-
-        loss = e_bond + e_clash
+        e_rama  = (k_rama  * rama_potential.energy(x.reshape(P, 4, 3))
+                   if rama_potential is not None else 0.0)
+        loss = e_bond + e_clash + e_rama
         loss.backward()
         return loss
 

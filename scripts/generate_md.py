@@ -111,7 +111,7 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
               x_start, x_ref, tau, n_steps, diff_steps, eta, sigma_init,
               device, bond_correction=False, bond_target=3.8, bond_iters=10,
               min_energy=False, k_bond=10.0, k_clash=1.0, min_steps=100,
-              mode="ca", gly_mask=None):
+              mode="ca", gly_mask=None, rama_potential=None, k_rama=1.0):
     """Run a single autoregressive trajectory chain.
 
     At each step:
@@ -161,7 +161,9 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
                 if mode == "4bead":
                     x = val.minimize_energy_4bead(x, gly_mask=gly_mask,
                                                   k_bond=k_bond, k_clash=k_clash,
-                                                  n_steps=min_steps)
+                                                  n_steps=min_steps,
+                                                  rama_potential=rama_potential,
+                                                  k_rama=k_rama)
                 elif mode == "2bead":
                     x = val.minimize_energy_2bead(x, gly_mask=gly_mask,
                                                   k_bond=k_bond, k_clash=k_clash,
@@ -203,7 +205,8 @@ def run_chain(net, schedule, node_feats, edge_index, edge_feats,
 
             # Physical validity check
             if mode == "4bead":
-                check = val.check_4bead_conformation(x_cpu, gly_mask=gly_mask)
+                check = val.check_4bead_conformation(x_cpu, gly_mask=gly_mask,
+                                                     rama_potential=rama_potential)
             elif mode == "2bead":
                 check = val.check_2bead_conformation(x_cpu, gly_mask=gly_mask)
             else:
@@ -261,6 +264,10 @@ def compute_metrics(trajectories, validity_all, tau, ps_per_frame=200):
     n_bond_vio = sum(1 for c in all_checks if not c["bond_ok"])
     n_clash    = sum(1 for c in all_checks if not c["clash_free"])
     n_rg_vio   = sum(1 for c in all_checks if not c["rg_ok"])
+    n_rama_vio = sum(1 for c in all_checks if not c.get("rama_ok", True))
+    # Mean Ramachandran outlier % per step (only meaningful for 4-bead)
+    rama_pcts  = [c.get("rama_outlier_pct", 0.0) for c in all_checks]
+    mean_rama_pct = round(sum(rama_pcts) / max(len(rama_pcts), 1), 1)
 
     return {
         "n_chains":               n_chains,
@@ -276,12 +283,14 @@ def compute_metrics(trajectories, validity_all, tau, ps_per_frame=200):
         "rmsf_max_residue":       int(rmsf.argmax().item()),
         "rmsf_per_residue_A":     [round(v, 4) for v in rmsf.tolist()],
         "validity": {
-            "n_steps_checked":    n_total,
-            "n_valid":            n_valid,
-            "valid_fraction":     round(n_valid / max(n_total, 1), 4),
-            "n_bond_violations":  n_bond_vio,
-            "n_clashes":          n_clash,
-            "n_rg_violations":    n_rg_vio,
+            "n_steps_checked":      n_total,
+            "n_valid":              n_valid,
+            "valid_fraction":       round(n_valid / max(n_total, 1), 4),
+            "n_bond_violations":    n_bond_vio,
+            "n_clashes":            n_clash,
+            "n_rg_violations":      n_rg_vio,
+            "n_rama_violations":    n_rama_vio,
+            "mean_rama_outlier_pct": mean_rama_pct,
         },
     }
 
@@ -325,6 +334,8 @@ def main():
                     help="Bond spring constant for --min_energy (default 10.0)")
     ap.add_argument("--k_clash",      type=float, default=1.0,
                     help="Clash penalty weight for --min_energy (default 1.0)")
+    ap.add_argument("--k_rama",       type=float, default=1.0,
+                    help="Ramachandran penalty weight for 4-bead --min_energy (default 1.0)")
     ap.add_argument("--min_steps",    type=int,   default=100,
                     help="Max L-BFGS iterations per step for --min_energy (default 100)")
     ap.add_argument("--device",       default=None)
@@ -351,6 +362,9 @@ def main():
     mode         = hp.get("mode", "ca")
     gly_mask_raw = ckpt.get("gly_mask")
     gly_mask     = gly_mask_raw.cpu() if gly_mask_raw is not None else None
+    rama_sd      = ckpt.get("rama_potential")
+    rama_pot     = (val.RamachandranPotential.from_state_dict(rama_sd).to(device)
+                    if rama_sd is not None else None)
 
     if args.tau not in taus_trained:
         print(f"Warning: --tau {args.tau} not in training taus {taus_trained}. "
@@ -422,6 +436,8 @@ def main():
             min_steps=args.min_steps,
             mode=mode,
             gly_mask=gly_mask,
+            rama_potential=rama_pot,
+            k_rama=args.k_rama,
         )
         all_trajs.append(traj)
         all_disps.append(disps)
@@ -494,11 +510,15 @@ def main():
     print(f"  Final RMSD      : {metrics['final_mean_rmsd_A']:.3f} Å from start")
     print(f"  RMSF (mean/max) : {metrics['rmsf_mean_A']:.3f} / {metrics['rmsf_max_A']:.3f} Å")
     print(f"  Most flexible   : residue {metrics['rmsf_max_residue']}")
+    rama_str = (f", rama viol={v['n_rama_violations']} "
+                f"(mean {v['mean_rama_outlier_pct']}% outliers/step)"
+                if v.get("n_rama_violations", 0) > 0 or mode == "4bead" else "")
     print(f"  Valid steps     : {v['n_valid']}/{v['n_steps_checked']} "
           f"({v['valid_fraction']*100:.1f}%)  "
           f"[bond viol={v['n_bond_violations']}, "
           f"clashes={v['n_clashes']}, "
-          f"Rg viol={v['n_rg_violations']}]")
+          f"Rg viol={v['n_rg_violations']}"
+          f"{rama_str}]")
     print(f"  Time/step       : {mean_step_s:.3f} s  "
           f"→ {timing_info['total_min']:.1f} min for 1000 ns "
           f"({timing_info['speedup_vs_classical_md']:.0f}× vs classical MD)")
