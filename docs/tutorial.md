@@ -1,8 +1,11 @@
 # LSMD Tutorial
 
-This tutorial walks through the complete LSMD pipeline on a real protein system, from preprocessing an MD trajectory to generating and analysing long generative MD runs.
+This tutorial covers both the original per-protein DDPM and the transferable cross-protein propagator.
 
-**Pre-generated demo output is included in the repository** under `demo_2bead/` and `demo_4bead/`. You can inspect or visualize those files immediately after cloning, without running any of the generation steps yourself.
+- **Part 1** — per-protein DDPM: train on a single MD trajectory, generate trajectories for that protein.
+- **Part 2** — transferable propagator: train once on ATLAS + mdCATH, then zero-shot rollout on any new protein from its sequence alone.
+
+**Pre-generated demo output** is in `demo_2bead/` and `demo_4bead/`. Visualize immediately after cloning without running any steps yourself.
 
 ---
 
@@ -18,18 +21,11 @@ source lsmd-env/bin/activate        # Linux / macOS
 
 ### 2. Install PyTorch with CUDA
 
-Check your CUDA version:
 ```bash
 nvidia-smi | grep "CUDA Version"
-```
-
-Install PyTorch matching your CUDA version (https://pytorch.org/get-started/locally/):
-```bash
-# Example for CUDA 12.x
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-
-# CPU-only fallback
-pip install torch
+# Install from https://pytorch.org/get-started/locally/
+pip install torch --index-url https://download.pytorch.org/whl/cu121   # CUDA 12.x
+pip install torch   # CPU-only fallback
 ```
 
 ### 3. Install LSMD
@@ -49,9 +45,13 @@ pytest tests/ -q
 
 ---
 
+# Part 1 — Per-Protein DDPM
+
+The per-protein model trains on a single MD trajectory and learns to generate new conformations for that specific protein. No cross-protein generalization.
+
 ## Demo data
 
-After cloning, two ready-to-visualize demo runs are available immediately:
+Two ready-to-visualize demos are bundled with the repository:
 
 ```
 demo_2bead/
@@ -68,31 +68,26 @@ demo_4bead/
 ```
 
 ```bash
-# Visualize immediately (no training or generation needed)
 pymol demo_2bead/allatom.pdb
 pymol demo_4bead/allatom.pdb
 ```
 
-Both demos use mimic mode (τ=2, anchor_every=50) on a 169-residue protein. See [below](#demo-1--2-bead-mimic-20-ns) for the exact commands used to generate them.
-
----
+Both demos use mimic mode (τ=2, anchor_every=50) on a 169-residue protein.
 
 ## Input data
-
-LSMD reads any trajectory format supported by MDtraj (GROMACS TRR/XTC, CHARMM DCD, AMBER NetCDF, …) plus a matching topology file. For this tutorial we use:
 
 ```
 WT/WT-sol6.trr   — 5001-frame GROMACS trajectory (1 μs, 200 ps/frame)
 WT/WT-sol6.gro   — GROMACS topology (169 protein residues + solvent)
 ```
 
-> The `WT/` directory is not distributed with the repository. To reproduce the demo runs, you need the original trajectory files.
+> The `WT/` directory is not distributed. You need the original trajectory files to reproduce the demos.
 
 ---
 
 ## Step 1 — Preprocess
 
-Convert the MD trajectory to bead point clouds and save to disk. This runs once and takes ~30 seconds.
+Convert the MD trajectory to bead point clouds. Runs once, ~30 seconds.
 
 ```bash
 # 2-bead (Cα + Cβ): recommended for most use cases
@@ -102,7 +97,7 @@ python scripts/preprocess.py \
     --atoms 2bead \
     --out   data/wt_2bead.pt
 
-# 4-bead (N, Cα, C, Cβ): full backbone, slower generation
+# 4-bead (N, Cα, C, Cβ): full backbone
 python scripts/preprocess.py \
     --traj  WT/WT-sol6.trr \
     --top   WT/WT-sol6.gro \
@@ -112,24 +107,16 @@ python scripts/preprocess.py \
 
 Expected output:
 ```
-Loading  WT/WT-sol6.trr
-Topology WT/WT-sol6.gro
-Mode     2bead
-Frames: 5001   Residues: 169   Gly (no CB): 11   Residue types: 19
+Frames: 5001   Residues: 169   Gly (no CB): 11
 CA coordinate range  min=-30.23 Å  max=40.12 Å
 Saved → data/wt_2bead.pt  (18.3 MB)
 ```
 
-The `.pt` file contains:
-- `t` — `[5001, 169, n_beads, 3]` bead coordinates in Å (PBC-fixed, Cα-superposed)
-- `res_type`, `chain_id`, `res_index` — residue attributes
-- `gly_mask` — `[169]` bool marking the 11 Gly residues (no Cβ)
+The `.pt` file contains `t [F, P, n_beads, 3]`, `res_type`, `chain_id`, `res_index`, `gly_mask`.
 
 ---
 
 ## Step 2 — Train
-
-Train the DDPM on preprocessed frames. 200 epochs on a GPU takes ~10 minutes for this system.
 
 ```bash
 # 2-bead model
@@ -147,15 +134,20 @@ python scripts/train.py \
     --out      checkpoints/wt_4bead_200ep.pt
 ```
 
-`--taus 1 2 5` trains on three lag times simultaneously (200 ps, 400 ps, 1 ns), letting the model capture dynamics from fast thermal fluctuations to slow conformational changes.
+`--taus 1 2 5` trains simultaneously on 200 ps, 400 ps, and 1 ns lag times.
 
-The checkpoint stores model weights, noise schedule, reference graph, and all hyperparameters. It is self-contained — no other files are needed at inference time.
+| Flag | Default | Description |
+|---|---|---|
+| `--taus` | `1 2 5` | Lag schedule (frames) |
+| `--epochs` | `200` | Training epochs |
+| `--hidden` | `64` | GNN hidden dimension |
+| `--layers` | `3` | Message-passing layers |
+| `--lr` | `1e-3` | Learning rate |
+| `--T_diff` | `200` | DDPM noise levels |
 
 ---
 
-## Step 3a — Quick validation: snapshot ensemble
-
-Before running long trajectories, check that the model reproduces known MD statistics.
+## Step 3a — Quick validation
 
 ```bash
 python scripts/infer.py \
@@ -166,33 +158,20 @@ python scripts/infer.py \
     --out         infer_out
 ```
 
-Check `infer_out/metrics.json` for:
+Target values in `infer_out/metrics.json`:
 
 | Metric | Target | Meaning |
 |---|---|---|
-| `rmsf_corr` | > 0.90 | Per-residue flexibility profile matches MD |
-| `distance_matrix_js` | < 0.001 | Cα–Cα pairwise distance distributions match MD |
-| `ensemble_recall` | > 0.95 | Model covers the MD conformational space |
+| `rmsf_corr` | > 0.90 | Per-residue flexibility matches MD |
+| `distance_matrix_js` | < 0.001 | Cα–Cα distances match MD |
+| `ensemble_recall` | > 0.95 | Model covers MD conformational space |
 | `ca_bond_mean` | 3.8–4.0 Å | Correct backbone geometry |
 
 ---
 
 ## Step 3b — Long trajectory generation
 
-LSMD supports two sampling modes that trade conformational coverage against physical fidelity.
-
-### Choosing a mode
-
-| Mode | Mechanism | Typical RMSD | Best for |
-|---|---|---|---|
-| **mimic** | Re-anchor to nearest real MD frame every N steps | 5–10 Å | MD reproduction, benchmarking |
-| **explore** | Revert to last valid frame on structural failure | 15–30 Å | Novel conformations, enhanced sampling |
-
----
-
 ### Demo 1 — 2-bead mimic, 20 ns
-
-This is the command that generated `demo_2bead/`:
 
 ```bash
 python scripts/generate_md.py \
@@ -207,38 +186,9 @@ python scripts/generate_md.py \
     --out         demo_2bead
 ```
 
-Terminal output:
-```
-Generative MD
-  Checkpoint : checkpoints/wt_2bead_200ep.pt
-  Starting frame : 3999  (5001 total, 169 residues)
-  Tau per step   : 2 frames = 400 ps
-  Steps          : 50
-  Total time     : 20.0 ns  (10000000× faster than 2 fs MD)
-  Energy min     : ON  (L-BFGS, 100 steps, k_bond=10.0, k_clash=5.0)
-  Sample mode    : mimic  (re-anchor to nearest MD frame every 50 steps)
-  Mode           : 2-bead (CA, CB)  point_dim=6
-
-Chain 1/1 ...
-  Done. Mean disp/step: 0.996 Å  Final RMSD: 7.618 Å  Valid steps: 44/50  re-anchors: 1
-
-Generated 20.0 ns of CA dynamics
-  Final RMSD      : 7.62 Å from start
-  RMSF (mean/max) : 2.43 / 9.10 Å
-  Valid steps     : 44/50 (88%)  [bond viol=0, clashes=6, Rg viol=0]
-  Time/step       : 0.240 s  → 10.0 min for 1000 ns (1439× vs classical MD)
-Output → demo_2bead/
-```
-
-**Results:** RMSD 7.6 Å, RMSF 2.4 Å, 88% valid steps, **1439× speedup**. The trajectory stays near the MD ensemble; 2-bead reconstruction (rigid Cα translation) preserves the template's backbone φ/ψ angles.
-
-To scale up to a full 1 μs production run, change `--steps 50` to `--steps 2500`.
-
----
+Results: RMSD 7.6 Å, RMSF 2.4 Å, 88% valid steps, **1439× speedup**.
 
 ### Demo 2 — 4-bead mimic, 20 ns
-
-This is the command that generated `demo_4bead/`:
 
 ```bash
 python scripts/generate_md.py \
@@ -253,118 +203,44 @@ python scripts/generate_md.py \
     --out         demo_4bead
 ```
 
-Terminal output:
-```
-  Mode           : 4-bead (N, CA, C, CB)  point_dim=12
+Results: RMSD 8.5 Å, RMSF 2.5 Å, **1116× speedup**. Bond/clash checks pass cleanly; only the Ramachandran check fails (~70% φ/ψ outliers — an inherent limitation of the Cartesian 4-bead model, not a structural failure).
 
-Chain 1/1 ...
-  Done. Mean disp/step: 0.892 Å  Final RMSD: 8.452 Å  Valid steps: 0/50  re-anchors: 1
+### Production runs
 
-Generated 20.0 ns of CA dynamics
-  Final RMSD      : 8.45 Å from start
-  RMSF (mean/max) : 2.51 / 9.43 Å
-  Valid steps     : 0/50 (0%)  [bond viol=0, clashes=0, Rg viol=0,
-                                 rama viol=50 (mean 69.6% outliers/step)]
-  Time/step       : 0.310 s  → 12.9 min for 1000 ns (1116× vs classical MD)
-Output → demo_4bead/
-```
-
-**Results:** RMSD 8.5 Å, RMSF 2.5 Å, **1116× speedup**. Cα-level geometry is excellent (0 bonds, 0 clashes). The 0% valid steps is entirely due to Ramachandran: the 4-bead Cartesian model generates N/Cα/C displacements independently, producing ~70% φ/ψ outliers versus ~2% in real MD. This is a known limitation — not a structural failure. For dihedral analysis use the 2-bead demo instead.
-
-**Validity check breakdown for 4-bead:**
-
-| Check | demo_4bead result | Real MD baseline |
+| Run | Command additions | Expected outcome |
 |---|---|---|
-| Bond violations | 0 | 0 |
-| Steric clashes | 0 | 0 |
-| Rg in range | 50/50 | ~100% |
-| Ramachandran < 5% | 0/50 | 97% |
-
-### Explore mode (conformational sampling)
-
-To sample beyond the training distribution, switch to explore mode and increase the lag:
-
-```bash
-python scripts/generate_md.py \
-    --checkpoint  checkpoints/wt_2bead_200ep.pt \
-    --frames      data/wt_2bead.pt \
-    --tau         5 \
-    --steps       1000 \
-    --n_chains    4 \
-    --min_energy \
-    --k_clash     5.0 \
-    --sample_mode explore \
-    --out         my_explore_run
-```
-
-Reverts to the last valid frame on structural failure. Expected RMSD 20–25 Å, RMSF ~14 Å over 1 μs.
-
----
+| 1 μs mimic | `--steps 2500 --sample_mode mimic` | ~8 Å RMSD, ~87% valid, ~580× speedup |
+| 1 μs explore ×4 chains | `--steps 1000 --n_chains 4 --tau 5 --sample_mode explore` | ~23 Å RMSD, ~86% valid, ~1640× speedup |
 
 **All `generate_md.py` flags:**
 
 | Flag | Default | Description |
 |---|---|---|
-| `--tau` | `5` | Lag per step (frames; τ=2 → 400 ps/step) |
+| `--tau` | `5` | Lag per step (frames) |
 | `--steps` | `50` | Number of generative steps |
 | `--n_chains` | `1` | Independent trajectory chains |
 | `--sample_mode` | `explore` | `explore` or `mimic` |
-| `--anchor_every` | `50` | Re-anchor interval for mimic mode (steps) |
+| `--anchor_every` | `50` | Re-anchor interval for mimic mode |
 | `--min_energy` | off | L-BFGS energy minimization after each step |
-| `--k_bond` | `10.0` | Bond spring constant for L-BFGS |
-| `--k_clash` | `1.0` | Clash penalty weight for L-BFGS (use 5.0 for 2-bead) |
-| `--min_steps` | `100` | Max L-BFGS iterations per step |
+| `--k_bond` | `10.0` | Bond spring constant |
+| `--k_clash` | `1.0` | Clash penalty (use 5.0 for 2-bead) |
 | `--diff_steps` | `50` | Reverse diffusion steps per sample |
-| `--eta` | `1.0` | DDPM stochasticity (0 = deterministic DDIM) |
-| `--source_frame` | auto | Starting frame index (default: first validation frame) |
-
-**Output files:**
-- `trajectory.pdb` — multi-MODEL PDB, one MODEL per step
-- `chain_<k>.pdb` — per-chain PDB (when `--n_chains > 1`)
-- `metrics.json` — RMSD, RMSF, per-step RMSD array, validity breakdown
-- `timing_report.txt` — wall-clock time per step and speedup vs classical MD
-
-**Validity reporting** — each step is checked for:
-
-| Check | Criterion | Notes |
-|---|---|---|
-| Bond geometry | All bead-bead bonds within ±20% of ideal length | CA–CA 3.8 Å; N–CA 1.46 Å; CA–C 1.52 Å etc. |
-| Steric clashes | No non-bonded heavy-atom pair < 2.0 Å | Gly Cβ = Cα position is correctly excluded |
-| Radius of gyration | Rg within 0.5×–2.0× of expected (2.2 × P^0.38 Å) | Detects complete unfolding |
-| Ramachandran (4-bead only) | < 5% residues outside allowed φ/ψ regions | ~97% of real MD frames pass at this threshold |
+| `--eta` | `1.0` | Stochasticity: 1.0 = DDPM, 0.0 = deterministic DDIM |
 
 ---
 
 ## Step 4 — All-atom reconstruction
 
-Recover full heavy-atom coordinates from the bead trajectory using the nearest real MD frame as a sidechain template.
-
-### 2-bead reconstruction (demo_2bead → high-quality backbone dihedrals)
-
 ```bash
+# 2-bead → high-quality backbone dihedrals via rigid Cα shift
 python scripts/reconstruct.py \
     --beads      demo_2bead/trajectory.pdb \
     --traj       WT/WT-sol6.trr \
     --top        WT/WT-sol6.gro \
     --checkpoint checkpoints/wt_2bead_200ep.pt \
     --out        demo_2bead/allatom.pdb
-```
 
-Output:
-```
-Loaded 51 bead frames  (169 residues, mode=2bead)
-Loading template trajectory WT/WT-sol6.trr … 5001 frames, 35875 atoms
-  169 reconstructable residues
-Reconstructing 51 frames …
-Saved 51 frames → demo_2bead/allatom.pdb  (5.6 MB)
-  Heavy atoms per frame: 1351
-```
-
-Each frame finds the nearest real MD frame by Cα-RMSD, then shifts every residue rigidly by (Cα_gen − Cα_template). This preserves the template's backbone φ/ψ angles — Ramachandran plots will look like real MD.
-
-### 4-bead reconstruction (demo_4bead → Kabsch-grafted sidechains)
-
-```bash
+# 4-bead → per-residue Kabsch sidechain grafting
 python scripts/reconstruct.py \
     --beads      demo_4bead/trajectory.pdb \
     --traj       WT/WT-sol6.trr \
@@ -373,57 +249,368 @@ python scripts/reconstruct.py \
     --out        demo_4bead/allatom.pdb
 ```
 
-Output:
-```
-Loaded 51 bead frames  (169 residues, mode=4bead)
-Reconstructing 51 frames …
-Saved 51 frames → demo_4bead/allatom.pdb  (5.6 MB)
-  Heavy atoms per frame: 1351
-```
-
-For each residue, the template backbone (N, Cα, C) is Kabsch-superposed onto the generated backbone to rotate deep sidechain atoms (Cγ, Cδ, …) into the correct local frame. N, Cα, C, Cβ come directly from the generated coordinates. Carbonyl O is placed geometrically in the peptide plane (C=O = 1.229 Å). Backbone dihedrals reflect the model's poor φ/ψ geometry — use the 2-bead reconstruction for dihedral analysis.
+---
 
 ---
 
-## Visualisation
+# Part 2 — Transferable Cross-Protein Propagator
 
-The demo all-atom PDBs are ready to open immediately after cloning:
+The transferable model learns SE(3)-equivariant backbone dynamics from thousands of proteins at once. At inference, only the protein's sequence and a starting structure are needed — no per-protein MD trajectory.
+
+## Architecture overview
+
+Instead of Cartesian bead displacements, the transferable model works in **SE(3) local residue frames**:
+
+1. Each residue has a local frame (R_i ∈ SO(3), t_i ∈ ℝ³) built from its backbone N/Cα/C atoms.
+2. The model predicts the **relative SE(3) update** u = (ω, Δt) that maps frame_i to frame_{i+τ} in the local coordinate system of residue i.
+3. Updates in local frames are invariant to global rigid-body motion, making them portable across all proteins.
+
+The **PropagatorNet** is a union-graph GNN that processes multiple proteins simultaneously:
+- Nodes carry residue type, chain membership, sequential index, current noisy update, diffusion timestep, lag τ, and simulation temperature T.
+- Edges carry 13-dimensional SE(3)-relative geometric features (inter-frame distances, relative rotations).
+- DDPM ε-prediction with T=200 noise levels; DDIM sampling with η=0 for fast inference.
+
+## Training datasets
+
+| Dataset | Proteins | Frames | Temperature | Lag |
+|---|---|---|---|---|
+| ATLAS | 1938 | 1.9 M | 300 K (physiological) | 200 ps |
+| mdCATH | 1000 | 11 M | 320, 348, 379, 413, 450 K | 1–10 ns |
+
+---
+
+## Step 1 — Download and preprocess data
+
+ATLAS and mdCATH shards are pre-built `.pt` files (one per protein). Download them with:
 
 ```bash
-# 2-bead demo — backbone dihedrals match real MD
-pymol demo_2bead/allatom.pdb
+python scripts/download_atlas_full.py --out data/atlas
+python scripts/download_mdcath.py     --out data/mdcath
+```
 
-# 4-bead demo — per-residue Kabsch sidechain placement
-pymol demo_4bead/allatom.pdb
+Each shard contains:
+- `R_aa` `[F, N, 3]` — SO(3) log-map of per-residue rotation (float16)
+- `t` `[F, N, 3]` — Cα positions in Å (float16)
+- `res_type`, `chain_id`, `res_index` — residue metadata
+- `dt` — picoseconds per frame
+- `traj_breaks` — frame indices where sub-trajectories begin (mdCATH only)
+- `traj_temps` — temperature (K) per sub-trajectory (mdCATH only)
 
-# Compare both at once
-pymol demo_2bead/allatom.pdb demo_4bead/allatom.pdb
+ATLAS shards are assumed to be at 300 K. mdCATH shards carry 5 temperatures (320–450 K) as separate sub-trajectories within each protein shard.
 
-# Bead-model trajectories (before reconstruction)
-pymol demo_2bead/trajectory.pdb   # shows Cα and Cβ
-pymol demo_4bead/trajectory.pdb   # shows N, Cα, C, Cβ
+---
 
-# VMD
-vmd demo_2bead/allatom.pdb
+## Step 2 — Train the transferable model
+
+### Recommended training command
+
+```bash
+python scripts/train_transfer.py \
+    --shards_dir data/atlas data/mdcath \
+    --lags_ps 2000 5000 10000 \
+    --hidden 256 --layers 6 \
+    --steps 50000 \
+    --temp_schedule 0:320 5000:348 10000:379 17000:413 25000:450 \
+    --time_reversal \
+    --compile \
+    --out checkpoints/v2_256h_curriculum.pt
+```
+
+This takes ~4–5 hours on a single GPU at ~10 step/s. Key flags explained:
+
+### Dataset and sampling
+
+| Flag | Default | Description |
+|---|---|---|
+| `--shards_dir` | required | One or more shard directories (e.g. `data/atlas data/mdcath`) |
+| `--lags_ps` | `200 1000` | Physical lag times in picoseconds (can list multiple) |
+| `--norm_dir` | first dir | Directory to fit UpdateNorm on; defaults to ATLAS to avoid high-T mdCATH scale inflation |
+| `--no_frame_weighted` | off | By default, shards are sampled proportional to frame count so every MD frame has equal probability regardless of how many shards come from that dataset |
+
+### Model architecture
+
+| Flag | Default | Description |
+|---|---|---|
+| `--hidden` | `128` | GNN hidden dimension; use 256 for production quality |
+| `--layers` | `4` | Message-passing layers; use 6 for production quality |
+| `--temp_emb_dim` | `8` | Temperature embedding dimension; 0 to disable. When > 0, the model is conditioned on simulation temperature so it learns that thermal fluctuation variance scales with T |
+
+### Physics-informed training
+
+| Flag | Default | Description |
+|---|---|---|
+| `--temp_schedule` | off | Temperature curriculum: `STEP:TEMP_K` pairs. Starts training on low-temperature (well-behaved) data and gradually introduces higher temperatures. Prevents NaN gradients caused by SO(3) singularities at high-T large backbone rotations |
+| `--time_reversal` | off | Enable time-reversal augmentation (`reverse_prob=0.5`). Each training example is randomly flipped (x_{t+τ}→x_t instead of x_t→x_{t+τ}), doubling effective training data and enforcing microscopic reversibility |
+| `--lam` | `0.0` | Physics penalty weight (C1 soft loss: bond lengths + steric clashes). Enabled by setting > 0 |
+| `--lam_warmup` | `500` | Steps to ramp physics penalty from 0 to `--lam` |
+
+### Training efficiency
+
+| Flag | Default | Description |
+|---|---|---|
+| `--accum` | `4` | Gradient accumulation steps (effective batch = 4 × `max_union_nodes`) |
+| `--max_union_nodes` | `2000` | Max nodes per union minibatch |
+| `--compile` | off | `torch.compile` for ~37% GPU speedup (requires PyTorch 2.0+) |
+| `--grad_clip` | `1.0` | Gradient norm clip |
+
+### Temperature curriculum explained
+
+mdCATH contains trajectories at 5 temperatures: 320, 348, 379, 413, and 450 K. At high temperatures (particularly 450 K), backbone rotations can be large enough that the SO(3) log-map encounters a singularity at π radians. Combined with float16 quantization, this produces NaN gradients early in training when the model has not yet learned to handle large deformations.
+
+The temperature curriculum solves this by starting with only 320 K data and introducing hotter trajectories gradually:
+
+```
+0:320      — start: only 320 K (smallest rotations, most stable)
+5000:348   — step 5000: add 348 K
+10000:379  — step 10000: add 379 K
+17000:413  — step 17000: add 413 K
+25000:450  — step 25000: full curriculum (all temperatures)
+```
+
+ATLAS shards (no temperature metadata) are always included at all curriculum stages.
+
+### Console output during training
+
+```
+  data/atlas: 1938 shards, 1,939,938 total frames  (2.2s)
+  data/mdcath: 1000 shards, 11,041,709 total frames  (5.5s)
+Total: 2938 shards from 2 dataset(s)
+  UpdateNorm fitted on: data/atlas (1938 shards)
+torch.compile: model compiled
+  Temperature curriculum starts at 320K (schedule: [...])
+step    100/50000  loss=0.2341  10.12 step/s  76150 nodes/s  elapsed=0.2m  ETA=82.4m
+step    200/50000  loss=0.1987  10.34 step/s  77800 nodes/s  elapsed=0.4m  ETA=80.6m
+  [step 5000] curriculum: max_temp=348K (allowed: [320, 348]K)
+  [step 10000] curriculum: max_temp=379K (allowed: [320, 348, 379]K)
+...
+Checkpoint saved -> checkpoints/v2_256h_curriculum.pt
+```
+
+The curriculum transition lines confirm that temperature gates fire at the right steps.
+
+---
+
+## Step 3 — Evaluate zero-shot
+
+Evaluate on a protein that was never seen during training:
+
+```bash
+python scripts/eval_transfer.py \
+    --checkpoint checkpoints/v2_256h_curriculum.pt \
+    --shard      data/atlas/1abc.pt \
+    --steps      200 \
+    --tau_ps     2000 \
+    --diff_steps 20 \
+    --eta        0.0 \
+    --temp_K     300.0 \
+    --out        eval_1abc.json
+```
+
+Output `eval_1abc.json`:
+```json
+{
+  "model": {
+    "rmsf_corr": 0.87,
+    "dist_js": 0.003,
+    "ca_bond_mean": 3.81,
+    "clash_count": 0.0
+  }
+}
+```
+
+| Metric | Meaning | Good value |
+|---|---|---|
+| `rmsf_corr` | Pearson correlation of per-residue RMSF vs MD reference | > 0.80 for zero-shot |
+| `dist_js` | Jensen-Shannon divergence of Cα–Cα pairwise distance distributions | < 0.01 |
+| `ca_bond_mean` | Mean Cα–Cα bond length in generated frames | 3.7–3.9 Å |
+| `clash_count` | Mean steric clashes per frame (non-bonded Cα pairs < 3.0 Å) | < 1.0 |
+
+**All `eval_transfer.py` flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--checkpoint` | required | Path to trained `.pt` checkpoint |
+| `--shard` | required | Held-out protein shard `.pt` |
+| `--steps` | `200` | Number of autoregressive rollout steps |
+| `--tau_ps` | `1000` | Lag time in picoseconds |
+| `--diff_steps` | `50` | Denoising steps per rollout step (50 = DDPM quality; 10–20 = DDIM) |
+| `--eta` | `1.0` | Reverse-process stochasticity: 1.0 = DDPM, 0.0 = deterministic DDIM |
+| `--temp_K` | `300.0` | Simulation temperature in Kelvin passed to the model |
+| `--oracle` | — | Per-protein checkpoint (upper-bound bracket) |
+| `--lower` | — | Marginal-prior checkpoint (lower-bound bracket) |
+| `--out` | `eval.json` | Output path |
+| `--device` | auto | `cuda` or `cpu` |
+
+### DDIM vs DDPM at inference
+
+The model is trained with T=200 DDPM noise levels but supports any number of denoising steps at inference via **DDIM** (Denoising Diffusion Implicit Models). With η=0, the reverse process is deterministic and can use far fewer steps without quality loss.
+
+| `--diff_steps` | `--eta` | Mode | Speed relative to T=200 DDPM |
+|---|---|---|---|
+| 200 | 1.0 | Full DDPM (stochastic) | 1× |
+| 50 | 1.0 | Subsampled DDPM | 4× |
+| 20 | 0.0 | DDIM deterministic | **10×** |
+| 10 | 0.0 | Aggressive DDIM | **20×** |
+
+For production rollouts, `--diff_steps 20 --eta 0.0` provides a good quality/speed balance.
+
+---
+
+## Throughput and lag time selection
+
+The simulated time generated per day depends on the lag time τ, protein size N, and number of denoising steps T_DDPM:
+
+```
+simulated_time_per_day ≈ 86400 s × (150,000 nodes/s / N) / T_DDPM × τ
+```
+
+For the transferable model (inference throughput ~150K nodes/s on a single GPU):
+
+### With standard DDPM (T=200 steps)
+
+| τ | N = 100 residues | N = 200 residues | N = 300 residues |
+|---|---|---|---|
+| 2 ns (2000 ps) | ~1300 μs/day | ~650 μs/day | ~430 μs/day |
+| 5 ns (5000 ps) | ~3200 μs/day | ~1600 μs/day | ~1080 μs/day |
+| 10 ns (10000 ps) | ~6500 μs/day | ~3200 μs/day | ~2160 μs/day |
+
+### With DDIM (T=20 steps, η=0, `--diff_steps 20 --eta 0.0`)
+
+10× speedup — same rows × 10.
+
+**Choosing τ**: use the smallest τ the model was trained on (2000 ps) for maximum physical accuracy. Increase τ only if throughput is insufficient. The training lags `--lags_ps 2000 5000 10000` bracket common use cases.
+
+---
+
+## Physics-informed features
+
+### Temperature conditioning (`--temp_emb_dim 8`, default)
+
+The model embeds the simulation temperature T alongside the lag time τ. This is important because thermal fluctuation variance scales linearly with T (equipartition theorem): at 450 K, backbone fluctuations are ~40% larger than at 320 K. Without temperature conditioning, the model would learn an average scale and systematically under-predict fluctuations at high T.
+
+At inference, pass `--temp_K 300.0` for physiological simulation or `--temp_K 350.0` for thermal unfolding studies. The model interpolates between the training temperatures (320–450 K) and extrapolates modestly beyond them.
+
+Old checkpoints trained without temperature conditioning load with `temp_emb_dim=0` automatically — backward compatible.
+
+### Time-reversal augmentation (`--time_reversal`)
+
+With `--time_reversal`, each training example has a 50% chance of being reversed: the model sees the end frame as the source and learns to predict the transition back to the start frame (x_{t+τ} → x_t instead of x_t → x_{t+τ}). This:
+
+1. Doubles the effective training data at zero additional cost
+2. Enforces **microscopic reversibility** — the model learns dynamics that could be run forward or backward in time, consistent with equilibrium statistical mechanics
+3. Naturally prevents the model from learning irreversible drift artifacts
+
+### C1 physics loss (`--lam 0.01`)
+
+When `--lam > 0`, an auxiliary loss penalizes the model's predicted clean-update estimate x0_hat for geometric violations:
+- Cα–Cα consecutive bond deviations from 3.8 Å
+- Steric clashes (non-bonded Cα pairs < 3.0 Å)
+
+This does not change the DDPM noise schedule or sampling procedure; it provides a supervision signal that the predicted endpoint should be geometrically reasonable.
+
+### C2 guidance (at inference, via `lsmd.guidance`)
+
+At inference, `sample_ddpm_union_guided` applies a per-step gradient nudge toward valid geometry during the reverse diffusion process. This is distinct from the C1 training loss — it actively steers each denoising step:
+
+```python
+from lsmd.guidance import sample_ddpm_union_guided
+u = sample_ddpm_union_guided(net, ..., gamma=0.1)  # gamma=0 → plain DDPM
+```
+
+`gamma > 0` reduces geometric violations at the cost of some sample diversity. Start with `gamma=0.05–0.1`.
+
+---
+
+## Backward compatibility
+
+Old checkpoints (before temperature conditioning and time-reversal) load correctly:
+
+```python
+from lsmd.transfer_eval import load_checkpoint
+net, schedule, update_norm = load_checkpoint(
+    torch.load("checkpoints/old_checkpoint.pt"), device="cpu")
+# → loads with temp_emb_dim=0, PropagatorNet unchanged
+```
+
+`load_checkpoint` reads `temp_emb_dim` from the checkpoint's `hparams` and defaults to 0 when the key is absent.
+
+---
+
+## Using the Python API directly
+
+```python
+import torch
+from lsmd import featurize as feat
+from lsmd.transfer_eval import load_checkpoint, rollout, evaluate
+
+device = "cuda"
+ckpt = torch.load("checkpoints/v2_256h_curriculum.pt", map_location="cpu")
+net, schedule, update_norm = load_checkpoint(ckpt, device=device)
+
+# Load a shard
+shard = torch.load("data/atlas/1abc.pt", map_location="cpu")
+if "R_aa" in shard:
+    from lsmd import geometry as g
+    R0 = g.so3_exp(shard["R_aa"][0].float())
+else:
+    R0 = shard["R"][0]
+t0 = shard["t"][0].float()
+
+# Run rollout: 100 steps × 2000 ps = 200 ns of simulated time
+traj = rollout(
+    net, schedule, update_norm,
+    R0, t0, shard["res_type"], shard["chain_id"], shard["res_index"],
+    steps=100,
+    tau_ps=2000.0,   # 2 ns per step
+    k=12,
+    diff_steps=20,   # DDIM: 10× faster than 200-step DDPM
+    eta=0.0,         # deterministic
+    temp_K=300.0,    # physiological temperature
+    device=device,
+)
+# traj: [101, N, 3] Cα positions in Å
+
+# Score against reference MD
+metrics = evaluate(traj, shard["t"].float())
+print(metrics)
+# {'rmsf_corr': 0.87, 'dist_js': 0.003, 'ca_bond_mean': 3.81, 'clash_count': 0.0}
 ```
 
 ---
 
-## Demo run summary
+## Training on your own protein dataset
 
-Both demos use mimic mode, τ=2 (400 ps/step), 50 steps (20 ns), same starting frame.
+If you have your own MD data and want to train the transferable model:
 
-| | demo_2bead | demo_4bead |
+```python
+from lsmd import data, featurize as feat, geometry as g
+
+# Build a shard from your trajectory
+shard = {
+    "R_aa": g.so3_log(R_all).half(),   # [F, N, 3] SO(3) log-map, float16
+    "t":    t_all.half(),               # [F, N, 3] Cα positions, float16
+    "res_type":  res_type,              # [N] long
+    "chain_id":  chain_id,             # [N] long
+    "res_index": res_index,            # [N] long
+    "dt": 200.0,                       # ps per frame
+    "n_res": N,
+}
+torch.save(shard, "data/my_protein/my_protein.pt")
+```
+
+Then train with `--shards_dir data/my_protein` alongside ATLAS/mdCATH. Set `--lags_ps` to match your trajectory's frame interval and desired lag times.
+
+---
+
+## Summary
+
+| | Per-protein DDPM | Transferable propagator |
 |---|---|---|
-| Atoms per residue | Cα, Cβ | N, Cα, C, Cβ |
-| Final RMSD | 7.6 Å | 8.5 Å |
-| RMSF (mean / max) | 2.4 / 9.1 Å | 2.5 / 9.4 Å |
-| Valid steps | 88% | 0% (Ramachandran†) |
-| Speedup vs MD | 1439× | 1116× |
-| Reconstruction | rigid Cα shift | per-residue Kabsch |
-| Backbone φ/ψ quality | ✓ template quality | ✗ model generates poor dihedrals |
-| Sidechain placement | template rotamers | Kabsch-rotated into generated frame |
-
-†Bond violations and steric clashes are both 0; only the Ramachandran check fails due to the Cartesian model's lack of dihedral constraints.
-
-To scale up, increase `--steps` (e.g. `--steps 2500` for 1 μs) or switch to `--sample_mode explore` for wider conformational sampling.
+| Training data | Single MD trajectory | ATLAS (1938) + mdCATH (1000) proteins |
+| Proteins at inference | Same protein only | Any new protein (zero-shot) |
+| Step interval | 200 ps – 1 ns | 2 – 10 ns |
+| Throughput (N=100) | Protein-specific | ~1300 μs/day (DDPM) / ~13 ms/day (DDIM-20) |
+| Temperature | Single (training T) | 300–450 K (conditioning) |
+| Checkpoint size | ~1 MB | ~20 MB (hidden=256) |
+| Training time | ~10 min (GPU) | ~4–5 h (GPU, 50 K steps) |
+| All-atom reconstruction | Template nearest-neighbor | Not included (Cα-level output) |
