@@ -29,3 +29,23 @@ def test_rollout_shape_and_finite():
                       steps=4, tau_ps=200.0, k=4, diff_steps=3, device="cpu")
     assert traj.shape == (5, 10, 3)
     assert torch.isfinite(traj).all()
+
+
+def test_evaluate_keys_and_finite():
+    torch.manual_seed(0)
+    ca_model = torch.randn(8, 10, 3) * 2.0
+    ca_md = torch.randn(12, 10, 3) * 2.0
+    m = te.evaluate(ca_model, ca_md)
+    for key in ("rmsf_corr", "dist_js", "ca_bond_mean", "clash_count"):
+        assert key in m
+    assert -1.0 <= m["rmsf_corr"] <= 1.0
+    assert 0.0 <= m["dist_js"] <= 1.0
+    assert torch.isfinite(torch.tensor(m["ca_bond_mean"]))
+
+
+def test_evaluate_identical_ensembles_have_high_rmsf_corr():
+    torch.manual_seed(1)
+    ca = torch.randn(10, 12, 3) * 2.0
+    m = te.evaluate(ca, ca)
+    assert m["rmsf_corr"] > 0.99
+    assert m["dist_js"] < 1e-3

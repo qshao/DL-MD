@@ -11,7 +11,6 @@ from lsmd import featurize as feat
 from lsmd.transfer_model import PropagatorNet, sample_ddpm_union
 from lsmd.normalize import UpdateNorm
 from lsmd.model import NoiseSchedule
-from lsmd import validation as val
 
 
 def load_checkpoint(ckpt, device):
@@ -87,3 +86,31 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
         traj.append(t.clone())
 
     return torch.stack(traj, dim=0)
+
+
+from lsmd import validation as val  # noqa: E402
+
+
+def evaluate(ca_model, ca_md):
+    """Score a generated CA ensemble against reference MD.
+
+    Args:
+        ca_model: [K, N, 3] generated CA frames.
+        ca_md:    [M, N, 3] reference MD CA frames.
+
+    Returns:
+        dict: rmsf_corr, dist_js, ca_bond_mean, clash_count.
+    """
+    rmsf = val.rmsf_profile(ca_model, ca_md)
+    dist_js = val.distance_matrix_js(ca_model, ca_md)
+    bond_means, clashes = [], []
+    for fr in ca_model:
+        geo = val.ca_geometry(fr)
+        bond_means.append(geo["ca_bond_mean"])
+        clashes.append(geo["clash_count"])
+    return {
+        "rmsf_corr": rmsf["corr"],
+        "dist_js": dist_js,
+        "ca_bond_mean": float(sum(bond_means) / len(bond_means)),
+        "clash_count": float(sum(clashes) / len(clashes)),
+    }
