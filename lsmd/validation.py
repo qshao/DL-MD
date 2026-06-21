@@ -503,7 +503,10 @@ def check_4bead_conformation(beads, gly_mask=None, rama_potential=None):
     n_atoms = P * 4
     flat = beads.reshape(n_atoms, 3)
 
-    # Bonded pairs (flat indices): N-CA, CA-C, CA-CB, C-N(next)
+    # Bonded pairs for clash exclusion: N-CA, CA-C, CA-CB, C-N(next).
+    # For Gly, CB sits at the CA position (distance 0), so N-CB and C-CB
+    # are also at bonded distances and must be excluded from the clash check.
+    # CA-CB is kept in the exclusion list for Gly too (unlike the energy term).
     bi_list, bj_list = [], []
     for res in range(P):
         bi_list += [res*4, res*4+1, res*4+1]    # N-CA, CA-C, CA-CB
@@ -511,12 +514,9 @@ def check_4bead_conformation(beads, gly_mask=None, rama_potential=None):
         if res < P - 1:
             bi_list.append(res*4+2)              # C-N(next)
             bj_list.append((res+1)*4)
-    # Gly: remove CA-CB bonds
-    if gly_mask is not None:
-        pairs_filtered = [(i, j) for i, j in zip(bi_list, bj_list)
-                          if not (j == (i//4)*4+3 and gly_mask[i//4])]
-        bi_list = [p[0] for p in pairs_filtered]
-        bj_list = [p[1] for p in pairs_filtered]
+        if gly_mask is not None and gly_mask[res]:
+            bi_list += [res*4, res*4+2]          # N-CB, C-CB (Gly only)
+            bj_list += [res*4+3, res*4+3]
 
     bonded_adj = torch.zeros(n_atoms, n_atoms, dtype=torch.bool, device=device)
     if bi_list:
@@ -595,6 +595,16 @@ def _build_4bead_bond_tensors(P, gly_mask, device):
     if len(bi):
         adj[bond_i, bond_j] = True
         adj[bond_j, bond_i] = True
+    # Gly: CB sits at CA position — exclude N-CB, CA-CB, C-CB from clash penalty
+    # (CA-CB was stripped from the bond energy list above, but must still be
+    # excluded from the non-bonded clash term so Gly doesn't blow up)
+    if gly_mask is not None:
+        for r in range(P):
+            if gly_mask[r]:
+                cb = r * 4 + 3
+                for other in (r*4, r*4+1, r*4+2):   # N, CA, C
+                    adj[cb, other] = True
+                    adj[other, cb] = True
     ii, jj = torch.triu_indices(n, n, offset=1, device=device)
     nb_mask = ~adj[ii, jj]
     return bond_i, bond_j, bond_t, ii[nb_mask], jj[nb_mask]
