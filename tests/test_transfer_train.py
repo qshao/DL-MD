@@ -50,3 +50,26 @@ def test_union_batch_emits_single_oversized_example():
                                          lags_ps=[200.0], k=4,
                                          max_union_nodes=25, n_batches=1))
     assert batches[0]["node_feats"].shape[0] == 40  # emitted despite exceeding cap
+
+
+from lsmd.normalize import UpdateNorm
+
+
+def test_fit_update_norm_returns_positive_scale():
+    shards = [_synthetic_shard(N=10, seed=i) for i in range(4)]
+    norm = tt.fit_update_norm(shards, random.Random(0), lags_ps=[200.0],
+                              k=4, n_samples=20)
+    assert isinstance(norm, UpdateNorm)
+    assert norm.scale.shape == (6,)
+    assert (norm.scale > 0).all()
+
+
+def test_train_one_step_returns_checkpoint_without_nans():
+    shards = [_synthetic_shard(N=10, seed=i) for i in range(4)]
+    ckpt = tt.train(shards, lags_ps=[200.0], k=4, hidden=16, layers=2,
+                    max_union_nodes=25, accum=2, steps=2, T_diff=20,
+                    norm_samples=16, device="cpu", seed=0)
+    assert "model_state" in ckpt and "update_norm" in ckpt
+    assert ckpt["n_aa_types"] == 21
+    for v in ckpt["model_state"].values():
+        assert torch.isfinite(v).all()

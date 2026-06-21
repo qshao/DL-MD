@@ -45,3 +45,69 @@ def iter_union_batches(shards, rng, lags_ps, k, max_union_nodes, n_batches):
             continue
         yield batching.union_collate(group)
         produced += 1
+
+
+from lsmd.normalize import UpdateNorm
+from lsmd.transfer_model import PropagatorNet, ddpm_loss_union
+from lsmd.model import NoiseSchedule
+
+
+def fit_update_norm(shards, rng, lags_ps, k, n_samples):
+    """Fit corpus-level UpdateNorm from sampled training updates."""
+    cols = []
+    while len(cols) < n_samples:
+        shard = shards[rng.randrange(len(shards))]
+        ex = sample_example(shard, rng, lags_ps, k)
+        if ex is not None:
+            cols.append(ex["u_target"])
+    return UpdateNorm.fit(torch.cat(cols, dim=0))
+
+
+def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
+          max_union_nodes=2000, accum=4, steps=1000, T_diff=200,
+          norm_samples=256, device="cpu", seed=0):
+    """Train the union-graph propagator across proteins; return a checkpoint."""
+    device = torch.device(device)
+    rng = random.Random(seed)
+    torch.manual_seed(seed)
+
+    update_norm = fit_update_norm(shards, rng, lags_ps, k, norm_samples)
+    scale = update_norm.scale.to(device)
+
+    net = PropagatorNet(hidden=hidden, layers=layers).to(device)
+    schedule = NoiseSchedule(T=T_diff).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    use_amp = device.type == "cuda"
+    try:
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    except AttributeError:
+        scaler = torch.amp.GradScaler(enabled=use_amp)
+
+    batches = iter_union_batches(shards, rng, lags_ps, k,
+                                 max_union_nodes, n_batches=steps * accum)
+    opt.zero_grad()
+    for i, b in enumerate(batches):
+        node_feats = b["node_feats"].to(device)
+        edge_index = b["edge_index"].to(device)
+        edge_feats = b["edge_feats"].to(device)
+        u_target = b["u_target"].to(device) / scale
+        tau = b["tau"].to(device)
+        batch = b["batch"].to(device)
+        with torch.autocast(device_type=device.type, enabled=use_amp):
+            loss = ddpm_loss_union(net, u_target, node_feats, edge_index,
+                                   edge_feats, tau, batch, schedule) / accum
+        scaler.scale(loss).backward()
+        if (i + 1) % accum == 0:
+            scaler.step(opt)
+            scaler.update()
+            opt.zero_grad()
+
+    return {
+        "model_state": {kk: vv.cpu() for kk, vv in net.state_dict().items()},
+        "T_diff": T_diff,
+        "update_norm": update_norm.state_dict(),
+        "n_aa_types": 21,
+        "hparams": {"hidden": hidden, "layers": layers, "k": k,
+                    "lags_ps": list(lags_ps), "point_dim": 6,
+                    "node_dim": 24, "edge_dim": 13},
+    }
