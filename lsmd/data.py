@@ -296,3 +296,64 @@ def compute_frame_weights(frames, n_pca=3, bins=30, density_clip=10.0):
     weights = weights.clamp(max=mean_w * density_clip)
     weights = weights / weights.mean()
     return weights
+
+
+from lsmd import featurize as _feat
+
+
+def physical_lag_pairs(num_frames, dt, lags_ps):
+    """Frame pairs at physical lag times (picoseconds).
+
+    Args:
+        num_frames: frames in the trajectory.
+        dt:         ps per frame.
+        lags_ps:    iterable of physical lags in ps.
+
+    Returns:
+        LongTensor [P, 3] — columns (start_frame, end_frame, tau_frames).
+        Lags requiring >= num_frames frames are skipped.
+    """
+    segs = []
+    for lag in lags_ps:
+        tau_frames = max(1, int(round(float(lag) / dt)))
+        if tau_frames >= num_frames:
+            continue
+        starts = torch.arange(0, num_frames - tau_frames, dtype=torch.long)
+        tau_col = torch.full((len(starts),), tau_frames, dtype=torch.long)
+        segs.append(torch.stack([starts, starts + tau_frames, tau_col], dim=1))
+    if not segs:
+        return torch.zeros((0, 3), dtype=torch.long)
+    return torch.cat(segs, dim=0)
+
+
+def build_training_example(frames, i, tau_frames, k):
+    """State-conditional training example from frame i to frame i+tau_frames.
+
+    The graph is built from the CURRENT frame i; the target is the per-residue
+    SE(3) update from frame i to frame i+tau_frames.
+
+    Args:
+        frames: dict with R [F,N,3,3], t [F,N,3], res_type [N], chain_id [N],
+                res_index [N], dt (ps/frame).
+        i:          source frame index.
+        tau_frames: lag in frames.
+        k:          kNN neighbours.
+
+    Returns:
+        dict with node_feats [N,24], edge_index [2,E], edge_feats [E,13],
+        u_target [N,6], tau (float, ps) — consumable by union_collate.
+    """
+    j = i + tau_frames
+    R_i, t_i = frames["R"][i], frames["t"][i]
+    R_j, t_j = frames["R"][j], frames["t"][j]
+    edge_index, edge_feats = _feat.frame_graph(R_i, t_i, k)
+    node_feats = _feat.frame_node_features(
+        frames["res_type"], frames["chain_id"], frames["res_index"])
+    u_target = _feat.relative_update(R_i, t_i, R_j, t_j)
+    return {
+        "node_feats": node_feats,
+        "edge_index": edge_index,
+        "edge_feats": edge_feats,
+        "u_target": u_target,
+        "tau": float(tau_frames) * float(frames["dt"]),
+    }
