@@ -11,7 +11,10 @@ from lsmd.physics_loss import geometric_penalty
 
 def guidance_step(u0_hat, R_cur, t_cur, global_chain, scale, gamma, *,
                   rama_pot=None, **pen_kw):
-    """One reconstruction-guidance nudge on the clean-update estimate."""
+    """One reconstruction-guidance nudge on the clean-update estimate.
+
+    gamma is in normalized-update units (multiples of sigma per component).
+    """
     if gamma == 0.0:
         return u0_hat
     with torch.enable_grad():

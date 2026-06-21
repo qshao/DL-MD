@@ -4,6 +4,7 @@ Whole CATH clusters are assigned to a single split so homologous proteins never
 straddle the train/test boundary (which would inflate zero-shot scores).
 """
 import random
+import warnings
 
 
 def by_protein_split(cluster_of, fracs=(0.8, 0.1, 0.1), seed=0):
@@ -39,4 +40,13 @@ def by_protein_split(cluster_of, fracs=(0.8, 0.1, 0.1), seed=0):
             bucket = "test"
         out[bucket].extend(members)
         count += len(members)
-    return {k: sorted(v) for k, v in out.items()}
+    result = {k: sorted(v) for k, v in out.items()}
+    for split_name in ("val", "test"):
+        if not result[split_name]:
+            warnings.warn(
+                f"by_protein_split: '{split_name}' split is empty — cluster "
+                "granularity may be too coarse for the requested fracs. "
+                "Try smaller fracs[0] or ensure more clusters than proteins.",
+                stacklevel=2,
+            )
+    return result

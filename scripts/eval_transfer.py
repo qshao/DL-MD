@@ -13,17 +13,25 @@ python scripts/eval_transfer.py \\
 import argparse
 import json
 import torch
+from lsmd import geometry as g
 from lsmd import transfer_eval as te
 
 
 def _run(ckpt, shard, steps, tau_ps, k, diff_steps, device):
     net, sched, norm = te.load_checkpoint(ckpt, device=device)
     k_eff = ckpt["hparams"].get("k", k)
-    traj = te.rollout(net, sched, norm, shard["R"][0], shard["t"][0],
+    # support both compact (R_aa float16) and legacy (R float32) shard formats
+    if "R_aa" in shard:
+        R0 = g.so3_exp(shard["R_aa"][0].float())
+    else:
+        R0 = shard["R"][0]
+    t0 = shard["t"][0].float()
+    t_md = shard["t"].float()
+    traj = te.rollout(net, sched, norm, R0, t0,
                       shard["res_type"], shard["chain_id"], shard["res_index"],
                       steps=steps, tau_ps=tau_ps, k=k_eff,
                       diff_steps=diff_steps, device=device)
-    return te.evaluate(traj, shard["t"])
+    return te.evaluate(traj, t_md)
 
 
 def main():

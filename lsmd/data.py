@@ -300,31 +300,58 @@ def compute_frame_weights(frames, n_pca=3, bins=30, density_clip=10.0):
 
 
 from lsmd import featurize as _feat
+from lsmd import geometry as _g
 
 
-def physical_lag_pairs(num_frames, dt, lags_ps):
+def _frame_R(frames, i):
+    """Return rotation matrix [N,3,3] for frame i, supporting both shard formats."""
+    if "R_aa" in frames:
+        return _g.so3_exp(frames["R_aa"][i].float())
+    return frames["R"][i]
+
+
+def _frame_t(frames, i):
+    """Return CA positions [N,3] float32 for frame i."""
+    return frames["t"][i].float()
+
+
+def physical_lag_pairs(num_frames, dt, lags_ps, traj_breaks=None):
     """Frame pairs at physical lag times (picoseconds).
 
     Args:
-        num_frames: frames in the trajectory.
-        dt:         ps per frame.
-        lags_ps:    iterable of physical lags in ps.
+        num_frames:   total frames in the shard.
+        dt:           ps per frame.
+        lags_ps:      iterable of physical lags in ps.
+        traj_breaks:  optional LongTensor of frame indices where new
+                      trajectories begin (e.g. [440, 880, ...] for a shard
+                      that concatenates three trajectories of 440 frames each).
+                      Pairs that would cross a boundary are excluded.
+                      None (default) treats the entire shard as one trajectory.
 
     Returns:
         LongTensor [P, 3] — columns (start_frame, end_frame, tau_frames).
-        Lags requiring >= num_frames frames are skipped.
+        Lags requiring >= segment_length frames for a given segment are skipped
+        for that segment only.
     """
-    segs = []
-    for lag in lags_ps:
-        tau_frames = max(1, int(round(float(lag) / dt)))
-        if tau_frames >= num_frames:
-            continue
-        starts = torch.arange(0, num_frames - tau_frames, dtype=torch.long)
-        tau_col = torch.full((len(starts),), tau_frames, dtype=torch.long)
-        segs.append(torch.stack([starts, starts + tau_frames, tau_col], dim=1))
-    if not segs:
+    if traj_breaks is None or len(traj_breaks) == 0:
+        segments = [(0, num_frames)]
+    else:
+        walls = [0] + traj_breaks.tolist() + [num_frames]
+        segments = list(zip(walls[:-1], walls[1:]))
+
+    parts = []
+    for seg_start, seg_end in segments:
+        seg_len = seg_end - seg_start
+        for lag in lags_ps:
+            tau_frames = max(1, int(round(float(lag) / dt)))
+            if tau_frames >= seg_len:
+                continue
+            starts = torch.arange(seg_start, seg_end - tau_frames, dtype=torch.long)
+            tau_col = torch.full((len(starts),), tau_frames, dtype=torch.long)
+            parts.append(torch.stack([starts, starts + tau_frames, tau_col], dim=1))
+    if not parts:
         return torch.zeros((0, 3), dtype=torch.long)
-    return torch.cat(segs, dim=0)
+    return torch.cat(parts, dim=0)
 
 
 def build_training_example(frames, i, tau_frames, k):
@@ -345,12 +372,14 @@ def build_training_example(frames, i, tau_frames, k):
         u_target [N,6], tau (float, ps) — consumable by union_collate.
     """
     j = i + tau_frames
-    R_i, t_i = frames["R"][i], frames["t"][i]
-    R_j, t_j = frames["R"][j], frames["t"][j]
+    R_i, t_i = _frame_R(frames, i), _frame_t(frames, i)
+    R_j, t_j = _frame_R(frames, j), _frame_t(frames, j)
     edge_index, edge_feats = _feat.frame_graph(R_i, t_i, k)
     node_feats = _feat.frame_node_features(
         frames["res_type"], frames["chain_id"], frames["res_index"])
     u_target = _feat.relative_update(R_i, t_i, R_j, t_j)
+    if not u_target.isfinite().all():
+        return None  # degenerate backbone frame; caller should resample
     return {
         "node_feats": node_feats,
         "edge_index": edge_index,

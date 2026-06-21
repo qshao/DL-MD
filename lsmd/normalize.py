@@ -9,12 +9,27 @@ import torch
 
 class UpdateNorm:
     def __init__(self, scale):
-        self.scale = scale                       # [point_dim]
+        self.scale = scale.clamp_min(1e-6)      # [point_dim], always >= 1e-6
 
     @classmethod
-    def fit(cls, updates):
-        """Fit per-component scale from a sample of updates [M, point_dim]."""
-        scale = updates.reshape(-1, updates.shape[-1]).std(dim=0).clamp_min(1e-6)
+    def fit(cls, updates, clip_quantile=0.99):
+        """Fit per-component scale from a sample of updates [M, point_dim].
+
+        Uses the ``clip_quantile`` absolute-value percentile as the scale
+        (default 99th percentile) rather than std so that extreme outliers
+        from high-temperature MD or degenerate backbone frames do not inflate
+        the scale and corrupt normalization.  Any NaN/Inf rows are dropped
+        before fitting.
+        """
+        flat = updates.reshape(-1, updates.shape[-1])
+        # Drop rows containing NaN or Inf
+        valid = flat.isfinite().all(dim=-1)
+        flat = flat[valid]
+        if flat.shape[0] < 2:
+            raise ValueError(
+                f"UpdateNorm.fit needs at least 2 finite samples, got {flat.shape[0]}"
+            )
+        scale = flat.abs().quantile(clip_quantile, dim=0)
         return cls(scale)
 
     def normalize(self, u):

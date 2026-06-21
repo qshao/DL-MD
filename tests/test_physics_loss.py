@@ -91,10 +91,12 @@ def test_lam_zero_equals_plain_ddpm_loss():
     phys = pl.collate_physics([e0, e1])
     net = tm.PropagatorNet(hidden=16, layers=2)
     sched = NoiseSchedule(T=30)
-    scale = torch.ones(6)
+    # non-trivial scale validates the normalization contract: ddpm_physics_loss
+    # must normalize u_target internally to match ddpm_loss_union with pre-norm input
+    scale = torch.full((6,), 2.0)
 
     torch.manual_seed(7)
-    plain = tm.ddpm_loss_union(net, union["u_target"], union["node_feats"],
+    plain = tm.ddpm_loss_union(net, union["u_target"] / scale, union["node_feats"],
                                union["edge_index"], union["edge_feats"],
                                union["tau"], union["batch"], sched)
     torch.manual_seed(7)

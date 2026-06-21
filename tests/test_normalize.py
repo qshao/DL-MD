@@ -6,9 +6,10 @@ def test_fit_and_roundtrip():
     torch.manual_seed(0)
     u = torch.randn(1000, 6) * torch.tensor([2.0, 2.0, 2.0, 0.3, 0.3, 0.3])
     norm = UpdateNorm.fit(u)
-    # normalized columns have ~unit std
     z = norm.normalize(u)
-    assert torch.allclose(z.std(0), torch.ones(6), atol=0.1)
+    # scale is the 99th percentile of |u|, so normalized 99th-pct abs ≈ 1
+    q99 = z.abs().quantile(0.99, dim=0)
+    assert torch.allclose(q99, torch.ones(6), atol=0.15)
     # round-trip is exact
     assert torch.allclose(norm.denormalize(norm.normalize(u)), u, atol=1e-5)
 
@@ -25,3 +26,10 @@ def test_scale_is_floored():
     norm = UpdateNorm.fit(u)
     assert (norm.scale >= 1e-6).all()
     assert torch.isfinite(norm.normalize(u)).all()
+
+
+def test_constructor_clamps_scale_floor():
+    # __init__ is the canonical enforcement point — fit/from_state_dict delegate to it
+    norm = UpdateNorm(torch.zeros(6))
+    assert (norm.scale >= 1e-6).all()
+    assert torch.isfinite(norm.normalize(torch.ones(6))).all()

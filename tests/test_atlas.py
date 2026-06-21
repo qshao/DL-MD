@@ -20,7 +20,9 @@ def test_build_shard_uses_fixed_vocab_and_keys():
         pytest.skip("WT trajectory not present")
     shard = atlas.build_shard(trr, gro, dt=200.0)
     N = shard["n_res"]
-    assert shard["R"].shape[1] == N and shard["t"].shape[1] == N
+    assert shard["R_aa"].shape[1] == N and shard["t"].shape[1] == N
+    assert shard["R_aa"].dtype == torch.float16
+    assert shard["t"].dtype == torch.float16
     assert shard["res_type"].shape == (N,)
     # fixed vocab range
     assert int(shard["res_type"].min()) >= 0

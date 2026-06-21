@@ -8,10 +8,22 @@ loss) and C2 (sampling guidance).
 import torch
 
 from lsmd import featurize as feat
+from lsmd.transfer_model import _scatter_mean
+
+# Cache triu indices by (n, device) — index tensors depend only on size and
+# device, so reusing them across forward passes avoids repeated O(n²) allocations.
+_triu_cache: dict = {}
 
 
-def geometric_penalty(R_cur, t_cur, u_denorm, global_chain, rama_pot=None,
-                      w_bond=1.0, w_clash=1.0, w_rama=0.1,
+def _triu_idx(n, device):
+    key = (n, str(device))
+    if key not in _triu_cache:
+        _triu_cache[key] = torch.triu_indices(n, n, offset=2, device=device)
+    return _triu_cache[key]
+
+
+def geometric_penalty(R_cur, t_cur, u_denorm, global_chain, protein_id=None,
+                      rama_pot=None, w_bond=1.0, w_clash=1.0, w_rama=0.1,
                       bond_target=3.8, clash_dist=3.0):
     """Geometric energy of the frames obtained by applying u_denorm to (R_cur, t_cur).
 
@@ -21,6 +33,10 @@ def geometric_penalty(R_cur, t_cur, u_denorm, global_chain, rama_pot=None,
         u_denorm:     [ΣN,6] de-normalized predicted update.
         global_chain: [ΣN] long, globally-unique chain id (same value = same
                       protein and same chain; see collate_physics).
+        protein_id:   [ΣN] long, globally-unique protein id (same value = same
+                      protein; used for clash exclusion so inter-chain intra-protein
+                      pairs are still penalized). If None, falls back to global_chain
+                      (clash restricted to same-chain pairs).
         rama_pot:     optional validation.RamachandranPotential.
         w_bond, w_clash, w_rama: term weights.
         bond_target:  ideal Ca-Ca distance (Angstrom).
@@ -36,15 +52,32 @@ def geometric_penalty(R_cur, t_cur, u_denorm, global_chain, rama_pot=None,
     same = global_chain[1:] == global_chain[:-1]           # [ΣN-1]
     bonds = (ca[1:] - ca[:-1]).norm(dim=-1)                # [ΣN-1]
     if same.any():
-        e_bond = ((bonds - bond_target) ** 2)[same].sum()
+        e_bond = ((bonds - bond_target) ** 2)[same].mean()
     else:
         e_bond = ca.new_zeros(())
 
-    # non-adjacent Ca-Ca clashes (all pairs with index gap >= 2)
-    P = ca.shape[0]
-    ii, jj = torch.triu_indices(P, P, offset=2, device=ca.device)
-    d = (ca[ii] - ca[jj]).norm(dim=-1)
-    e_clash = torch.clamp(clash_dist - d, min=0.0).pow(2).sum()
+    # non-adjacent Ca-Ca clashes within each protein (local index gap >= 2).
+    # unique_consecutive(return_counts=True) gives group sizes in O(ΣN) without
+    # per-protein equality scans; contiguous layout (union_collate) lets us
+    # slice ca directly instead of gathering, and sum/count avoids cat allocation.
+    pid = protein_id if protein_id is not None else global_chain
+    _, counts = torch.unique_consecutive(pid, return_counts=True)
+    clash_parts = []
+    offset = 0
+    for n in counts.tolist():
+        if n < 3:  # triu offset=2 yields empty pairs; mean() on empty → NaN
+            offset += n
+            continue
+        ca_p = ca[offset:offset + n]   # slice — view, no copy
+        li, lj = _triu_idx(n, ca.device)
+        d = (ca_p[li] - ca_p[lj]).norm(dim=-1)
+        clash_parts.append(torch.clamp(clash_dist - d, min=0.0).pow(2))
+        offset += n
+    if clash_parts:
+        total = sum(t.sum() for t in clash_parts)
+        e_clash = total / sum(t.numel() for t in clash_parts)
+    else:
+        e_clash = ca.new_zeros(())
 
     e = w_bond * e_bond + w_clash * e_clash
 
@@ -58,18 +91,28 @@ def geometric_penalty(R_cur, t_cur, u_denorm, global_chain, rama_pot=None,
 def collate_physics(examples):
     """Collate current-frame extras for the physics term (mirrors union order).
 
-    Returns R_cur [ΣN,3,3], t_cur [ΣN,3], global_chain [ΣN] where global_chain
-    = graph_idx*1000 + chain_id so chains never merge across proteins.
+    Returns:
+        R_cur [ΣN,3,3], t_cur [ΣN,3],
+        global_chain [ΣN]  — graph_idx*10_000 + chain_id, unique per chain,
+        protein_id   [ΣN]  — graph_idx, unique per protein (used for clash).
     """
-    R_cur, t_cur, chains = [], [], []
+    R_cur, t_cur, chains, pids = [], [], [], []
     for gi, ex in enumerate(examples):
         R_cur.append(ex["R_cur"])
         t_cur.append(ex["t_cur"])
-        chains.append(gi * 1000 + ex["chain_id"].long())
+        cid = ex["chain_id"].long()
+        if cid.numel() > 0 and int(cid.max()) >= 10_000:
+            raise ValueError(
+                f"chain_id values must be < 10_000 for global_chain encoding; "
+                f"got max={int(cid.max())} in example {gi}"
+            )
+        chains.append(gi * 10_000 + cid)
+        pids.append(torch.full((cid.shape[0],), gi, dtype=torch.long))
     return {
         "R_cur": torch.cat(R_cur, dim=0),
         "t_cur": torch.cat(t_cur, dim=0),
         "global_chain": torch.cat(chains, dim=0),
+        "protein_id": torch.cat(pids, dim=0),
     }
 
 
@@ -88,9 +131,9 @@ def ddpm_physics_loss(net, union, physics, scale, schedule, *, rama_pot=None,
     the model's clean-update estimate x0_hat, de-normalizes it, and adds the
     chain-aware geometric penalty. lam=0 reproduces ddpm_loss_union exactly.
     """
-    from lsmd.transfer_model import _scatter_mean
-
-    u_target = union["u_target"]
+    # cast to device only — keep float32 so AMP doesn't quantize scale to fp16
+    scale_dev = scale.to(device=union["u_target"].device)
+    u_target = union["u_target"] / scale_dev
     node_feats = union["node_feats"]
     edge_index = union["edge_index"]
     edge_feats = union["edge_feats"]
@@ -118,10 +161,14 @@ def ddpm_physics_loss(net, union, physics, scale, schedule, *, rama_pot=None,
         return score_loss
 
     u0_hat = (noisy - sqrt_1mab * pred) / sqrt_ab.clamp_min(1e-8)
-    u_denorm = u0_hat * scale.to(u0_hat)
-    pen = geometric_penalty(physics["R_cur"].to(u_denorm.device),
-                            physics["t_cur"].to(u_denorm.device),
-                            u_denorm, physics["global_chain"].to(u_denorm.device),
+    u_denorm = u0_hat * scale_dev
+    dev = u_denorm.device
+    _pid = physics.get("protein_id")
+    pen = geometric_penalty(physics["R_cur"].to(dev),
+                            physics["t_cur"].to(dev),
+                            u_denorm,
+                            physics["global_chain"].to(dev),
+                            protein_id=_pid.to(dev) if _pid is not None else None,
                             rama_pot=rama_pot, w_bond=w_bond, w_clash=w_clash,
                             w_rama=w_rama)
     return score_loss + lam * pen

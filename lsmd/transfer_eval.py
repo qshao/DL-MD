@@ -99,6 +99,8 @@ def evaluate(ca_model, ca_md):
     Returns:
         dict: rmsf_corr, dist_js, ca_bond_mean, clash_count.
     """
+    if ca_model.shape[0] == 0:
+        raise ValueError("evaluate: ca_model must have at least one frame")
     rmsf = val.rmsf_profile(ca_model, ca_md)
     dist_js = val.distance_matrix_js(ca_model, ca_md)
     bond_means, clashes = [], []

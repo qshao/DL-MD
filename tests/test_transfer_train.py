@@ -32,24 +32,26 @@ def test_sample_example_none_when_lag_too_large():
 
 def test_union_batches_respect_node_cap():
     shards = [_synthetic_shard(N=10, seed=i) for i in range(6)]
-    batches = list(tt.iter_union_batches(shards, random.Random(0),
-                                         lags_ps=[200.0], k=4,
-                                         max_union_nodes=25, n_batches=5))
-    assert len(batches) == 5
-    for b in batches:
+    pairs = list(tt.iter_union_batches(shards, random.Random(0),
+                                       lags_ps=[200.0], k=4,
+                                       max_union_nodes=25, n_batches=5))
+    assert len(pairs) == 5
+    for b, group in pairs:
         n = b["node_feats"].shape[0]
         # at most 2 proteins of 10 nodes fit under a 25 cap; 3 would be 30 > 25
         assert n <= 20
         # union keys present and consistent
         assert b["batch"].max().item() + 1 == b["tau"].shape[0]
+        assert len(group) >= 1
 
 
 def test_union_batch_emits_single_oversized_example():
     shards = [_synthetic_shard(N=40, seed=0)]
-    batches = list(tt.iter_union_batches(shards, random.Random(0),
-                                         lags_ps=[200.0], k=4,
-                                         max_union_nodes=25, n_batches=1))
-    assert batches[0]["node_feats"].shape[0] == 40  # emitted despite exceeding cap
+    pairs = list(tt.iter_union_batches(shards, random.Random(0),
+                                       lags_ps=[200.0], k=4,
+                                       max_union_nodes=25, n_batches=1))
+    b, _ = pairs[0]
+    assert b["node_feats"].shape[0] == 40  # emitted despite exceeding cap
 
 
 from lsmd.normalize import UpdateNorm
