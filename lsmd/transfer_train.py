@@ -58,13 +58,30 @@ def _current_max_temp(step, temp_schedule):
     return current
 
 
-def sample_example(shard, rng, lags_ps, k, allowed_temps=None):
+def _shard_temp_at_frame(shard, frame_idx):
+    """Return the simulation temperature (K) for a given frame index.
+
+    mdCATH shards carry traj_breaks and traj_temps; ATLAS shards have neither
+    and are assumed to be at physiological temperature (300 K).
+    """
+    traj_breaks = shard.get("traj_breaks")
+    traj_temps = shard.get("traj_temps")
+    if traj_breaks is None or traj_temps is None:
+        return 300.0
+    seg_idx = bisect.bisect_right(traj_breaks.tolist(), frame_idx)
+    seg_idx = min(seg_idx, len(traj_temps) - 1)
+    return float(traj_temps[seg_idx])
+
+
+def sample_example(shard, rng, lags_ps, k, allowed_temps=None, reverse_prob=0.0):
     """Sample one state-conditional training example from a shard, or None.
 
     Args:
-        allowed_temps: frozenset of integer temperatures (K) to include.
-                       Only applies to mdCATH shards that carry ``traj_temps``.
-                       None means all segments are eligible (ATLAS or no curriculum).
+        allowed_temps:  frozenset of integer temperatures (K) to include.
+                        Only applies to mdCATH shards that carry ``traj_temps``.
+                        None means all segments are eligible (ATLAS or no curriculum).
+        reverse_prob:   probability of swapping source/dest frames (time-reversal
+                        augmentation).  0.0 = disabled.
     """
     # Cache lag pairs per (lags_ps, allowed_temps) combination
     cache_key = "_pairs_" + "_".join(str(int(lag)) for lag in sorted(lags_ps))
@@ -81,12 +98,15 @@ def sample_example(shard, rng, lags_ps, k, allowed_temps=None):
         return None
     row = pairs[rng.randrange(pairs.shape[0])]
     start, _end, tau_frames = (int(row[0]), int(row[1]), int(row[2]))
-    return data.build_training_example(shard, start, tau_frames, k)
+    temp_K = _shard_temp_at_frame(shard, start)
+    reverse = reverse_prob > 0.0 and rng.random() < reverse_prob
+    return data.build_training_example(shard, start, tau_frames, k,
+                                       temp_K=temp_K, reverse=reverse)
 
 
 def iter_union_batches(shards, rng, lags_ps, k, max_union_nodes, n_batches,
                        cum_frames=None, total_frames=None,
-                       get_allowed_temps=None):
+                       get_allowed_temps=None, reverse_prob=0.0):
     """Yield n_batches (union_batch, example_group) pairs.
 
     union_batch is the union_collate dict; example_group is the raw list of
@@ -98,6 +118,7 @@ def iter_union_batches(shards, rng, lags_ps, k, max_union_nodes, n_batches,
         get_allowed_temps: optional zero-arg callable that returns the current
             frozenset of allowed mdCATH temperatures (K). Called once per
             union-batch so the curriculum can change mid-training.
+        reverse_prob: probability of time-reversal per example (0.0 = disabled).
     """
     use_weighted = cum_frames is not None and total_frames is not None
     miss_limit = _max_misses(shards)
@@ -110,7 +131,8 @@ def iter_union_batches(shards, rng, lags_ps, k, max_union_nodes, n_batches,
                 shard = _sample_shard(shards, cum_frames, total_frames, rng)
             else:
                 shard = shards[rng.randrange(len(shards))]
-            ex = sample_example(shard, rng, lags_ps, k, allowed_temps=allowed_temps)
+            ex = sample_example(shard, rng, lags_ps, k, allowed_temps=allowed_temps,
+                                reverse_prob=reverse_prob)
             if ex is None:
                 misses += 1
                 if misses > miss_limit:
@@ -175,7 +197,8 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
           max_union_nodes=2000, accum=4, steps=1000, T_diff=200,
           norm_samples=256, device="cpu", seed=0, lam=0.0, lam_warmup=500,
           log_every=100, grad_clip=1.0, norm_shards=None,
-          frame_weighted=True, compile_model=False, temp_schedule=None):
+          frame_weighted=True, compile_model=False, temp_schedule=None,
+          temp_emb_dim=8, reverse_prob=0.0):
     """Train the union-graph propagator across proteins; return a checkpoint.
 
     Args:
@@ -191,6 +214,13 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
                         sampler restricts mdCATH trajectories to temperatures
                         ≤ current max.  None (default) uses all temperatures.
                         Example: [(0,320),(2000,348),(5000,379),(10000,413),(15000,450)]
+        temp_emb_dim:   Size of the temperature embedding added to PropagatorNet.
+                        0 disables it (matches the original architecture).
+                        Default 8: conditions the model on simulation temperature
+                        so it learns correctly-scaled fluctuations at each T.
+        reverse_prob:   Probability of time-reversal per training example.
+                        0.5 doubles effective training data via microscopic
+                        reversibility; 0.0 (default) disables.
     """
     if lam > 0.0 and lam_warmup >= steps:
         peak = pl.lambda_schedule(max(0, steps - 1), lam_warmup, lam)
@@ -212,7 +242,8 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
                                   total_frames=total_frames)
     scale = update_norm.scale.to(device)
 
-    net = PropagatorNet(hidden=hidden, layers=layers).to(device)
+    net = PropagatorNet(hidden=hidden, layers=layers,
+                        temp_emb_dim=temp_emb_dim).to(device)
     if compile_model:
         try:
             net = torch.compile(net)
@@ -241,7 +272,8 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
     batches = iter_union_batches(shards, rng, lags_ps, k,
                                  max_union_nodes, n_batches=steps * accum,
                                  cum_frames=cum_frames, total_frames=total_frames,
-                                 get_allowed_temps=_get_allowed_temps)
+                                 get_allowed_temps=_get_allowed_temps,
+                                 reverse_prob=reverse_prob)
     opt.zero_grad()
     lam_t = 0.0
     loss_acc = 0.0       # accumulated (scaled) loss for logging
@@ -261,10 +293,11 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
         if i % accum == 0:  # recompute once per gradient step
             lam_t = pl.lambda_schedule(i // accum, lam_warmup, lam)
         with torch.autocast(device_type=device.type, enabled=use_amp):
+            temp_K = b_dev.get("temp_K")
             if lam_t == 0.0:
                 loss = ddpm_loss_union(net, b_dev["u_target"] / scale, node_feats,
                                        edge_index, edge_feats, tau, batch,
-                                       schedule) / accum
+                                       schedule, temp_K=temp_K) / accum
             else:
                 phys = {kk: vv.to(device)
                         for kk, vv in pl.collate_physics(group).items()}
@@ -339,5 +372,7 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
                     "node_dim": 24, "edge_dim": 13,
                     "lam": lam, "lam_warmup": lam_warmup,
                     "frame_weighted": frame_weighted,
-                    "temp_schedule": temp_schedule},
+                    "temp_schedule": temp_schedule,
+                    "temp_emb_dim": temp_emb_dim,
+                    "reverse_prob": reverse_prob},
     }

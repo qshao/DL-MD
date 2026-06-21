@@ -46,14 +46,22 @@ class UnionMessageLayer(nn.Module):
 
 
 class PropagatorNet(nn.Module):
-    """DDPM epsilon-predictor over a union graph."""
+    """DDPM epsilon-predictor over a union graph.
+
+    temp_emb_dim > 0 conditions the model on simulation temperature (K), which
+    is crucial when training across temperatures (mdCATH 320-450K): the model
+    must predict larger fluctuations at higher T.  Default 8 for new models;
+    set to 0 to reproduce the original architecture (for loading old checkpoints).
+    """
 
     def __init__(self, node_dim=24, edge_dim=13, hidden=128, layers=4,
-                 tau_emb_dim=16, point_dim=6):
+                 tau_emb_dim=16, point_dim=6, temp_emb_dim=8):
         super().__init__()
         self.tau_emb_dim = tau_emb_dim
+        self.temp_emb_dim = temp_emb_dim
         self.point_dim = point_dim
-        self.embed = nn.Linear(node_dim + point_dim + 1 + tau_emb_dim, hidden)
+        in_dim = node_dim + point_dim + 1 + tau_emb_dim + temp_emb_dim
+        self.embed = nn.Linear(in_dim, hidden)
         self.layers = nn.ModuleList(
             [UnionMessageLayer(hidden, edge_dim) for _ in range(layers)]
         )
@@ -62,7 +70,8 @@ class PropagatorNet(nn.Module):
             nn.Linear(hidden, point_dim),
         )
 
-    def forward(self, u, s, node_feats, edge_index, edge_feats, tau, batch):
+    def forward(self, u, s, node_feats, edge_index, edge_feats, tau, batch,
+                temp_K=None):
         """Predict per-node epsilon.
 
         Args:
@@ -73,6 +82,8 @@ class PropagatorNet(nn.Module):
             edge_feats: [ΣE, edge_dim]
             tau:        [G] physical lag (ps) per graph.
             batch:      [ΣN] long, node→graph.
+            temp_K:     [G] simulation temperature in Kelvin (optional; ignored
+                        when temp_emb_dim == 0).
 
         Returns:
             [ΣN, point_dim]
@@ -83,14 +94,22 @@ class PropagatorNet(nn.Module):
         tau_emb = tau_embedding(tau, dim=self.tau_emb_dim,
                                 device=u.device, dtype=u.dtype)  # [G, tau_dim]
         tau_nodes = tau_emb[batch]                             # [ΣN, tau_dim]
-        h = self.embed(torch.cat([node_feats, u, s_nodes, tau_nodes], dim=-1))
+        parts = [node_feats, u, s_nodes, tau_nodes]
+        if self.temp_emb_dim > 0:
+            if temp_K is None:
+                temp_K = torch.full((tau.shape[0],), 300.0,
+                                    device=u.device, dtype=u.dtype)
+            temp_emb = tau_embedding(temp_K / 300.0, dim=self.temp_emb_dim,
+                                     device=u.device, dtype=u.dtype)
+            parts.append(temp_emb[batch])
+        h = self.embed(torch.cat(parts, dim=-1))
         for layer in self.layers:
             h = layer(h, edge_index, edge_feats)
         return self.head(h)
 
 
 def ddpm_loss_union(net, u_target, node_feats, edge_index, edge_feats, tau,
-                    batch, schedule, graph_weights=None):
+                    batch, schedule, graph_weights=None, temp_K=None):
     """DDPM epsilon-prediction loss over a union batch.
 
     Each graph gets its own noise level; per-graph node-mean losses are then
@@ -109,7 +128,8 @@ def ddpm_loss_union(net, u_target, node_feats, edge_index, edge_feats, tau,
     noisy = sqrt_ab * u_target + sqrt_1mab * eps
 
     s = (t_idx.float() / T).to(u_target.dtype)                         # [G]
-    pred = net(noisy, s, node_feats, edge_index, edge_feats, tau, batch)
+    pred = net(noisy, s, node_feats, edge_index, edge_feats, tau, batch,
+               temp_K=temp_K)
 
     node_se = ((pred - eps) ** 2).mean(dim=-1)                         # [ΣN]
     per_graph = _scatter_mean(node_se, batch, G)                       # [G]
@@ -121,8 +141,12 @@ def ddpm_loss_union(net, u_target, node_feats, edge_index, edge_feats, tau,
 
 @torch.no_grad()
 def sample_ddpm_union(net, node_feats, edge_index, edge_feats, tau, batch,
-                      schedule, steps=50, eta=1.0, sigma_init=1.0):
-    """Reverse-diffusion sampler over a union graph (one update per node)."""
+                      schedule, steps=50, eta=1.0, sigma_init=1.0, temp_K=None):
+    """Reverse-diffusion sampler over a union graph (one update per node).
+
+    eta=1.0 → stochastic DDPM; eta=0.0 → deterministic DDIM.  Use eta=0 with
+    steps=10-20 for fast rollout (10-20x speedup with little quality loss).
+    """
     T = schedule.T
     N = node_feats.shape[0]
     device, dtype = node_feats.device, node_feats.dtype
@@ -133,7 +157,8 @@ def sample_ddpm_union(net, node_feats, edge_index, edge_feats, tau, batch,
         t = t_full[i].item()
         t_prev = t_full[i + 1].item()
         s = torch.full((tau.shape[0],), t / T, dtype=dtype, device=device)   # [G]
-        eps_pred = net(u, s, node_feats, edge_index, edge_feats, tau, batch)
+        eps_pred = net(u, s, node_feats, edge_index, edge_feats, tau, batch,
+                       temp_K=temp_K)
 
         sqrt_ab_t = schedule.sqrt_alphas_bar[t].to(dtype)
         sqrt_1mab_t = schedule.sqrt_one_minus_alphas_bar[t].to(dtype)
@@ -158,20 +183,30 @@ class StructuralEncoder(nn.Module):
     """
 
     def __init__(self, node_dim=24, edge_dim=13, hidden=128, layers=4,
-                 tau_emb_dim=16):
+                 tau_emb_dim=16, temp_emb_dim=8):
         super().__init__()
         self.tau_emb_dim = tau_emb_dim
-        self.embed = nn.Linear(node_dim + tau_emb_dim, hidden)
+        self.temp_emb_dim = temp_emb_dim
+        self.embed = nn.Linear(node_dim + tau_emb_dim + temp_emb_dim, hidden)
         self.layers = nn.ModuleList(
             [UnionMessageLayer(hidden, edge_dim) for _ in range(layers)]
         )
 
-    def forward(self, node_feats, edge_index, edge_feats, tau, batch):
+    def forward(self, node_feats, edge_index, edge_feats, tau, batch,
+                temp_K=None):
         batch = batch.to(node_feats.device)
         tau_emb = tau_embedding(tau, dim=self.tau_emb_dim,
                                 device=node_feats.device, dtype=node_feats.dtype)
         tau_nodes = tau_emb[batch]
-        h = self.embed(torch.cat([node_feats, tau_nodes], dim=-1))
+        parts = [node_feats, tau_nodes]
+        if self.temp_emb_dim > 0:
+            if temp_K is None:
+                temp_K = torch.full((tau.shape[0],), 300.0,
+                                    device=node_feats.device, dtype=node_feats.dtype)
+            temp_emb = tau_embedding(temp_K / 300.0, dim=self.temp_emb_dim,
+                                     device=node_feats.device, dtype=node_feats.dtype)
+            parts.append(temp_emb[batch])
+        h = self.embed(torch.cat(parts, dim=-1))
         for layer in self.layers:
             h = layer(h, edge_index, edge_feats)
         return h
@@ -216,27 +251,31 @@ class CachedPropagator(nn.Module):
     """
 
     def __init__(self, node_dim=24, edge_dim=13, hidden=128, layers=4,
-                 tau_emb_dim=16, point_dim=6, n_denoise_layers=1):
+                 tau_emb_dim=16, point_dim=6, n_denoise_layers=1, temp_emb_dim=8):
         super().__init__()
         self.point_dim = point_dim
         self.encoder = StructuralEncoder(node_dim, edge_dim, hidden, layers,
-                                        tau_emb_dim)
+                                        tau_emb_dim, temp_emb_dim)
         self.denoiser = Denoiser(hidden, edge_dim, point_dim, n_denoise_layers)
 
-    def encode(self, node_feats, edge_index, edge_feats, tau, batch):
-        return self.encoder(node_feats, edge_index, edge_feats, tau, batch)
+    def encode(self, node_feats, edge_index, edge_feats, tau, batch, temp_K=None):
+        return self.encoder(node_feats, edge_index, edge_feats, tau, batch,
+                            temp_K=temp_K)
 
     def denoise(self, u, s, context, edge_index, edge_feats, batch):
         return self.denoiser(u, s, context, edge_index, edge_feats, batch)
 
-    def forward(self, u, s, node_feats, edge_index, edge_feats, tau, batch):
-        context = self.encode(node_feats, edge_index, edge_feats, tau, batch)
+    def forward(self, u, s, node_feats, edge_index, edge_feats, tau, batch,
+                temp_K=None):
+        context = self.encode(node_feats, edge_index, edge_feats, tau, batch,
+                              temp_K=temp_K)
         return self.denoise(u, s, context, edge_index, edge_feats, batch)
 
 
 @torch.no_grad()
 def sample_ddpm_union_cached(net, node_feats, edge_index, edge_feats, tau, batch,
-                             schedule, steps=50, eta=1.0, sigma_init=1.0):
+                             schedule, steps=50, eta=1.0, sigma_init=1.0,
+                             temp_K=None):
     """Reverse-diffusion sampler that encodes the static graph once.
 
     `net` must expose `encode`/`denoise` (a CachedPropagator). Identical reverse
@@ -247,7 +286,8 @@ def sample_ddpm_union_cached(net, node_feats, edge_index, edge_feats, tau, batch
     T = schedule.T
     N = node_feats.shape[0]
     device, dtype = node_feats.device, node_feats.dtype
-    context = net.encode(node_feats, edge_index, edge_feats, tau, batch)
+    context = net.encode(node_feats, edge_index, edge_feats, tau, batch,
+                         temp_K=temp_K)
     u = torch.randn(N, net.point_dim, device=device, dtype=dtype) * sigma_init
 
     t_full = torch.round(torch.linspace(T - 1, 0, steps + 1, device=device)).long().clamp(0, T - 1)

@@ -362,30 +362,38 @@ def physical_lag_pairs(num_frames, dt, lags_ps, traj_breaks=None,
     return torch.cat(parts, dim=0)
 
 
-def build_training_example(frames, i, tau_frames, k):
+def build_training_example(frames, i, tau_frames, k, temp_K=300.0, reverse=False):
     """State-conditional training example from frame i to frame i+tau_frames.
 
-    The graph is built from the CURRENT frame i; the target is the per-residue
-    SE(3) update from frame i to frame i+tau_frames.
+    The graph is built from the source frame; the target is the per-residue
+    SE(3) update from source to destination frame.
 
     Args:
-        frames: dict with R [F,N,3,3], t [F,N,3], res_type [N], chain_id [N],
-                res_index [N], dt (ps/frame).
-        i:          source frame index.
-        tau_frames: lag in frames.
+        frames:     dict with R [F,N,3,3], t [F,N,3], res_type [N], chain_id [N],
+                    res_index [N], dt (ps/frame).
+        i:          start frame index.
+        tau_frames: lag in frames (positive).
         k:          kNN neighbours.
+        temp_K:     simulation temperature in Kelvin (default 300 K).
+        reverse:    if True, swap source/dest so the model learns the backward
+                    transition (time-reversal augmentation).
 
     Returns:
         dict with node_feats [N,24], edge_index [2,E], edge_feats [E,13],
-        u_target [N,6], tau (float, ps) — consumable by union_collate.
+        u_target [N,6], tau (float, ps), temp_K (float) — consumable by
+        union_collate.  Returns None for degenerate frames.
     """
     j = i + tau_frames
-    R_i, t_i = _frame_R(frames, i), _frame_t(frames, i)
-    R_j, t_j = _frame_R(frames, j), _frame_t(frames, j)
-    edge_index, edge_feats = _feat.frame_graph(R_i, t_i, k)
+    if reverse:
+        R_src, t_src = _frame_R(frames, j), _frame_t(frames, j)
+        R_tgt, t_tgt = _frame_R(frames, i), _frame_t(frames, i)
+    else:
+        R_src, t_src = _frame_R(frames, i), _frame_t(frames, i)
+        R_tgt, t_tgt = _frame_R(frames, j), _frame_t(frames, j)
+    edge_index, edge_feats = _feat.frame_graph(R_src, t_src, k)
     node_feats = _feat.frame_node_features(
         frames["res_type"], frames["chain_id"], frames["res_index"])
-    u_target = _feat.relative_update(R_i, t_i, R_j, t_j)
+    u_target = _feat.relative_update(R_src, t_src, R_tgt, t_tgt)
     if not u_target.isfinite().all():
         return None  # degenerate backbone frame; caller should resample
     return {
@@ -394,7 +402,8 @@ def build_training_example(frames, i, tau_frames, k):
         "edge_feats": edge_feats,
         "u_target": u_target,
         "tau": float(tau_frames) * float(frames["dt"]),
-        "R_cur": R_i,
-        "t_cur": t_i,
+        "temp_K": float(temp_K),
+        "R_cur": R_src,
+        "t_cur": t_src,
         "chain_id": frames["chain_id"],
     }

@@ -52,6 +52,15 @@ def main():
                     help="Sample shards uniformly (default: proportional to frame count)")
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile the model for ~20%% GPU speedup (requires PyTorch 2.0+)")
+    ap.add_argument("--temp_emb_dim", type=int, default=8,
+                    help="Temperature embedding size for PropagatorNet (0 to disable). "
+                         "When > 0, the model is conditioned on simulation temperature "
+                         "so it predicts correctly-scaled fluctuations at each T. "
+                         "Default 8. Old checkpoints without temp conditioning used 0.")
+    ap.add_argument("--time_reversal", action="store_true",
+                    help="Enable time-reversal augmentation (reverse_prob=0.5). "
+                         "Doubles effective training data via microscopic reversibility: "
+                         "the model also learns backward transitions x_{t+τ}→x_t.")
     ap.add_argument("--temp_schedule", nargs="*", default=None, metavar="STEP:TEMP",
                     help="Temperature curriculum for mdCATH trajectories. "
                          "Space-separated 'step:temp_K' pairs, e.g.: "
@@ -126,7 +135,9 @@ def main():
                     norm_shards=norm_shards,
                     frame_weighted=not args.no_frame_weighted,
                     compile_model=args.compile,
-                    temp_schedule=temp_schedule)
+                    temp_schedule=temp_schedule,
+                    temp_emb_dim=args.temp_emb_dim,
+                    reverse_prob=0.5 if args.time_reversal else 0.0)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     torch.save(ckpt, args.out)

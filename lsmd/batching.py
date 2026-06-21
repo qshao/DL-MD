@@ -14,13 +14,15 @@ def union_collate(graphs):
     Args:
         graphs: list of dicts with keys node_feats [N,F], edge_index [2,E],
                 edge_feats [E,De], u_target [N,P], tau (float).
+                Optional: temp_K (float) — simulation temperature per graph.
 
     Returns:
         dict with node_feats [ΣN,F], edge_index [2,ΣE], edge_feats [ΣE,De],
         u_target [ΣN,P], batch [ΣN] long, tau [G] float.
+        Optional: temp_K [G] float when present in any graph.
     """
     node_feats, edge_feats, u_target = [], [], []
-    edge_index, batch, taus = [], [], []
+    edge_index, batch, taus, temps = [], [], [], []
     offset = 0
     for i, gr in enumerate(graphs):
         n = gr["node_feats"].shape[0]
@@ -30,8 +32,10 @@ def union_collate(graphs):
         edge_index.append(gr["edge_index"] + offset)
         batch.append(torch.full((n,), i, dtype=torch.long))
         taus.append(float(gr["tau"]))
+        if "temp_K" in gr:
+            temps.append(float(gr["temp_K"]))
         offset += n
-    return {
+    out = {
         "node_feats": torch.cat(node_feats, dim=0),
         "edge_index": torch.cat(edge_index, dim=1),
         "edge_feats": torch.cat(edge_feats, dim=0),
@@ -39,3 +43,6 @@ def union_collate(graphs):
         "batch": torch.cat(batch, dim=0),
         "tau": torch.tensor(taus, dtype=torch.float32),
     }
+    if temps:
+        out["temp_K"] = torch.tensor(temps, dtype=torch.float32)
+    return out

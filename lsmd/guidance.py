@@ -29,10 +29,11 @@ def guidance_step(u0_hat, R_cur, t_cur, global_chain, scale, gamma, *,
 def sample_ddpm_union_guided(net, node_feats, edge_index, edge_feats, tau, batch,
                              schedule, R_cur, t_cur, global_chain, scale, *,
                              steps=50, eta=1.0, sigma_init=1.0, gamma=0.0,
-                             rama_pot=None):
+                             rama_pot=None, temp_K=None):
     """Plan-1 reverse sampler with per-step energy guidance on x0_hat.
 
     gamma=0 reproduces sample_ddpm_union exactly under identical RNG.
+    eta=0 → deterministic DDIM (combine with small steps for fast rollout).
     """
     T = schedule.T
     N = node_feats.shape[0]
@@ -44,7 +45,8 @@ def sample_ddpm_union_guided(net, node_feats, edge_index, edge_feats, tau, batch
         t = t_full[i].item()
         t_prev = t_full[i + 1].item()
         s = torch.full((tau.shape[0],), t / T, dtype=dtype, device=device)
-        eps_pred = net(u, s, node_feats, edge_index, edge_feats, tau, batch)
+        eps_pred = net(u, s, node_feats, edge_index, edge_feats, tau, batch,
+                       temp_K=temp_K)
 
         sqrt_ab_t = schedule.sqrt_alphas_bar[t].to(dtype)
         sqrt_1mab_t = schedule.sqrt_one_minus_alphas_bar[t].to(dtype)

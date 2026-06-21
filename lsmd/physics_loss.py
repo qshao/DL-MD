@@ -152,7 +152,9 @@ def ddpm_physics_loss(net, union, physics, scale, schedule, *, rama_pot=None,
     noisy = sqrt_ab * u_target + sqrt_1mab * eps
 
     s = (t_idx.float() / T).to(u_target.dtype)
-    pred = net(noisy, s, node_feats, edge_index, edge_feats, tau, batch)
+    temp_K = union.get("temp_K")
+    pred = net(noisy, s, node_feats, edge_index, edge_feats, tau, batch,
+               temp_K=temp_K)
 
     node_se = ((pred - eps) ** 2).mean(dim=-1)
     score_loss = _scatter_mean(node_se, batch, G).mean()

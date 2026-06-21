@@ -143,3 +143,86 @@ def test_train_with_temp_schedule():
     assert ckpt["hparams"]["temp_schedule"] == schedule
     for v in ckpt["model_state"].values():
         assert torch.isfinite(v).all()
+
+
+def test_sample_example_carries_temp_K():
+    """build_training_example must return temp_K from shard metadata."""
+    shard = _mdcath_shard(F=30, N=10, temps=(320, 450))
+    # First segment is 320K; second is 450K
+    for seed in range(20):
+        ex = tt.sample_example(shard, random.Random(seed), lags_ps=[1000.0], k=4)
+        if ex is not None:
+            assert "temp_K" in ex
+            assert ex["temp_K"] in (320.0, 450.0)
+            break
+
+
+def test_train_with_temp_conditioning():
+    """temp_emb_dim > 0: model trains, hparams recorded, no NaNs."""
+    shards = [_mdcath_shard(F=30, N=10, temps=(320, 450), seed=i) for i in range(3)]
+    ckpt = tt.train(shards, lags_ps=[1000.0], k=4, hidden=16, layers=2,
+                    max_union_nodes=25, accum=2, steps=4, T_diff=20,
+                    norm_samples=16, device="cpu", seed=0, temp_emb_dim=4)
+    assert ckpt["hparams"]["temp_emb_dim"] == 4
+    for v in ckpt["model_state"].values():
+        assert torch.isfinite(v).all()
+
+
+def test_train_with_time_reversal():
+    """reverse_prob=0.5: trains without errors, hparams recorded."""
+    shards = [_synthetic_shard(N=10, seed=i) for i in range(4)]
+    ckpt = tt.train(shards, lags_ps=[200.0], k=4, hidden=16, layers=2,
+                    max_union_nodes=25, accum=2, steps=4, T_diff=20,
+                    norm_samples=16, device="cpu", seed=0, reverse_prob=0.5)
+    assert ckpt["hparams"]["reverse_prob"] == 0.5
+    for v in ckpt["model_state"].values():
+        assert torch.isfinite(v).all()
+
+
+def test_atlas_shard_defaults_to_300K():
+    """ATLAS shards (no traj_temps) get temp_K=300.0."""
+    shard = _synthetic_shard(N=10)  # ATLAS-like: no traj_temps
+    ex = tt.sample_example(shard, random.Random(0), lags_ps=[200.0], k=4)
+    assert ex is not None
+    assert ex["temp_K"] == 300.0
+
+
+def test_union_collate_carries_temp_K():
+    """union_collate should aggregate temp_K from examples into a [G] tensor."""
+    from lsmd import batching, data as d
+    shard = _mdcath_shard(F=30, N=10, temps=(320, 450))
+    exs = []
+    rng = random.Random(42)
+    while len(exs) < 3:
+        ex = tt.sample_example(shard, rng, lags_ps=[1000.0], k=4)
+        if ex is not None:
+            exs.append(ex)
+    b = batching.union_collate(exs)
+    assert "temp_K" in b
+    assert b["temp_K"].shape == (len(exs),)
+    assert b["temp_K"].dtype == torch.float32
+
+
+def test_reverse_example_inverts_update():
+    """Time-reversed example should have approximately negated u_target."""
+    shard = _synthetic_shard(F=20, N=10)
+    rng = random.Random(7)
+    # Get a forward example
+    ex_fwd = None
+    for seed in range(100):
+        ex_fwd = tt.sample_example(shard, random.Random(seed), lags_ps=[200.0], k=4,
+                                   reverse_prob=0.0)
+        if ex_fwd is not None:
+            break
+    # Get the same pair reversed (rebuild without cache to force reverse)
+    from lsmd import data as d
+    pairs = d.physical_lag_pairs(shard["t"].shape[0], shard["dt"], [200.0])
+    assert pairs.shape[0] > 0
+    row = pairs[0]
+    start, tau_frames = int(row[0]), int(row[2])
+    ex_rev = d.build_training_example(shard, start, tau_frames, 4, reverse=True)
+    ex_fwd2 = d.build_training_example(shard, start, tau_frames, 4, reverse=False)
+    assert ex_fwd2 is not None and ex_rev is not None
+    # Forward and reverse updates should have roughly opposite sign
+    dot = (ex_fwd2["u_target"] * ex_rev["u_target"]).sum()
+    assert dot < 0, "reverse example should mostly negate the forward update"

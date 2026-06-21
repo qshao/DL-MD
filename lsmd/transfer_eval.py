@@ -15,11 +15,12 @@ from lsmd.model import NoiseSchedule
 
 
 def load_checkpoint(ckpt, device):
-    """Rebuild (net, schedule, update_norm) from a Task-4 checkpoint dict."""
+    """Rebuild (net, schedule, update_norm) from a checkpoint dict."""
     hp = ckpt["hparams"]
     net = PropagatorNet(node_dim=hp["node_dim"], edge_dim=hp["edge_dim"],
                         hidden=hp["hidden"], layers=hp["layers"],
-                        point_dim=hp["point_dim"]).to(device)
+                        point_dim=hp["point_dim"],
+                        temp_emb_dim=hp.get("temp_emb_dim", 0)).to(device)
     net.load_state_dict(ckpt["model_state"])
     net.eval()
     schedule = NoiseSchedule(T=ckpt["T_diff"]).to(device)
@@ -29,7 +30,8 @@ def load_checkpoint(ckpt, device):
 
 @torch.no_grad()
 def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
-            *, steps, tau_ps, k, diff_steps=50, device="cpu"):
+            *, steps, tau_ps, k, diff_steps=50, eta=1.0, temp_K=300.0,
+            device="cpu"):
     """Autoregressive CA trajectory from a reference structure.
 
     The graph is rebuilt from current (R, t) each step (state-conditional).
@@ -49,7 +51,12 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
         steps:       Number of autoregressive steps.
         tau_ps:      Physical lag in picoseconds.
         k:           Number of kNN neighbors for graph building.
-        diff_steps:  Number of DDPM reverse steps (default 50).
+        diff_steps:  Number of denoising reverse steps (default 50).
+                     Use 10-20 with eta=0.0 for 5-10x speedup (DDIM mode).
+        eta:         Stochasticity in reverse process (1.0 = full DDPM,
+                     0.0 = deterministic DDIM).
+        temp_K:      Simulation temperature in Kelvin (default 300 K).
+                     Passed to the model when it was trained with temp_emb_dim > 0.
         device:      Target device (default "cpu").
 
     Returns:
@@ -69,17 +76,19 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
     # De-normalization scale for sampled updates
     scale = update_norm.scale.to(device)
 
-    # Single-graph batch vector and tau tensor
+    # Single-graph batch vector, tau, and temperature tensors
     batch = torch.zeros(N, dtype=torch.long, device=device)
     tau = torch.tensor([float(tau_ps)], device=device)
+    t_K = torch.tensor([float(temp_K)], device=device)
 
     traj = [t.clone()]
     for _ in range(steps):
         # Rebuild graph from current frames
         edge_index, edge_feats = feat.frame_graph(R, t, k)
-        # Sample normalized update via reverse DDPM
+        # Sample normalized update via reverse DDPM/DDIM
         u = sample_ddpm_union(net, node_feats, edge_index, edge_feats,
-                              tau, batch, schedule, steps=diff_steps)
+                              tau, batch, schedule, steps=diff_steps,
+                              eta=eta, temp_K=t_K)
         # De-normalize update
         u = u * scale
         # Advance frames
