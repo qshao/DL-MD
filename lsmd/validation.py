@@ -546,7 +546,7 @@ def check_4bead_conformation(beads, gly_mask=None, rama_potential=None):
     # Ramachandran check (only when potential is provided)
     if rama_potential is not None:
         n_rama_out, rama_frac = rama_potential.check(beads)
-        rama_ok = rama_frac < 0.02        # <2% outliers → OK
+        rama_ok = rama_frac < 0.05        # <5% outliers → OK (mean of real MD ≈ 2%, max ≈ 5.4%)
     else:
         n_rama_out, rama_frac, rama_ok = 0, 0.0, True
 
