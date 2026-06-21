@@ -57,7 +57,8 @@ def load_frames(traj_path, top_path):
     res_index = torch.arange(len(keep), dtype=torch.long)
 
     return {"R": R, "t": t, "res_type": res_type, "chain_id": chain_id,
-            "res_index": res_index, "n_types": len(uniq), "mode": "ca"}
+            "res_index": res_index, "n_types": len(uniq), "mode": "ca",
+            "res_names": res_names}
 
 
 def load_frames_2bead(traj_path, top_path):
