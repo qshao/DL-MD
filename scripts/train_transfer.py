@@ -69,6 +69,10 @@ def main():
                          "temperature increases to temp_K. "
                          "ATLAS shards are unaffected (always included). "
                          "Default: no curriculum (all temperatures from step 0).")
+    ap.add_argument("--resume", default=None,
+                    help="Path to a checkpoint .pt file to resume from. "
+                         "Model weights and optimizer state are loaded; "
+                         "--steps then means additional steps beyond the checkpoint.")
     ap.add_argument("--out", default="checkpoints/transfer.pt")
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
@@ -125,6 +129,13 @@ def main():
             temp_schedule.append((int(step_str), int(temp_str)))
         temp_schedule.sort()
 
+    resume_ckpt = None
+    if args.resume:
+        resume_ckpt = torch.load(args.resume, map_location="cpu", weights_only=False)
+        resumed_step = resume_ckpt.get("step",
+                       resume_ckpt.get("hparams", {}).get("steps", "?"))
+        print(f"  Resuming from {args.resume} (step {resumed_step})", flush=True)
+
     ckpt = tt.train(shards, lags_ps=args.lags_ps, k=args.k, hidden=args.hidden,
                     layers=args.layers, lr=args.lr,
                     max_union_nodes=args.max_union_nodes, accum=args.accum,
@@ -137,7 +148,8 @@ def main():
                     compile_model=args.compile,
                     temp_schedule=temp_schedule,
                     temp_emb_dim=args.temp_emb_dim,
-                    reverse_prob=0.5 if args.time_reversal else 0.0)
+                    reverse_prob=0.5 if args.time_reversal else 0.0,
+                    resume_from=resume_ckpt)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     torch.save(ckpt, args.out)

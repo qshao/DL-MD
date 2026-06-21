@@ -73,7 +73,25 @@ def test_train_one_step_returns_checkpoint_without_nans():
                     norm_samples=16, device="cpu", seed=0)
     assert "model_state" in ckpt and "update_norm" in ckpt
     assert ckpt["n_aa_types"] == 21
+    assert ckpt["step"] == 2
+    assert "optimizer_state" in ckpt
     for v in ckpt["model_state"].values():
+        assert torch.isfinite(v).all()
+
+
+def test_resume_from_checkpoint():
+    """Resuming continues from the saved step with correct step counter and no NaNs."""
+    shards = [_synthetic_shard(N=10, seed=i) for i in range(4)]
+    ckpt1 = tt.train(shards, lags_ps=[200.0], k=4, hidden=16, layers=2,
+                     max_union_nodes=25, accum=2, steps=3, T_diff=20,
+                     norm_samples=16, device="cpu", seed=0)
+    assert ckpt1["step"] == 3
+
+    ckpt2 = tt.train(shards, lags_ps=[200.0], k=4, hidden=16, layers=2,
+                     max_union_nodes=25, accum=2, steps=4, T_diff=20,
+                     norm_samples=16, device="cpu", seed=1, resume_from=ckpt1)
+    assert ckpt2["step"] == 7  # 3 + 4
+    for v in ckpt2["model_state"].values():
         assert torch.isfinite(v).all()
 
 

@@ -198,7 +198,7 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
           norm_samples=256, device="cpu", seed=0, lam=0.0, lam_warmup=500,
           log_every=100, grad_clip=1.0, norm_shards=None,
           frame_weighted=True, compile_model=False, temp_schedule=None,
-          temp_emb_dim=8, reverse_prob=0.0):
+          temp_emb_dim=8, reverse_prob=0.0, resume_from=None):
     """Train the union-graph propagator across proteins; return a checkpoint.
 
     Args:
@@ -221,6 +221,10 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
         reverse_prob:   Probability of time-reversal per training example.
                         0.5 doubles effective training data via microscopic
                         reversibility; 0.0 (default) disables.
+        resume_from:    Checkpoint dict (from torch.load). If provided, model
+                        weights and optimizer state are loaded and training
+                        continues from checkpoint['step']. The 'steps' arg then
+                        means additional steps beyond the checkpoint, not total.
     """
     if lam > 0.0 and lam_warmup >= steps:
         peak = pl.lambda_schedule(max(0, steps - 1), lam_warmup, lam)
@@ -252,6 +256,17 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
             warnings.warn(f"torch.compile failed ({exc}); using eager mode")
     schedule = NoiseSchedule(T=T_diff).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
+
+    # Resume from checkpoint: load weights and optimizer state, offset step counter
+    init_step = 0
+    if resume_from is not None:
+        net.load_state_dict(resume_from["model_state"], strict=False)
+        if "optimizer_state" in resume_from:
+            opt.load_state_dict(resume_from["optimizer_state"])
+        init_step = resume_from.get("step", resume_from.get("hparams", {}).get("steps", 0))
+        print(f"  Resumed from checkpoint at step {init_step}; "
+              f"training {steps} more steps (target: {init_step + steps})", flush=True)
+
     use_amp = device.type == "cuda"
     try:
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -261,10 +276,14 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
     # --- Temperature curriculum ---
     _allowed_state = [None]  # mutable cell updated in the training loop
     if temp_schedule:
-        initial_max = _current_max_temp(0, temp_schedule)
+        initial_max = _current_max_temp(init_step, temp_schedule)
         _allowed_state[0] = _allowed_temps_set(initial_max)
-        print(f"  Temperature curriculum starts at {initial_max}K "
-              f"(schedule: {temp_schedule})", flush=True)
+        if init_step == 0:
+            print(f"  Temperature curriculum starts at {initial_max}K "
+                  f"(schedule: {temp_schedule})", flush=True)
+        else:
+            print(f"  Temperature curriculum resumed at step {init_step}: "
+                  f"max_temp={initial_max}K", flush=True)
 
     def _get_allowed_temps():
         return _allowed_state[0]
@@ -330,7 +349,8 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
             scaler.update()
             opt.zero_grad()
 
-            step = (i + 1) // accum
+            local_step = (i + 1) // accum
+            step = init_step + local_step
 
             # Advance curriculum temperature if schedule dictates
             if temp_schedule:
@@ -341,16 +361,17 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
                     print(f"  [step {step}] curriculum: max_temp={new_max}K "
                           f"(allowed: {sorted(_allowed_state[0])}K)", flush=True)
 
-            if step % log_every == 0:
+            if local_step % log_every == 0:
                 now = time.perf_counter()
                 dt = now - t_log
                 steps_per_sec = log_every / dt
                 nodes_per_sec = nodes_acc / dt
                 avg_loss = loss_acc / (log_every * accum)
                 elapsed = now - t0
-                eta = (steps - step) / steps_per_sec if steps_per_sec > 0 else 0
+                eta = (steps - local_step) / steps_per_sec if steps_per_sec > 0 else 0
+                total_steps = init_step + steps
                 print(
-                    f"step {step:6d}/{steps}"
+                    f"step {step:6d}/{total_steps}"
                     f"  loss={avg_loss:.4f}"
                     f"  {steps_per_sec:.2f} step/s"
                     f"  {nodes_per_sec:.0f} nodes/s"
@@ -362,8 +383,12 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
                 nodes_acc = 0
                 t_log = now
 
+    # Unwrap compiled model for serialization
+    raw_net = net._orig_mod if hasattr(net, "_orig_mod") else net
     return {
-        "model_state": {kk: vv.cpu() for kk, vv in net.state_dict().items()},
+        "model_state": {kk: vv.cpu() for kk, vv in raw_net.state_dict().items()},
+        "optimizer_state": opt.state_dict(),
+        "step": init_step + steps,
         "T_diff": T_diff,
         "update_norm": update_norm.state_dict(),
         "n_aa_types": 21,
