@@ -6,8 +6,12 @@ gen_*/
 genmd_*/
 ca_run_*/
 infer_test/
-checkpoints/
-data/
+checkpoints/*
+!checkpoints/wt_2bead_200ep.pt
+!checkpoints/wt_4bead_200ep.pt
+data/*
+!data/wt_2bead.pt
+!data/wt_4bead.pt
 record
 
 # Python build artifacts
