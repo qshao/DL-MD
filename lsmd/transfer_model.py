@@ -147,3 +147,125 @@ def sample_ddpm_union(net, node_feats, edge_index, edge_feats, tau, batch,
         z = torch.randn_like(u) if t_prev > 0 else torch.zeros_like(u)
         u = ab_prev.sqrt() * u0_hat + dir_coeff * eps_pred + sigma_t * z
     return u
+
+
+class StructuralEncoder(nn.Module):
+    """Per-node context from the static graph + lag tau. Run once per step.
+
+    Carries the expensive L message-passing layers. Independent of the noisy
+    update u and the diffusion flow-time s, so its output can be cached across
+    all reverse-diffusion steps of one propagation step.
+    """
+
+    def __init__(self, node_dim=24, edge_dim=13, hidden=128, layers=4,
+                 tau_emb_dim=16):
+        super().__init__()
+        self.tau_emb_dim = tau_emb_dim
+        self.embed = nn.Linear(node_dim + tau_emb_dim, hidden)
+        self.layers = nn.ModuleList(
+            [UnionMessageLayer(hidden, edge_dim) for _ in range(layers)]
+        )
+
+    def forward(self, node_feats, edge_index, edge_feats, tau, batch):
+        batch = batch.to(node_feats.device)
+        tau_emb = tau_embedding(tau, dim=self.tau_emb_dim,
+                                device=node_feats.device, dtype=node_feats.dtype)
+        tau_nodes = tau_emb[batch]
+        h = self.embed(torch.cat([node_feats, tau_nodes], dim=-1))
+        for layer in self.layers:
+            h = layer(h, edge_index, edge_feats)
+        return h
+
+
+class Denoiser(nn.Module):
+    """Lightweight per-step epsilon predictor over cached context.
+
+    Injects the noisy update u and diffusion flow-time s into the cached
+    structural context, runs n_denoise_layers message layers (default 1; 0 = a
+    pure per-node MLP), and predicts epsilon.
+    """
+
+    def __init__(self, hidden=128, edge_dim=13, point_dim=6, n_denoise_layers=1):
+        super().__init__()
+        self.point_dim = point_dim
+        self.inject = nn.Linear(hidden + point_dim + 1, hidden)
+        self.layers = nn.ModuleList(
+            [UnionMessageLayer(hidden, edge_dim) for _ in range(n_denoise_layers)]
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, point_dim),
+        )
+
+    def forward(self, u, s, context, edge_index, edge_feats, batch):
+        batch = batch.to(context.device)
+        s = torch.as_tensor(s, dtype=u.dtype, device=u.device)
+        s_nodes = s[batch].unsqueeze(-1)
+        h = self.inject(torch.cat([context, u, s_nodes], dim=-1))
+        for layer in self.layers:
+            h = layer(h, edge_index, edge_feats)
+        return self.head(h)
+
+
+class CachedPropagator(nn.Module):
+    """Encoder + denoiser propagator with a cacheable structural pass.
+
+    `forward` has the same signature as PropagatorNet.forward (drop-in for
+    ddpm_loss_union). `encode`/`denoise` expose the split so a sampler can run
+    the expensive encoder once and the cheap denoiser per reverse step.
+    """
+
+    def __init__(self, node_dim=24, edge_dim=13, hidden=128, layers=4,
+                 tau_emb_dim=16, point_dim=6, n_denoise_layers=1):
+        super().__init__()
+        self.point_dim = point_dim
+        self.encoder = StructuralEncoder(node_dim, edge_dim, hidden, layers,
+                                        tau_emb_dim)
+        self.denoiser = Denoiser(hidden, edge_dim, point_dim, n_denoise_layers)
+
+    def encode(self, node_feats, edge_index, edge_feats, tau, batch):
+        return self.encoder(node_feats, edge_index, edge_feats, tau, batch)
+
+    def denoise(self, u, s, context, edge_index, edge_feats, batch):
+        return self.denoiser(u, s, context, edge_index, edge_feats, batch)
+
+    def forward(self, u, s, node_feats, edge_index, edge_feats, tau, batch):
+        context = self.encode(node_feats, edge_index, edge_feats, tau, batch)
+        return self.denoise(u, s, context, edge_index, edge_feats, batch)
+
+
+@torch.no_grad()
+def sample_ddpm_union_cached(net, node_feats, edge_index, edge_feats, tau, batch,
+                             schedule, steps=50, eta=1.0, sigma_init=1.0):
+    """Reverse-diffusion sampler that encodes the static graph once.
+
+    `net` must expose `encode`/`denoise` (a CachedPropagator). Identical reverse
+    math to sample_ddpm_union; the only difference is the structural context is
+    computed once and reused across all reverse steps. eta=0 -> deterministic
+    DDIM (use with a small `steps` for fast rollout).
+    """
+    T = schedule.T
+    N = node_feats.shape[0]
+    device, dtype = node_feats.device, node_feats.dtype
+    context = net.encode(node_feats, edge_index, edge_feats, tau, batch)
+    u = torch.randn(N, net.point_dim, device=device, dtype=dtype) * sigma_init
+
+    t_full = torch.round(torch.linspace(T - 1, 0, steps + 1, device=device)).long().clamp(0, T - 1)
+    for i in range(steps):
+        t = t_full[i].item()
+        t_prev = t_full[i + 1].item()
+        s = torch.full((tau.shape[0],), t / T, dtype=dtype, device=device)
+        eps_pred = net.denoise(u, s, context, edge_index, edge_feats, batch)
+
+        sqrt_ab_t = schedule.sqrt_alphas_bar[t].to(dtype)
+        sqrt_1mab_t = schedule.sqrt_one_minus_alphas_bar[t].to(dtype)
+        ab_prev = schedule.alphas_bar[t_prev].to(dtype)
+        ab_t = schedule.alphas_bar[t].to(dtype)
+
+        u0_hat = (u - sqrt_1mab_t * eps_pred) / sqrt_ab_t.clamp_min(1e-8)
+        pv = (1 - ab_prev) / (1 - ab_t).clamp_min(1e-8) * (1 - ab_t / ab_prev.clamp_min(1e-8))
+        sigma_t = eta * pv.clamp_min(0.0).sqrt()
+        dir_coeff = (1 - ab_prev - sigma_t ** 2).clamp_min(0.0).sqrt()
+        z = torch.randn_like(u) if t_prev > 0 else torch.zeros_like(u)
+        u = ab_prev.sqrt() * u0_hat + dir_coeff * eps_pred + sigma_t * z
+    return u
