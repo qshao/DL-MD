@@ -1,6 +1,13 @@
 # MD trajectory and simulation data
 WT/
 demo_run_*/
+run_*/
+gen_*/
+genmd_*/
+ca_run_*/
+infer_test/
+checkpoints/
+data/
 record
 
 # Python build artifacts

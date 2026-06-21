@@ -1,0 +1,20 @@
+Generative MD Timing Report
+====================================================
+Generated : 2026-06-20 20:45:18
+Target    : 1000 ns
+
+── Generative MD (this model) ─────────────────────
+  τ per step           : 2 frames = 400 ps = 0.40 ns
+  Steps required       : 2,500
+  Time per step        : 0.3096 s  (measured)
+  Total wall-clock     : 774.0 s  /  12.9 min  /  0.22 h
+
+── Classical MD (reference GPU estimate) ───────────
+  Integration step     : 2 fs
+  Steps required       : 500,000,000
+  Typical throughput   : ~100 ns/day on GPU
+  Total wall-clock     : ~10 days  /  ~240 h
+
+── Speedup ─────────────────────────────────────────
+  Generative MD vs classical MD : 1116×  faster
+====================================================
