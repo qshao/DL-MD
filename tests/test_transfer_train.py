@@ -75,3 +75,71 @@ def test_train_one_step_returns_checkpoint_without_nans():
     assert ckpt["n_aa_types"] == 21
     for v in ckpt["model_state"].values():
         assert torch.isfinite(v).all()
+
+
+def _mdcath_shard(F=30, N=10, dt=1000.0, temps=(320, 348, 450), seed=0):
+    """Synthetic mdCATH-like shard with traj_breaks and traj_temps."""
+    torch.manual_seed(seed)
+    n_trajs = len(temps)
+    frames_per_traj = F // n_trajs
+    R_aa = torch.randn(frames_per_traj * n_trajs, N, 3) * 0.1
+    t    = torch.randn(frames_per_traj * n_trajs, N, 3) * 5.0
+    traj_breaks = torch.tensor(
+        [frames_per_traj * i for i in range(1, n_trajs)], dtype=torch.long)
+    traj_temps  = torch.tensor(list(temps), dtype=torch.long)
+    return {
+        "R_aa": R_aa.half(), "t": t.half(),
+        "res_type": torch.randint(0, 21, (N,)),
+        "chain_id": torch.zeros(N, dtype=torch.long),
+        "res_index": torch.arange(N),
+        "dt": dt, "seq": ["ALA"] * N, "n_res": N,
+        "traj_breaks": traj_breaks, "traj_temps": traj_temps,
+    }
+
+
+def test_sample_example_respects_allowed_temps():
+    shard = _mdcath_shard(F=30, N=10, temps=(320, 450))
+    # Allow only 320K: pairs must come from frames 0-14
+    for _ in range(50):
+        ex = tt.sample_example(shard, random.Random(_), lags_ps=[1000.0], k=4,
+                               allowed_temps=frozenset([320]))
+        if ex is None:
+            continue
+        # Not testing exact frame — just that example was produced without error
+    # Now with 450K only: pairs from frames 15-29
+    found_450 = False
+    for seed in range(50):
+        ex = tt.sample_example(shard, random.Random(seed), lags_ps=[1000.0], k=4,
+                               allowed_temps=frozenset([450]))
+        if ex is not None:
+            found_450 = True
+            break
+    assert found_450
+
+
+def test_curriculum_helpers():
+    schedule = [(0, 320), (100, 348), (500, 379)]
+    assert tt._current_max_temp(0,   schedule) == 320
+    assert tt._current_max_temp(99,  schedule) == 320
+    assert tt._current_max_temp(100, schedule) == 348
+    assert tt._current_max_temp(499, schedule) == 348
+    assert tt._current_max_temp(500, schedule) == 379
+
+    allowed = tt._allowed_temps_set(348)
+    assert 320 in allowed
+    assert 348 in allowed
+    assert 379 not in allowed
+
+
+def test_train_with_temp_schedule():
+    shards = [_mdcath_shard(F=30, N=10, temps=(320, 450), seed=i) for i in range(3)]
+    # Start at 320K only; switch to all temps at step 2
+    schedule = [(0, 320), (2, 450)]
+    ckpt = tt.train(shards, lags_ps=[1000.0], k=4, hidden=16, layers=2,
+                    max_union_nodes=25, accum=2, steps=4, T_diff=20,
+                    norm_samples=16, device="cpu", seed=0,
+                    temp_schedule=schedule)
+    assert "model_state" in ckpt
+    assert ckpt["hparams"]["temp_schedule"] == schedule
+    for v in ckpt["model_state"].values():
+        assert torch.isfinite(v).all()

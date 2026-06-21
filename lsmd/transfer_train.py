@@ -38,14 +38,44 @@ def _sample_shard(shards, cum, total, rng):
     return shards[min(idx, len(shards) - 1)]
 
 
-def sample_example(shard, rng, lags_ps, k):
-    """Sample one state-conditional training example from a shard, or None."""
-    # Cache lag pairs in the shard dict to avoid recomputing on every call
+_ALL_MDCATH_TEMPS = [320, 348, 379, 413, 450]
+
+
+def _allowed_temps_set(max_temp_K):
+    """Integer set of mdCATH temperatures (K) at or below max_temp_K."""
+    return frozenset(t for t in _ALL_MDCATH_TEMPS if t <= max_temp_K)
+
+
+def _current_max_temp(step, temp_schedule):
+    """Return the max temperature (K) at gradient step `step`.
+
+    temp_schedule: list of (start_step, max_temp_K) sorted by start_step.
+    """
+    current = temp_schedule[0][1]
+    for thresh, temp in temp_schedule:
+        if step >= thresh:
+            current = temp
+    return current
+
+
+def sample_example(shard, rng, lags_ps, k, allowed_temps=None):
+    """Sample one state-conditional training example from a shard, or None.
+
+    Args:
+        allowed_temps: frozenset of integer temperatures (K) to include.
+                       Only applies to mdCATH shards that carry ``traj_temps``.
+                       None means all segments are eligible (ATLAS or no curriculum).
+    """
+    # Cache lag pairs per (lags_ps, allowed_temps) combination
     cache_key = "_pairs_" + "_".join(str(int(lag)) for lag in sorted(lags_ps))
+    if allowed_temps is not None:
+        cache_key += "_T" + "_".join(str(t) for t in sorted(allowed_temps))
     if cache_key not in shard:
         shard[cache_key] = data.physical_lag_pairs(
             shard["t"].shape[0], shard["dt"], lags_ps,
-            traj_breaks=shard.get("traj_breaks"))
+            traj_breaks=shard.get("traj_breaks"),
+            traj_temps=shard.get("traj_temps"),
+            allowed_temps=allowed_temps)
     pairs = shard[cache_key]
     if pairs.shape[0] == 0:
         return None
@@ -55,25 +85,32 @@ def sample_example(shard, rng, lags_ps, k):
 
 
 def iter_union_batches(shards, rng, lags_ps, k, max_union_nodes, n_batches,
-                       cum_frames=None, total_frames=None):
+                       cum_frames=None, total_frames=None,
+                       get_allowed_temps=None):
     """Yield n_batches (union_batch, example_group) pairs.
 
     union_batch is the union_collate dict; example_group is the raw list of
     examples before collation (needed by collate_physics for the C1 loss).
-    If cum_frames/total_frames are provided, sampling is frame-proportional;
-    otherwise uniform over shards.
+
+    Args:
+        cum_frames / total_frames: pre-computed sampler weights for
+            frame-proportional shard selection.
+        get_allowed_temps: optional zero-arg callable that returns the current
+            frozenset of allowed mdCATH temperatures (K). Called once per
+            union-batch so the curriculum can change mid-training.
     """
     use_weighted = cum_frames is not None and total_frames is not None
     miss_limit = _max_misses(shards)
     produced = 0
     while produced < n_batches:
+        allowed_temps = get_allowed_temps() if get_allowed_temps is not None else None
         group, n_nodes, misses = [], 0, 0
         while True:
             if use_weighted:
                 shard = _sample_shard(shards, cum_frames, total_frames, rng)
             else:
                 shard = shards[rng.randrange(len(shards))]
-            ex = sample_example(shard, rng, lags_ps, k)
+            ex = sample_example(shard, rng, lags_ps, k, allowed_temps=allowed_temps)
             if ex is None:
                 misses += 1
                 if misses > miss_limit:
@@ -84,7 +121,6 @@ def iter_union_batches(shards, rng, lags_ps, k, max_union_nodes, n_batches,
                 continue
             n = ex["node_feats"].shape[0]
             if group and n_nodes + n > max_union_nodes:
-                # would overflow; defer this example by re-sampling next batch
                 break
             group.append(ex)
             n_nodes += n
@@ -139,7 +175,7 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
           max_union_nodes=2000, accum=4, steps=1000, T_diff=200,
           norm_samples=256, device="cpu", seed=0, lam=0.0, lam_warmup=500,
           log_every=100, grad_clip=1.0, norm_shards=None,
-          frame_weighted=True, compile_model=False):
+          frame_weighted=True, compile_model=False, temp_schedule=None):
     """Train the union-graph propagator across proteins; return a checkpoint.
 
     Args:
@@ -148,9 +184,13 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
         log_every:      Print loss + speed every this many gradient steps.
         norm_shards:    Shards to fit UpdateNorm on (default: all shards).
                         Pass ATLAS-only shards to avoid high-T mdCATH outliers.
-        frame_weighted: If True (default), sample shards proportional to frame
-                        count so each MD frame has equal selection probability.
-        compile_model:  If True, call torch.compile() on the model for speedup.
+        frame_weighted: Sample shards proportional to frame count (default True).
+        compile_model:  Call torch.compile() on the model (default False).
+        temp_schedule:  Temperature curriculum: list of (start_step, max_temp_K)
+                        pairs sorted by start_step.  At each gradient step the
+                        sampler restricts mdCATH trajectories to temperatures
+                        ≤ current max.  None (default) uses all temperatures.
+                        Example: [(0,320),(2000,348),(5000,379),(10000,413),(15000,450)]
     """
     if lam > 0.0 and lam_warmup >= steps:
         peak = pl.lambda_schedule(max(0, steps - 1), lam_warmup, lam)
@@ -187,15 +227,28 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
     except (AttributeError, TypeError):
         scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
+    # --- Temperature curriculum ---
+    _allowed_state = [None]  # mutable cell updated in the training loop
+    if temp_schedule:
+        initial_max = _current_max_temp(0, temp_schedule)
+        _allowed_state[0] = _allowed_temps_set(initial_max)
+        print(f"  Temperature curriculum starts at {initial_max}K "
+              f"(schedule: {temp_schedule})", flush=True)
+
+    def _get_allowed_temps():
+        return _allowed_state[0]
+
     batches = iter_union_batches(shards, rng, lags_ps, k,
                                  max_union_nodes, n_batches=steps * accum,
-                                 cum_frames=cum_frames, total_frames=total_frames)
+                                 cum_frames=cum_frames, total_frames=total_frames,
+                                 get_allowed_temps=_get_allowed_temps)
     opt.zero_grad()
     lam_t = 0.0
     loss_acc = 0.0       # accumulated (scaled) loss for logging
     nodes_acc = 0        # nodes processed since last log
     t0 = time.perf_counter()
     t_log = t0
+    _prev_max_temp = _allowed_state[0] and max(_allowed_state[0])
 
     for i, (b, group) in enumerate(batches):
         b_dev = {kk: vv.to(device) for kk, vv in b.items()}
@@ -245,6 +298,16 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
             opt.zero_grad()
 
             step = (i + 1) // accum
+
+            # Advance curriculum temperature if schedule dictates
+            if temp_schedule:
+                new_max = _current_max_temp(step, temp_schedule)
+                if new_max != _prev_max_temp:
+                    _allowed_state[0] = _allowed_temps_set(new_max)
+                    _prev_max_temp = new_max
+                    print(f"  [step {step}] curriculum: max_temp={new_max}K "
+                          f"(allowed: {sorted(_allowed_state[0])}K)", flush=True)
+
             if step % log_every == 0:
                 now = time.perf_counter()
                 dt = now - t_log
@@ -275,5 +338,6 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
                     "lags_ps": list(lags_ps), "point_dim": 6,
                     "node_dim": 24, "edge_dim": 13,
                     "lam": lam, "lam_warmup": lam_warmup,
-                    "frame_weighted": frame_weighted},
+                    "frame_weighted": frame_weighted,
+                    "temp_schedule": temp_schedule},
     }

@@ -315,23 +315,26 @@ def _frame_t(frames, i):
     return frames["t"][i].float()
 
 
-def physical_lag_pairs(num_frames, dt, lags_ps, traj_breaks=None):
+def physical_lag_pairs(num_frames, dt, lags_ps, traj_breaks=None,
+                       traj_temps=None, allowed_temps=None):
     """Frame pairs at physical lag times (picoseconds).
 
     Args:
-        num_frames:   total frames in the shard.
-        dt:           ps per frame.
-        lags_ps:      iterable of physical lags in ps.
-        traj_breaks:  optional LongTensor of frame indices where new
-                      trajectories begin (e.g. [440, 880, ...] for a shard
-                      that concatenates three trajectories of 440 frames each).
-                      Pairs that would cross a boundary are excluded.
-                      None (default) treats the entire shard as one trajectory.
+        num_frames:    total frames in the shard.
+        dt:            ps per frame.
+        lags_ps:       iterable of physical lags in ps.
+        traj_breaks:   optional LongTensor of frame indices where new
+                       trajectories begin. Pairs crossing a boundary are excluded.
+                       None treats the entire shard as one trajectory.
+        traj_temps:    optional LongTensor [K] — temperature (K) for each
+                       sub-trajectory (same length as number of segments).
+                       When provided together with allowed_temps, segments
+                       with unlisted temperatures are skipped entirely.
+        allowed_temps: optional set/frozenset of integer temperatures (K) to
+                       include. Ignored when traj_temps is None.
 
     Returns:
         LongTensor [P, 3] — columns (start_frame, end_frame, tau_frames).
-        Lags requiring >= segment_length frames for a given segment are skipped
-        for that segment only.
     """
     if traj_breaks is None or len(traj_breaks) == 0:
         segments = [(0, num_frames)]
@@ -339,8 +342,13 @@ def physical_lag_pairs(num_frames, dt, lags_ps, traj_breaks=None):
         walls = [0] + traj_breaks.tolist() + [num_frames]
         segments = list(zip(walls[:-1], walls[1:]))
 
+    filter_temps = (traj_temps is not None) and (allowed_temps is not None)
+
     parts = []
-    for seg_start, seg_end in segments:
+    for seg_idx, (seg_start, seg_end) in enumerate(segments):
+        if filter_temps and seg_idx < len(traj_temps):
+            if int(traj_temps[seg_idx]) not in allowed_temps:
+                continue
         seg_len = seg_end - seg_start
         for lag in lags_ps:
             tau_frames = max(1, int(round(float(lag) / dt)))

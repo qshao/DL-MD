@@ -79,6 +79,33 @@ def _backbone_indices(top):
 # Public API
 # ---------------------------------------------------------------------------
 
+def infer_traj_temps(n_trajs, n_reps=None):
+    """Infer per-trajectory temperatures for shards built without ``traj_temps``.
+
+    Assumes the standard build ordering: MDCATH_TEMPS × MDCATH_REPS (i.e.
+    all replicas of temperature T come before any replica of temperature T+1).
+
+    Args:
+        n_trajs: total number of sub-trajectories in the shard
+                 (= len(traj_breaks) + 1 for a standard mdCATH shard).
+        n_reps:  replicas per temperature (default: len(MDCATH_REPS) = 5).
+
+    Returns:
+        LongTensor [n_trajs] with temperatures in Kelvin (320, 348, …).
+    """
+    if n_reps is None:
+        n_reps = len(MDCATH_REPS)
+    temps = []
+    for t in MDCATH_TEMPS:
+        for _ in range(n_reps):
+            if len(temps) >= n_trajs:
+                break
+            temps.append(int(t))
+        if len(temps) >= n_trajs:
+            break
+    return torch.tensor(temps, dtype=torch.long)
+
+
 def fetch_mdcath_ids():
     """Return list of all domain IDs available in the HuggingFace mdCATH dataset.
 
@@ -169,6 +196,7 @@ def build_shard_from_h5(h5_path, dt_ps=MDCATH_DT_PS,
 
         R_aa_parts, t_parts = [], []
         traj_break_frames = []  # start-of-trajectory frame indices (skip first)
+        traj_temp_list    = []  # temperature (K) for each sub-trajectory
         cum = 0
 
         for temp in temps:
@@ -199,6 +227,7 @@ def build_shard_from_h5(h5_path, dt_ps=MDCATH_DT_PS,
                         traj_break_frames.append(cum)
                     R_aa_parts.append(R_aa)
                     t_parts.append(t_f)
+                    traj_temp_list.append(int(temp))
                     cum += F
                 else:
                     valid_np = valid.numpy()
@@ -214,6 +243,7 @@ def build_shard_from_h5(h5_path, dt_ps=MDCATH_DT_PS,
                                     traj_break_frames.append(cum)
                                 R_aa_parts.append(R_aa[seg_start:fi])
                                 t_parts.append(t_f[seg_start:fi])
+                                traj_temp_list.append(int(temp))
                                 cum += seg_len
                             seg_start = None
 
@@ -227,6 +257,7 @@ def build_shard_from_h5(h5_path, dt_ps=MDCATH_DT_PS,
     chain_id  = torch.tensor(chain_ids, dtype=torch.long)
     res_index = torch.arange(len(res_names), dtype=torch.long)
     traj_breaks = torch.tensor(traj_break_frames, dtype=torch.long)
+    traj_temps  = torch.tensor(traj_temp_list,    dtype=torch.long)
 
     return {
         "R_aa":        R_aa,
@@ -238,4 +269,5 @@ def build_shard_from_h5(h5_path, dt_ps=MDCATH_DT_PS,
         "seq":         res_names,
         "n_res":       len(res_names),
         "traj_breaks": traj_breaks,
+        "traj_temps":  traj_temps,
     }

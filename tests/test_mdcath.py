@@ -136,6 +136,7 @@ def test_build_shard_from_h5_keys_and_dtypes():
     assert "R_aa" in shard
     assert "t" in shard
     assert "traj_breaks" in shard
+    assert "traj_temps" in shard
     assert shard["R_aa"].dtype == torch.float16
     assert shard["t"].dtype == torch.float16
     assert shard["n_res"] == 8
@@ -158,9 +159,14 @@ def test_build_shard_from_h5_shapes():
     assert shard["res_type"].shape == (n_res,)
     # traj_breaks: one entry per trajectory boundary (n_trajs - 1)
     assert shard["traj_breaks"].shape == (n_trajs - 1,)
-    # traj_breaks should be strictly increasing starting at n_frames
     assert shard["traj_breaks"][0].item() == n_frames
     assert (shard["traj_breaks"].diff() > 0).all()
+    # traj_temps: one temperature per trajectory
+    assert shard["traj_temps"].shape == (n_trajs,)
+    assert shard["traj_temps"][0].item() == 320  # first two trajectories are 320K
+    assert shard["traj_temps"][1].item() == 320
+    assert shard["traj_temps"][2].item() == 348  # next two are 348K
+    assert shard["traj_temps"][3].item() == 348
 
 
 def test_build_shard_from_h5_fixed_vocab():
@@ -172,6 +178,46 @@ def test_build_shard_from_h5_fixed_vocab():
     # Residue types from fixed vocab must be in [0, N_AA_TYPES)
     assert int(shard["res_type"].min()) >= 0
     assert int(shard["res_type"].max()) < vocab.N_AA_TYPES
+
+
+def test_infer_traj_temps_standard():
+    temps = mc.infer_traj_temps(25)  # 5 temps × 5 reps
+    assert temps.shape == (25,)
+    assert temps[0].item() == 320
+    assert temps[4].item() == 320   # last 320K rep
+    assert temps[5].item() == 348   # first 348K rep
+    assert temps[24].item() == 450  # last 450K rep
+
+
+def test_infer_traj_temps_partial():
+    temps = mc.infer_traj_temps(7)   # fewer than a full set
+    assert temps.shape == (7,)
+    assert (temps[:5] == 320).all()
+    assert temps[5].item() == 348
+    assert temps[6].item() == 348
+
+
+def test_physical_lag_pairs_temp_filter():
+    # Two 320K trajs + two 450K trajs; filter to 320K only
+    traj_breaks = torch.tensor([10, 20, 30], dtype=torch.long)
+    traj_temps  = torch.tensor([320, 320, 450, 450], dtype=torch.long)
+    pairs = data.physical_lag_pairs(
+        40, dt=100.0, lags_ps=[200.0],
+        traj_breaks=traj_breaks,
+        traj_temps=traj_temps,
+        allowed_temps=frozenset([320]))
+    # All returned pairs must lie within 320K segments (frames 0-19)
+    assert pairs.shape[0] > 0
+    assert int(pairs[:, 1].max()) < 20, "Pair end frame in 450K region"
+
+
+def test_physical_lag_pairs_no_traj_temps_ignores_filter():
+    # When traj_temps is absent, allowed_temps is ignored
+    pairs_all = data.physical_lag_pairs(20, dt=100.0, lags_ps=[200.0])
+    pairs_filtered = data.physical_lag_pairs(
+        20, dt=100.0, lags_ps=[200.0],
+        allowed_temps=frozenset([320]))  # no traj_temps → all segments pass
+    assert pairs_all.shape == pairs_filtered.shape
 
 
 def test_build_shard_from_h5_traj_breaks_no_cross_pairs():

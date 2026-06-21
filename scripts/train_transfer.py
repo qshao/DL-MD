@@ -52,6 +52,14 @@ def main():
                     help="Sample shards uniformly (default: proportional to frame count)")
     ap.add_argument("--compile", action="store_true",
                     help="torch.compile the model for ~20%% GPU speedup (requires PyTorch 2.0+)")
+    ap.add_argument("--temp_schedule", nargs="*", default=None, metavar="STEP:TEMP",
+                    help="Temperature curriculum for mdCATH trajectories. "
+                         "Space-separated 'step:temp_K' pairs, e.g.: "
+                         "0:320 2000:348 5000:379 10000:413 15000:450  "
+                         "At each listed gradient step, the max allowed mdCATH "
+                         "temperature increases to temp_K. "
+                         "ATLAS shards are unaffected (always included). "
+                         "Default: no curriculum (all temperatures from step 0).")
     ap.add_argument("--out", default="checkpoints/transfer.pt")
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
@@ -99,6 +107,15 @@ def main():
         print(f"  UpdateNorm fitted on: {args.shards_dir[0]} ({len(norm_shards)} shards)",
               flush=True)
 
+    # Parse temperature schedule: "0:320 2000:348 ..." -> [(0,320),(2000,348),...]
+    temp_schedule = None
+    if args.temp_schedule:
+        temp_schedule = []
+        for token in args.temp_schedule:
+            step_str, temp_str = token.split(":")
+            temp_schedule.append((int(step_str), int(temp_str)))
+        temp_schedule.sort()
+
     ckpt = tt.train(shards, lags_ps=args.lags_ps, k=args.k, hidden=args.hidden,
                     layers=args.layers, lr=args.lr,
                     max_union_nodes=args.max_union_nodes, accum=args.accum,
@@ -108,7 +125,8 @@ def main():
                     log_every=args.log_every, grad_clip=args.grad_clip,
                     norm_shards=norm_shards,
                     frame_weighted=not args.no_frame_weighted,
-                    compile_model=args.compile)
+                    compile_model=args.compile,
+                    temp_schedule=temp_schedule)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     torch.save(ckpt, args.out)
