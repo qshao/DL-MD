@@ -79,9 +79,9 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     use_amp = device.type == "cuda"
     try:
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    except (AttributeError, TypeError):
         scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-    except AttributeError:
-        scaler = torch.amp.GradScaler(enabled=use_amp)
 
     batches = iter_union_batches(shards, rng, lags_ps, k,
                                  max_union_nodes, n_batches=steps * accum)

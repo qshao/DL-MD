@@ -6,7 +6,6 @@ but re-keys residue identities through the global fixed vocabulary
 `download_atlas_entry` is a thin network wrapper around the ATLAS dataset.
 """
 import os
-import torch
 from lsmd import data
 from lsmd import vocab
 

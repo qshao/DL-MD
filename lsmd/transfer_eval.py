@@ -8,6 +8,7 @@ validity.
 import torch
 
 from lsmd import featurize as feat
+from lsmd import validation as val
 from lsmd.transfer_model import PropagatorNet, sample_ddpm_union
 from lsmd.normalize import UpdateNorm
 from lsmd.model import NoiseSchedule
@@ -86,9 +87,6 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
         traj.append(t.clone())
 
     return torch.stack(traj, dim=0)
-
-
-from lsmd import validation as val  # noqa: E402
 
 
 def evaluate(ca_model, ca_md):
