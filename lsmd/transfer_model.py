@@ -77,6 +77,7 @@ class PropagatorNet(nn.Module):
         Returns:
             [ΣN, point_dim]
         """
+        batch = batch.to(node_feats.device)
         s = torch.as_tensor(s, dtype=u.dtype, device=u.device)
         s_nodes = s[batch].unsqueeze(-1)                       # [ΣN,1]
         tau_emb = tau_embedding(tau, dim=self.tau_emb_dim,
@@ -95,6 +96,7 @@ def ddpm_loss_union(net, u_target, node_feats, edge_index, edge_feats, tau,
     Each graph gets its own noise level; per-graph node-mean losses are then
     averaged (optionally weighted) so large proteins don't dominate.
     """
+    batch = batch.to(u_target.device)
     G = tau.shape[0]
     T = schedule.T
     t_min = max(1, T // 20)
