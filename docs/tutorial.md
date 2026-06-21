@@ -1,6 +1,8 @@
 # LSMD Tutorial
 
-This tutorial walks through the complete LSMD pipeline on a real protein system, from preprocessing an MD trajectory to generating and analysing long generative MD runs. Three production runs are used as concrete examples throughout.
+This tutorial walks through the complete LSMD pipeline on a real protein system, from preprocessing an MD trajectory to generating and analysing long generative MD runs.
+
+**Pre-generated demo output is included in the repository** under `demo_2bead/` and `demo_4bead/`. You can inspect or visualize those files immediately after cloning, without running any of the generation steps yourself.
 
 ---
 
@@ -47,6 +49,34 @@ pytest tests/ -q
 
 ---
 
+## Demo data
+
+After cloning, two ready-to-visualize demo runs are available immediately:
+
+```
+demo_2bead/
+  trajectory.pdb  — 51-frame 2-bead (Cα+Cβ) trajectory, 20 ns
+  allatom.pdb     — full heavy-atom reconstruction, 51 frames
+  metrics.json    — RMSD, RMSF, validity
+  timing_report.txt
+
+demo_4bead/
+  trajectory.pdb  — 51-frame 4-bead (N/Cα/C/Cβ) trajectory, 20 ns
+  allatom.pdb     — full heavy-atom reconstruction, 51 frames
+  metrics.json
+  timing_report.txt
+```
+
+```bash
+# Visualize immediately (no training or generation needed)
+pymol demo_2bead/allatom.pdb
+pymol demo_4bead/allatom.pdb
+```
+
+Both demos use mimic mode (τ=2, anchor_every=50) on a 169-residue protein. See [below](#demo-1--2-bead-mimic-20-ns) for the exact commands used to generate them.
+
+---
+
 ## Input data
 
 LSMD reads any trajectory format supported by MDtraj (GROMACS TRR/XTC, CHARMM DCD, AMBER NetCDF, …) plus a matching topology file. For this tutorial we use:
@@ -55,6 +85,8 @@ LSMD reads any trajectory format supported by MDtraj (GROMACS TRR/XTC, CHARMM DC
 WT/WT-sol6.trr   — 5001-frame GROMACS trajectory (1 μs, 200 ps/frame)
 WT/WT-sol6.gro   — GROMACS topology (169 protein residues + solvent)
 ```
+
+> The `WT/` directory is not distributed with the repository. To reproduce the demo runs, you need the original trajectory files.
 
 ---
 
@@ -100,14 +132,14 @@ The `.pt` file contains:
 Train the DDPM on preprocessed frames. 200 epochs on a GPU takes ~10 minutes for this system.
 
 ```bash
-# 2-bead model — used for runs A and B
+# 2-bead model
 python scripts/train.py \
     --frames   data/wt_2bead.pt \
     --taus     1 2 5 \
     --epochs   200 \
     --out      checkpoints/wt_2bead_200ep.pt
 
-# 4-bead model — used for run C
+# 4-bead model
 python scripts/train.py \
     --frames   data/wt_4bead.pt \
     --taus     1 2 5 \
@@ -158,19 +190,21 @@ LSMD supports two sampling modes that trade conformational coverage against phys
 
 ---
 
-### Run A — 2-bead mimic, 1 μs (MD-faithful reference)
+### Demo 1 — 2-bead mimic, 20 ns
+
+This is the command that generated `demo_2bead/`:
 
 ```bash
 python scripts/generate_md.py \
     --checkpoint  checkpoints/wt_2bead_200ep.pt \
     --frames      data/wt_2bead.pt \
     --tau         2 \
-    --steps       2500 \
+    --steps       50 \
     --min_energy \
     --k_clash     5.0 \
     --sample_mode mimic \
     --anchor_every 50 \
-    --out         run_a_2bead_mimic_1us
+    --out         demo_2bead
 ```
 
 Terminal output:
@@ -179,31 +213,76 @@ Generative MD
   Checkpoint : checkpoints/wt_2bead_200ep.pt
   Starting frame : 3999  (5001 total, 169 residues)
   Tau per step   : 2 frames = 400 ps
-  Steps          : 2500
-  Total time     : 1000.0 ns  (500000000× faster than 2 fs MD)
+  Steps          : 50
+  Total time     : 20.0 ns  (10000000× faster than 2 fs MD)
   Energy min     : ON  (L-BFGS, 100 steps, k_bond=10.0, k_clash=5.0)
   Sample mode    : mimic  (re-anchor to nearest MD frame every 50 steps)
-  Device         : cuda
   Mode           : 2-bead (CA, CB)  point_dim=6
 
 Chain 1/1 ...
-  Done. Mean disp/step: 1.008 Å  Final RMSD: 8.158 Å  Valid steps: 2175/2500  re-anchors: 50
+  Done. Mean disp/step: 0.996 Å  Final RMSD: 7.618 Å  Valid steps: 44/50  re-anchors: 1
 
-Generated 1000.0 ns of CA dynamics
-  Final RMSD      : 8.16 Å from start
-  RMSF (mean/max) : 3.56 / 11.02 Å
-  Most flexible   : residue 168
-  Valid steps     : 2175/2500 (87%)  [bond viol=0, clashes=325, Rg viol=0]
-  Sample mode     : mimic  (anchor every 50 steps)  re-anchors: 50
-  Time/step       : 0.594 s  → 24.7 min for 1000 ns (582× vs classical MD)
-Output → run_a_2bead_mimic_1us/
+Generated 20.0 ns of CA dynamics
+  Final RMSD      : 7.62 Å from start
+  RMSF (mean/max) : 2.43 / 9.10 Å
+  Valid steps     : 44/50 (88%)  [bond viol=0, clashes=6, Rg viol=0]
+  Time/step       : 0.240 s  → 10.0 min for 1000 ns (1439× vs classical MD)
+Output → demo_2bead/
 ```
 
-**Results:** RMSD 8.2 Å, RMSF 3.6 Å, 87% valid steps, **582× speedup**. The trajectory stays near the MD ensemble — RMSF matches the order of magnitude of classical MD (~2 Å) while covering a broader range of the energy landscape in 25 minutes vs 10 days.
+**Results:** RMSD 7.6 Å, RMSF 2.4 Å, 88% valid steps, **1439× speedup**. The trajectory stays near the MD ensemble; 2-bead reconstruction (rigid Cα translation) preserves the template's backbone φ/ψ angles.
+
+To scale up to a full 1 μs production run, change `--steps 50` to `--steps 2500`.
 
 ---
 
-### Run B — 2-bead explore ensemble, 1 μs × 4 chains (conformational sampling)
+### Demo 2 — 4-bead mimic, 20 ns
+
+This is the command that generated `demo_4bead/`:
+
+```bash
+python scripts/generate_md.py \
+    --checkpoint  checkpoints/wt_4bead_200ep.pt \
+    --frames      data/wt_4bead.pt \
+    --tau         2 \
+    --steps       50 \
+    --min_energy \
+    --k_clash     5.0 \
+    --sample_mode mimic \
+    --anchor_every 50 \
+    --out         demo_4bead
+```
+
+Terminal output:
+```
+  Mode           : 4-bead (N, CA, C, CB)  point_dim=12
+
+Chain 1/1 ...
+  Done. Mean disp/step: 0.892 Å  Final RMSD: 8.452 Å  Valid steps: 0/50  re-anchors: 1
+
+Generated 20.0 ns of CA dynamics
+  Final RMSD      : 8.45 Å from start
+  RMSF (mean/max) : 2.51 / 9.43 Å
+  Valid steps     : 0/50 (0%)  [bond viol=0, clashes=0, Rg viol=0,
+                                 rama viol=50 (mean 69.6% outliers/step)]
+  Time/step       : 0.310 s  → 12.9 min for 1000 ns (1116× vs classical MD)
+Output → demo_4bead/
+```
+
+**Results:** RMSD 8.5 Å, RMSF 2.5 Å, **1116× speedup**. Cα-level geometry is excellent (0 bonds, 0 clashes). The 0% valid steps is entirely due to Ramachandran: the 4-bead Cartesian model generates N/Cα/C displacements independently, producing ~70% φ/ψ outliers versus ~2% in real MD. This is a known limitation — not a structural failure. For dihedral analysis use the 2-bead demo instead.
+
+**Validity check breakdown for 4-bead:**
+
+| Check | demo_4bead result | Real MD baseline |
+|---|---|---|
+| Bond violations | 0 | 0 |
+| Steric clashes | 0 | 0 |
+| Rg in range | 50/50 | ~100% |
+| Ramachandran < 5% | 0/50 | 97% |
+
+### Explore mode (conformational sampling)
+
+To sample beyond the training distribution, switch to explore mode and increase the lag:
 
 ```bash
 python scripts/generate_md.py \
@@ -215,73 +294,44 @@ python scripts/generate_md.py \
     --min_energy \
     --k_clash     5.0 \
     --sample_mode explore \
-    --out         run_b_2bead_explore_ensemble
+    --out         my_explore_run
 ```
 
-Terminal output (abbreviated):
-```
-  Tau per step   : 5 frames = 1000 ps
-  Steps          : 1000
-  Chains         : 4
-  Total time     : 1000.0 ns  (500000000× faster than 2 fs MD)
-  Sample mode    : explore  (revert to last valid frame on failure)
-
-Chain 1/4 ...  Done. Final RMSD: 21.6 Å  Valid steps: 859/1000  reverts: 141
-Chain 2/4 ...  Done. Final RMSD: 24.9 Å  Valid steps: 888/1000  reverts: 112
-Chain 3/4 ...  Done. Final RMSD: 20.3 Å  Valid steps: 792/1000  reverts: 208
-Chain 4/4 ...  Done. Final RMSD: 24.6 Å  Valid steps: 907/1000  reverts: 93
-
-  Final RMSD      : 22.86 Å from start (mean over 4 chains)
-  RMSF (mean/max) : 13.92 / 30.41 Å
-  Valid steps     : 3446/4000 (86%)  [bond viol=0, clashes=554, Rg viol=0]
-  Sample mode     : explore  reverts: 554
-  Time/step       : 0.526 s  → 8.8 min for 1000 ns (1643× vs classical MD)
-Output → run_b_2bead_explore_ensemble/
-```
-
-**Results:** Mean RMSD 22.9 Å, RMSF 13.9 Å across 4 chains, **1643× speedup**. The four chains each start from the same frame and diverge into different regions of conformational space, providing an ensemble that samples far beyond the training-data distribution. The larger lag (τ=5, 1 ns/step) drives bigger conformational jumps. Reverts (141–208 per chain) prevent runaway unfolding while still allowing aggressive exploration.
+Reverts to the last valid frame on structural failure. Expected RMSD 20–25 Å, RMSF ~14 Å over 1 μs.
 
 ---
 
-### Run C — 4-bead mimic, 200 ns (full backbone geometry)
+**All `generate_md.py` flags:**
 
-```bash
-python scripts/generate_md.py \
-    --checkpoint  checkpoints/wt_4bead_200ep.pt \
-    --frames      data/wt_4bead.pt \
-    --tau         2 \
-    --steps       500 \
-    --n_chains    1 \
-    --min_energy \
-    --k_clash     5.0 \
-    --sample_mode mimic \
-    --anchor_every 50 \
-    --out         run_c_4bead_mimic_200ns
-```
-
-Terminal output:
-```
-  Mode           : 4-bead (N, CA, C, CB)  point_dim=12
-
-  Done. Mean disp/step: 0.865 Å  Final RMSD: 6.939 Å  Valid steps: 0/500  re-anchors: 10
-
-  Final RMSD      : 6.94 Å from start
-  RMSF (mean/max) : 3.35 / 9.58 Å
-  Valid steps     : 0/500 (0%)  [bond viol=0, clashes=0, Rg viol=0,
-                                  rama viol=500 (mean 69.0% outliers/step)]
-  Time/step       : 0.293 s  → 12.2 min for 1000 ns (1180× vs classical MD)
-```
-
-**Results:** RMSD 6.9 Å, RMSF 3.4 Å — geometry is excellent at the Cα level. Bond violations: 0. Clashes: 0. The 0% valid steps is entirely due to Ramachandran: the 4-bead Cartesian model generates N/Cα/C displacements independently without dihedral constraints, producing ~69% φ/ψ outliers per step versus ~2% in real MD. This is a known limitation of the Cartesian bead model, not a structural failure. For dihedral analysis use run A's 2-bead reconstruction instead.
-
-**Validity check breakdown for 4-bead:**
-
-| Check | Run C result | Real MD baseline |
+| Flag | Default | Description |
 |---|---|---|
-| Bond violations | 0 | 0 |
-| Steric clashes | 0 | 0 |
-| Rg in range | 500/500 | ~100% |
-| Ramachandran < 5% | 0/500 | 97% |
+| `--tau` | `5` | Lag per step (frames; τ=2 → 400 ps/step) |
+| `--steps` | `50` | Number of generative steps |
+| `--n_chains` | `1` | Independent trajectory chains |
+| `--sample_mode` | `explore` | `explore` or `mimic` |
+| `--anchor_every` | `50` | Re-anchor interval for mimic mode (steps) |
+| `--min_energy` | off | L-BFGS energy minimization after each step |
+| `--k_bond` | `10.0` | Bond spring constant for L-BFGS |
+| `--k_clash` | `1.0` | Clash penalty weight for L-BFGS (use 5.0 for 2-bead) |
+| `--min_steps` | `100` | Max L-BFGS iterations per step |
+| `--diff_steps` | `50` | Reverse diffusion steps per sample |
+| `--eta` | `1.0` | DDPM stochasticity (0 = deterministic DDIM) |
+| `--source_frame` | auto | Starting frame index (default: first validation frame) |
+
+**Output files:**
+- `trajectory.pdb` — multi-MODEL PDB, one MODEL per step
+- `chain_<k>.pdb` — per-chain PDB (when `--n_chains > 1`)
+- `metrics.json` — RMSD, RMSF, per-step RMSD array, validity breakdown
+- `timing_report.txt` — wall-clock time per step and speedup vs classical MD
+
+**Validity reporting** — each step is checked for:
+
+| Check | Criterion | Notes |
+|---|---|---|
+| Bond geometry | All bead-bead bonds within ±20% of ideal length | CA–CA 3.8 Å; N–CA 1.46 Å; CA–C 1.52 Å etc. |
+| Steric clashes | No non-bonded heavy-atom pair < 2.0 Å | Gly Cβ = Cα position is correctly excluded |
+| Radius of gyration | Rg within 0.5×–2.0× of expected (2.2 × P^0.38 Å) | Detects complete unfolding |
+| Ramachandran (4-bead only) | < 5% residues outside allowed φ/ψ regions | ~97% of real MD frames pass at this threshold |
 
 ---
 
@@ -289,109 +339,91 @@ Terminal output:
 
 Recover full heavy-atom coordinates from the bead trajectory using the nearest real MD frame as a sidechain template.
 
-### 2-bead reconstruction (Run A → high-quality backbone dihedrals)
+### 2-bead reconstruction (demo_2bead → high-quality backbone dihedrals)
 
 ```bash
 python scripts/reconstruct.py \
-    --beads      run_a_2bead_mimic_1us/trajectory.pdb \
+    --beads      demo_2bead/trajectory.pdb \
     --traj       WT/WT-sol6.trr \
     --top        WT/WT-sol6.gro \
     --checkpoint checkpoints/wt_2bead_200ep.pt \
-    --out        run_a_2bead_mimic_1us/allatom.pdb
+    --out        demo_2bead/allatom.pdb
 ```
 
 Output:
 ```
-Loaded 2501 bead frames  (169 residues, mode=2bead)
+Loaded 51 bead frames  (169 residues, mode=2bead)
 Loading template trajectory WT/WT-sol6.trr … 5001 frames, 35875 atoms
   169 reconstructable residues
-Reconstructing 2501 frames …
-  Reconstructed 2501/2501 frames
-Saved 2501 frames → run_a_2bead_mimic_1us/allatom.pdb  (273.8 MB)
+Reconstructing 51 frames …
+Saved 51 frames → demo_2bead/allatom.pdb  (5.6 MB)
   Heavy atoms per frame: 1351
 ```
 
-Each frame finds the nearest real MD frame by Cα-RMSD, then shifts every residue rigidly by (Cα_gen − Cα_template). This preserves the template's backbone φ/ψ angles — Ramachandran plots of the output will look like real MD.
+Each frame finds the nearest real MD frame by Cα-RMSD, then shifts every residue rigidly by (Cα_gen − Cα_template). This preserves the template's backbone φ/ψ angles — Ramachandran plots will look like real MD.
 
-### 4-bead reconstruction (Run C → Kabsch-grafted sidechains)
+### 4-bead reconstruction (demo_4bead → Kabsch-grafted sidechains)
 
 ```bash
 python scripts/reconstruct.py \
-    --beads      run_c_4bead_mimic_200ns/trajectory.pdb \
+    --beads      demo_4bead/trajectory.pdb \
     --traj       WT/WT-sol6.trr \
     --top        WT/WT-sol6.gro \
     --checkpoint checkpoints/wt_4bead_200ep.pt \
-    --out        run_c_4bead_mimic_200ns/allatom.pdb
+    --out        demo_4bead/allatom.pdb
 ```
 
 Output:
 ```
-Loaded 501 bead frames  (169 residues, mode=4bead)
-Reconstructing 501 frames …
-Saved 501 frames → run_c_4bead_mimic_200ns/allatom.pdb  (54.8 MB)
+Loaded 51 bead frames  (169 residues, mode=4bead)
+Reconstructing 51 frames …
+Saved 51 frames → demo_4bead/allatom.pdb  (5.6 MB)
   Heavy atoms per frame: 1351
 ```
 
-For each residue, the template backbone (N, Cα, C) is Kabsch-superposed onto the generated backbone to rotate deep sidechain atoms (Cγ, Cδ, …) into the correct local frame. N, Cα, C, Cβ come directly from the generated coordinates. The carbonyl O is placed geometrically in the peptide plane (C=O = 1.229 Å). Use this reconstruction when sidechain placement in the generated backbone frame is important, but note that backbone dihedrals will reflect the model's poor φ/ψ geometry.
+For each residue, the template backbone (N, Cα, C) is Kabsch-superposed onto the generated backbone to rotate deep sidechain atoms (Cγ, Cδ, …) into the correct local frame. N, Cα, C, Cβ come directly from the generated coordinates. Carbonyl O is placed geometrically in the peptide plane (C=O = 1.229 Å). Backbone dihedrals reflect the model's poor φ/ψ geometry — use the 2-bead reconstruction for dihedral analysis.
 
 ---
 
 ## Visualisation
 
+The demo all-atom PDBs are ready to open immediately after cloning:
+
 ```bash
-# Load a trajectory in PyMOL
-pymol run_a_2bead_mimic_1us/allatom.pdb
+# 2-bead demo — backbone dihedrals match real MD
+pymol demo_2bead/allatom.pdb
 
-# Compare all three all-atom trajectories
-pymol run_a_2bead_mimic_1us/allatom.pdb \
-      run_c_4bead_mimic_200ns/allatom.pdb
+# 4-bead demo — per-residue Kabsch sidechain placement
+pymol demo_4bead/allatom.pdb
 
-# Load in VMD
-vmd run_a_2bead_mimic_1us/allatom.pdb
-```
+# Compare both at once
+pymol demo_2bead/allatom.pdb demo_4bead/allatom.pdb
 
-For the bead-model PDBs (before reconstruction):
-```bash
-# 2-bead trajectory — shows Cα and Cβ only
-pymol run_a_2bead_mimic_1us/trajectory.pdb
+# Bead-model trajectories (before reconstruction)
+pymol demo_2bead/trajectory.pdb   # shows Cα and Cβ
+pymol demo_4bead/trajectory.pdb   # shows N, Cα, C, Cβ
 
-# 4-bead trajectory — shows N, Cα, C, Cβ backbone
-pymol run_c_4bead_mimic_200ns/trajectory.pdb
+# VMD
+vmd demo_2bead/allatom.pdb
 ```
 
 ---
 
-## Output file reference
+## Demo run summary
 
-Each `generate_md.py` run produces:
+Both demos use mimic mode, τ=2 (400 ps/step), 50 steps (20 ns), same starting frame.
 
-| File | Description |
-|---|---|
-| `trajectory.pdb` | Multi-MODEL PDB, one MODEL per step, all chains |
-| `chain_<k>.pdb` | Per-chain PDB (when `--n_chains > 1`) |
-| `metrics.json` | Final RMSD, RMSF, per-step RMSD array, validity breakdown |
-| `timing_report.txt` | Wall-clock time per step and speedup vs classical MD |
+| | demo_2bead | demo_4bead |
+|---|---|---|
+| Atoms per residue | Cα, Cβ | N, Cα, C, Cβ |
+| Final RMSD | 7.6 Å | 8.5 Å |
+| RMSF (mean / max) | 2.4 / 9.1 Å | 2.5 / 9.4 Å |
+| Valid steps | 88% | 0% (Ramachandran†) |
+| Speedup vs MD | 1439× | 1116× |
+| Reconstruction | rigid Cα shift | per-residue Kabsch |
+| Backbone φ/ψ quality | ✓ template quality | ✗ model generates poor dihedrals |
+| Sidechain placement | template rotamers | Kabsch-rotated into generated frame |
 
-After `reconstruct.py`:
+†Bond violations and steric clashes are both 0; only the Ramachandran check fails due to the Cartesian model's lack of dihedral constraints.
 
-| File | Description |
-|---|---|
-| `allatom.pdb` | Multi-MODEL PDB, protein heavy atoms only (no H, no solvent) |
-
----
-
-## Summary of the three runs
-
-| | Run A | Run B | Run C |
-|---|---|---|---|
-| Model | 2-bead | 2-bead | 4-bead |
-| τ | 2 (400 ps/step) | 5 (1 ns/step) | 2 (400 ps/step) |
-| Steps / time | 2500 / 1 μs | 1000 / 1 μs | 500 / 200 ns |
-| Chains | 1 | 4 | 1 |
-| Sample mode | mimic | explore | mimic |
-| Final RMSD | 8.2 Å | 22.9 Å | 6.9 Å |
-| Mean RMSF | 3.6 Å | 13.9 Å | 3.4 Å |
-| Valid steps | 87% | 86% | 0% (Rama) |
-| Speedup | 582× | 1643× | 1180× |
-| All-atom reconstruction | ✓ high-quality backbone | — | ✓ Kabsch sidechains |
-| Best for | MD reproduction | Conformational sampling | Sidechain placement |
+To scale up, increase `--steps` (e.g. `--steps 2500` for 1 μs) or switch to `--sample_mode explore` for wider conformational sampling.
