@@ -50,6 +50,8 @@ MD trajectory  ──▶  bead point cloud  [F, P, n_beads, 3]
 | `2bead` | Cα + Cβ | 6 per residue | Side-chain orientation; good balance |
 | `4bead` | N, Cα, C, Cβ | 12 per residue | Full backbone geometry |
 
+> **Note on 4-bead Ramachandran geometry:** The 4-bead model generates atomic displacements in Cartesian space without dihedral constraints. φ/ψ angles are determined by inter-residue geometry and can fall outside Ramachandran-allowed regions even though Cα-level RMSD/RMSF is physically reasonable (~8 Å / ~3.5 Å). For backbone dihedral analysis, use the 2-bead model with template-based all-atom reconstruction, which borrows N/Cα/C from the nearest real MD frame.
+
 ---
 
 ## Installation
@@ -222,23 +224,7 @@ Key metrics to check:
 
 Run the model autoregressively to generate a long trajectory. Each step samples one displacement Δ ~ p(Δ|τ) and advances the conformation by τ × 200 ps.
 
-### Explore mode (find new conformations)
-
-```bash
-python scripts/generate_md.py \
-    --checkpoint  checkpoints/wt_2bead_200ep.pt \
-    --frames      data/wt_2bead.pt \
-    --tau         2 \
-    --steps       2500 \
-    --min_energy \
-    --k_clash     5.0 \
-    --sample_mode explore \
-    --out         genmd_explore
-```
-
-In **explore** mode, invalid frames (bond violations, steric clashes, Rg outliers) are rejected and the trajectory reverts to the last valid frame. This prevents runaway unfolding while still allowing wide conformational search. Expect RMSD of 15–30 Å from the starting frame over 1 μs.
-
-### Mimic mode (reproduce MD ensemble)
+### Run A — 2-bead mimic, 1 μs (MD-faithful reference)
 
 ```bash
 python scripts/generate_md.py \
@@ -250,32 +236,62 @@ python scripts/generate_md.py \
     --k_clash     5.0 \
     --sample_mode mimic \
     --anchor_every 50 \
-    --out         genmd_mimic
+    --out         run_a_2bead_mimic_1us
 ```
 
-In **mimic** mode, every `--anchor_every` steps the current conformation is replaced by the nearest real MD frame (by CA-RMSD). This keeps the trajectory inside the training distribution. Expect RMSD of 5–10 Å and RMSF of 3–5 Å — comparable to classical MD — at 2000× the speed.
+Re-anchors to the nearest real MD frame every 50 steps. Stays inside the training distribution. Expected: RMSD ~8 Å, RMSF ~3.5 Å, ~87% valid steps, **580×** speedup.
 
-### Ensemble of chains
+### Run B — 2-bead explore ensemble, 1 μs × 4 chains (conformational sampling)
 
 ```bash
 python scripts/generate_md.py \
     --checkpoint  checkpoints/wt_2bead_200ep.pt \
     --frames      data/wt_2bead.pt \
-    --tau         2 \
-    --steps       500 \
+    --tau         5 \
+    --steps       1000 \
     --n_chains    4 \
     --min_energy \
     --k_clash     5.0 \
+    --sample_mode explore \
+    --out         run_b_2bead_explore_ensemble
+```
+
+Larger lag (τ=5, 1 ns/step) and 4 independent chains for maximum conformational diversity. Reverts to last valid frame on structural failure to prevent runaway unfolding. Expected: RMSD ~23 Å, RMSF ~14 Å, **1640×** speedup.
+
+### Run C — 4-bead mimic, 200 ns (full backbone geometry)
+
+```bash
+python scripts/generate_md.py \
+    --checkpoint  checkpoints/wt_4bead_200ep.pt \
+    --frames      data/wt_4bead.pt \
+    --tau         2 \
+    --steps       500 \
+    --n_chains    1 \
+    --min_energy \
+    --k_clash     5.0 \
     --sample_mode mimic \
     --anchor_every 50 \
-    --out         genmd_ensemble
+    --out         run_c_4bead_mimic_200ns
 ```
+
+Generates N/Cα/C/Cβ for every residue, enabling per-residue Kabsch grafting during all-atom reconstruction. Expected: RMSD ~7 Å, RMSF ~3.5 Å, **1180×** speedup. Note: φ/ψ angles from the Cartesian model are unreliable (~69% Ramachandran outliers); use 2-bead reconstruction for dihedral analysis.
 
 **Output:**
 - `<out>/trajectory.pdb` — multi-MODEL PDB, all chains concatenated
 - `<out>/chain_<k>.pdb` — per-chain multi-MODEL PDB
 - `<out>/metrics.json` — RMSD, RMSF, displacement, validity per step
 - `<out>/timing_report.txt` — wall-clock time and speedup estimate
+
+**Validity reporting** — each step is checked for:
+
+| Check | Criterion | Notes |
+|---|---|---|
+| Bond geometry | All bead-bead bonds within ±20% of ideal length | CA–CA 3.8 Å; N–CA 1.46 Å; CA–C 1.52 Å etc. |
+| Steric clashes | No non-bonded heavy-atom pair < 2.0 Å | Gly Cβ = Cα position is correctly excluded |
+| Radius of gyration | Rg within 0.5×–2.0× of expected (2.2 × P^0.38 Å) | Detects complete unfolding |
+| Ramachandran (4-bead only) | < 5% residues outside allowed φ/ψ regions | ~97% of real MD frames pass at this threshold |
+
+All four must pass for a step to be counted as valid.
 
 All `generate_md.py` flags:
 
@@ -312,14 +328,30 @@ python scripts/reconstruct.py \
 
 **Strategy by bead mode:**
 
-- **4-bead**: Per-residue Kabsch superposition of the template backbone (N, Cα, C) onto the generated backbone rotates deep sidechain atoms (Cγ, Cδ, …) into the correct local frame. Backbone atoms and Cβ are set directly from generated coordinates. Carbonyl O is placed from peptide-plane geometry (C=O = 1.229 Å).
-- **2-bead / CA**: Each residue is translated rigidly by (Cα_gen − Cα_template), preserving the template rotamer in the global frame.
+- **4-bead**: Per-residue Kabsch superposition of template backbone (N, Cα, C) onto generated backbone rotates deep sidechain atoms (Cγ, Cδ, …) into the correct local frame. N, Cα, C, Cβ are set from generated coordinates; carbonyl O is placed from peptide-plane geometry (C=O = 1.229 Å). Backbone φ/ψ quality reflects the generated coordinates.
+- **2-bead / CA**: Finds the nearest real MD frame by Cα-RMSD, then translates each residue rigidly by (Cα_gen − Cα_template). Backbone geometry (including φ/ψ) comes from the template — Ramachandran plots will be high quality.
 
 **Output:** `allatom.pdb` — multi-MODEL PDB, protein heavy atoms only (no H, no solvent).
 
 ```bash
+# 2-bead trajectory → high-quality backbone dihedrals
+python scripts/reconstruct.py \
+    --beads      run_a_2bead_mimic_1us/trajectory.pdb \
+    --traj       WT/WT-sol6.trr \
+    --top        WT/WT-sol6.gro \
+    --checkpoint checkpoints/wt_2bead_200ep.pt \
+    --out        run_a_2bead_mimic_1us/allatom.pdb
+
+# 4-bead trajectory → per-residue Kabsch sidechain grafting
+python scripts/reconstruct.py \
+    --beads      run_c_4bead_mimic_200ns/trajectory.pdb \
+    --traj       WT/WT-sol6.trr \
+    --top        WT/WT-sol6.gro \
+    --checkpoint checkpoints/wt_4bead_200ep.pt \
+    --out        run_c_4bead_mimic_200ns/allatom.pdb
+
 # Visualize in PyMOL
-pymol genmd_mimic/allatom.pdb
+pymol run_a_2bead_mimic_1us/allatom.pdb
 ```
 
 ---
@@ -343,15 +375,17 @@ This trains a CA-DDPM and writes 8 sampled future conformations to `demo_out/`.
 
 ## Expected Results
 
-Benchmarked on a 169-residue protein, 5001-frame trajectory (1 μs classical MD at 200 ps/frame), 2-bead model, 200 epochs:
+Benchmarked on a 169-residue protein, 5001-frame trajectory (1 μs classical MD at 200 ps/frame), 200 epochs. All runs use `--min_energy --k_clash 5.0`.
 
-| Mode | Steps | Final RMSD | Mean RMSF | Valid steps | Speedup |
-|---|---|---|---|---|---|
-| mimic (anchor_every=50) | 2500 (1 μs) | ~8 Å | ~3.5 Å | ~87% | **2300×** |
-| explore | 2500 (1 μs) | ~26 Å | ~14 Å | ~88% | 600× |
-| classical MD reference | — | — | ~2 Å | 100% | 1× |
+| Run | Model | Mode | τ | Steps | Final RMSD | RMSF | Valid steps | Speedup |
+|---|---|---|---|---|---|---|---|---|
+| A | 2-bead | mimic (anchor=50) | 2 | 2500 (1 μs) | ~8 Å | ~3.5 Å | ~87% | **580×** |
+| B | 2-bead | explore, 4 chains | 5 | 1000 (1 μs) | ~23 Å | ~14 Å | ~86% | 1640× |
+| C | 4-bead | mimic (anchor=50) | 2 | 500 (200 ns) | ~7 Å | ~3.5 Å | 0%* | 1180× |
+| — | classical MD | — | — | — | — | ~2 Å | 97%† | 1× |
 
-Mimic mode reproduces the MD flexibility profile (RMSF 3.5 Å vs ~2 Å in MD) while running 2300× faster. Explore mode samples far beyond the training distribution, useful for finding novel conformations.
+\* Run C validity is 0% due to poor Ramachandran geometry — a known limitation of the 4-bead Cartesian model. Bond and clash checks pass cleanly; only φ/ψ angles fail.  
+† 97% of real MD frames pass the 4-bead validity check at the 5% Ramachandran threshold.
 
 ---
 
