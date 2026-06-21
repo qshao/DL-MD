@@ -357,4 +357,7 @@ def build_training_example(frames, i, tau_frames, k):
         "edge_feats": edge_feats,
         "u_target": u_target,
         "tau": float(tau_frames) * float(frames["dt"]),
+        "R_cur": R_i,
+        "t_cur": t_i,
+        "chain_id": frames["chain_id"],
     }

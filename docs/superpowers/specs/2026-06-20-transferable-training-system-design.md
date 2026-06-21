@@ -304,3 +304,24 @@ ATLAS entry ──atlas.py──> data/atlas/<pdbid>.pt  (fixed-vocab res_type v
 3. **Plan 4** — C1 soft losses (`physics_loss.py`) → C2 energy guidance
    (`guidance.py`); C3 design only. *Deliverable: improved geometry validity,
    RMSF correlation not regressed.*
+
+---
+
+#### C3 — learned energy / Boltzmann targeting (design)
+
+**Aim:** move beyond hand-weighted geometric penalties toward samples that
+approach the equilibrium Boltzmann distribution of the reference MD.
+
+**Hook:** the `StructuralEncoder` context (Plan 3) is the natural feature for an
+energy head `E_θ(context, u) -> scalar`. Two candidate objectives, to be
+bracketed against the C1/C2 baseline before any build:
+1. **Energy matching** — regress `E_θ` to the differentiable geometric energy on
+   training updates, then use `∇_u E_θ` as a learned guidance field in C2,
+   replacing the fixed `geometric_penalty` (cheaper, smoother, learns terms not
+   hand-coded).
+2. **Boltzmann reweighting** — weight the DDPM score loss by `exp(−E/kT)` density
+   ratios estimated from the corpus, nudging the marginal toward equilibrium.
+
+**Risk:** highest of the three stages (training stability, density estimation).
+**Gate:** only build if C1+C2 land and the zero-shot RMSF correlation / ensemble
+metrics justify the added complexity. No implementation in v1.
