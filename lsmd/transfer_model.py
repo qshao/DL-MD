@@ -1,0 +1,147 @@
+"""Union-graph propagator network for transferable protein dynamics.
+
+Operates on a flat disjoint-union graph ([ΣN, ...] nodes + a batch vector),
+so multiple proteins of different sizes train in one forward pass. Predicts a
+per-residue SE(3) local update via DDPM epsilon-prediction, conditioned on the
+current-state graph and physical lag tau.
+"""
+import torch
+import torch.nn as nn
+from lsmd.model import tau_embedding
+
+
+def _scatter_mean(src, index, dim_size):
+    """Mean of `src` rows grouped by `index` (0..dim_size-1)."""
+    out = torch.zeros(dim_size, *src.shape[1:], device=src.device, dtype=src.dtype)
+    out.index_add_(0, index, src)
+    cnt = torch.zeros(dim_size, device=src.device, dtype=src.dtype)
+    cnt.index_add_(0, index, torch.ones_like(index, dtype=src.dtype))
+    return out / cnt.clamp_min(1.0).reshape(-1, *([1] * (src.dim() - 1)))
+
+
+class UnionMessageLayer(nn.Module):
+    """Flat message-passing layer over a union edge_index ([ΣN, H] nodes)."""
+
+    def __init__(self, hidden, edge_dim):
+        super().__init__()
+        self.msg = nn.Sequential(
+            nn.Linear(2 * hidden + edge_dim, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+        )
+        self.upd = nn.Sequential(
+            nn.Linear(2 * hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden),
+        )
+
+    def forward(self, h, edge_index, edge_feats):
+        src, dst = edge_index                       # [E]
+        N, H = h.shape
+        msg = self.msg(torch.cat([h[src], h[dst], edge_feats], dim=-1))  # [E,H]
+        agg = torch.zeros(N, H, device=h.device, dtype=h.dtype)
+        agg.index_add_(0, dst, msg)
+        deg = torch.zeros(N, 1, device=h.device, dtype=h.dtype)
+        deg.index_add_(0, dst, torch.ones(dst.shape[0], 1, device=h.device, dtype=h.dtype))
+        agg = agg / deg.clamp_min(1.0)
+        return h + self.upd(torch.cat([h, agg], dim=-1))
+
+
+class PropagatorNet(nn.Module):
+    """DDPM epsilon-predictor over a union graph."""
+
+    def __init__(self, node_dim=24, edge_dim=13, hidden=128, layers=4,
+                 tau_emb_dim=16, point_dim=6):
+        super().__init__()
+        self.tau_emb_dim = tau_emb_dim
+        self.point_dim = point_dim
+        self.embed = nn.Linear(node_dim + point_dim + 1 + tau_emb_dim, hidden)
+        self.layers = nn.ModuleList(
+            [UnionMessageLayer(hidden, edge_dim) for _ in range(layers)]
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, point_dim),
+        )
+
+    def forward(self, u, s, node_feats, edge_index, edge_feats, tau, batch):
+        """Predict per-node epsilon.
+
+        Args:
+            u:          [ΣN, point_dim] noisy update.
+            s:          [G] flow-time per graph.
+            node_feats: [ΣN, node_dim]
+            edge_index: [2, ΣE] (union indices)
+            edge_feats: [ΣE, edge_dim]
+            tau:        [G] physical lag (ps) per graph.
+            batch:      [ΣN] long, node→graph.
+
+        Returns:
+            [ΣN, point_dim]
+        """
+        s = torch.as_tensor(s, dtype=u.dtype, device=u.device)
+        s_nodes = s[batch].unsqueeze(-1)                       # [ΣN,1]
+        tau_emb = tau_embedding(tau, dim=self.tau_emb_dim,
+                                device=u.device, dtype=u.dtype)  # [G, tau_dim]
+        tau_nodes = tau_emb[batch]                             # [ΣN, tau_dim]
+        h = self.embed(torch.cat([node_feats, u, s_nodes, tau_nodes], dim=-1))
+        for layer in self.layers:
+            h = layer(h, edge_index, edge_feats)
+        return self.head(h)
+
+
+def ddpm_loss_union(net, u_target, node_feats, edge_index, edge_feats, tau,
+                    batch, schedule, graph_weights=None):
+    """DDPM epsilon-prediction loss over a union batch.
+
+    Each graph gets its own noise level; per-graph node-mean losses are then
+    averaged (optionally weighted) so large proteins don't dominate.
+    """
+    G = tau.shape[0]
+    T = schedule.T
+    t_min = max(1, T // 20)
+    t_idx = torch.randint(t_min, T + 1, (G,), device=u_target.device)   # [G]
+    t_nodes = t_idx[batch]                                              # [ΣN]
+    eps = torch.randn_like(u_target)
+
+    sqrt_ab = schedule.sqrt_alphas_bar[t_nodes].to(u_target.dtype).unsqueeze(-1)
+    sqrt_1mab = schedule.sqrt_one_minus_alphas_bar[t_nodes].to(u_target.dtype).unsqueeze(-1)
+    noisy = sqrt_ab * u_target + sqrt_1mab * eps
+
+    s = (t_idx.float() / T).to(u_target.dtype)                         # [G]
+    pred = net(noisy, s, node_feats, edge_index, edge_feats, tau, batch)
+
+    node_se = ((pred - eps) ** 2).mean(dim=-1)                         # [ΣN]
+    per_graph = _scatter_mean(node_se, batch, G)                       # [G]
+    if graph_weights is not None:
+        w = graph_weights.to(per_graph)
+        return (w * per_graph).mean()
+    return per_graph.mean()
+
+
+@torch.no_grad()
+def sample_ddpm_union(net, node_feats, edge_index, edge_feats, tau, batch,
+                      schedule, steps=50, eta=1.0, sigma_init=1.0):
+    """Reverse-diffusion sampler over a union graph (one update per node)."""
+    T = schedule.T
+    N = node_feats.shape[0]
+    device, dtype = node_feats.device, node_feats.dtype
+    u = torch.randn(N, net.point_dim, device=device, dtype=dtype) * sigma_init
+
+    t_full = torch.round(torch.linspace(T - 1, 0, steps + 1, device=device)).long().clamp(0, T - 1)
+    for i in range(steps):
+        t = t_full[i].item()
+        t_prev = t_full[i + 1].item()
+        s = torch.full((tau.shape[0],), t / T, dtype=dtype, device=device)   # [G]
+        eps_pred = net(u, s, node_feats, edge_index, edge_feats, tau, batch)
+
+        sqrt_ab_t = schedule.sqrt_alphas_bar[t].to(dtype)
+        sqrt_1mab_t = schedule.sqrt_one_minus_alphas_bar[t].to(dtype)
+        ab_prev = schedule.alphas_bar[t_prev].to(dtype)
+        ab_t = schedule.alphas_bar[t].to(dtype)
+
+        u0_hat = (u - sqrt_1mab_t * eps_pred) / sqrt_ab_t.clamp_min(1e-8)
+        pv = (1 - ab_prev) / (1 - ab_t).clamp_min(1e-8) * (1 - ab_t / ab_prev.clamp_min(1e-8))
+        sigma_t = eta * pv.clamp_min(0.0).sqrt()
+        dir_coeff = (1 - ab_prev - sigma_t ** 2).clamp_min(0.0).sqrt()
+        z = torch.randn_like(u) if t_prev > 0 else torch.zeros_like(u)
+        u = ab_prev.sqrt() * u0_hat + dir_coeff * eps_pred + sigma_t * z
+    return u
