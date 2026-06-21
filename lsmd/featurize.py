@@ -205,3 +205,44 @@ def ca_graph(X, k):
     dist = rel_pos.norm(dim=-1, keepdim=True)        # [E,1]
     edge_feats = torch.cat([rel_pos, dist], dim=-1)  # [E,4]
     return edge_index, edge_feats
+
+
+from lsmd.vocab import N_AA_TYPES
+
+
+def frame_graph(R, t, k):
+    """kNN graph + invariant edge features from the CURRENT frames.
+
+    State-conditional: the graph is rebuilt from (R, t) at the current step,
+    so the network sees local geometry as it actually is.
+
+    Args:
+        R: per-residue rotations [N, 3, 3]
+        t: per-residue translations (CA positions) [N, 3]
+        k: neighbours per node.
+
+    Returns:
+        edge_index [2, E], edge_feats [E, 13] = [rel_pos(3), dist(1), rel_R(9)].
+    """
+    edge_index = knn_graph(t, k)
+    edge_feats = edge_features(R, t, edge_index)
+    return edge_index, edge_feats
+
+
+def frame_node_features(res_type, chain_id, res_index, n_types=N_AA_TYPES):
+    """Structure+AA node features: [one_hot(n_types), chain(1), PE(2)].
+
+    Args:
+        res_type:  [N] long, fixed-vocab indices 0..n_types-1.
+        chain_id:  [N] long.
+        res_index: [N] long, sequential residue index.
+        n_types:   vocabulary size (default N_AA_TYPES = 21).
+
+    Returns:
+        [N, n_types + 3] float tensor.
+    """
+    rt = F_nn.one_hot(res_type, num_classes=n_types).float()
+    ch = chain_id.float().unsqueeze(-1)
+    pos = res_index.float().unsqueeze(-1)
+    pe = torch.cat([torch.sin(pos / 100.0), torch.cos(pos / 100.0)], dim=-1)
+    return torch.cat([rt, ch, pe], dim=-1)
