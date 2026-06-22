@@ -1,6 +1,6 @@
 import math
 import torch
-from lsmd.learned_energy import LearnedCGEnergy, score_matching_loss, inverse_density_weights
+from lsmd.learned_energy import LearnedCGEnergy, score_matching_loss, inverse_density_weights, langevin_sample
 from lsmd import cg_energy as cge
 
 
@@ -91,3 +91,22 @@ def test_inverse_density_weights_upweight_sparse():
     assert w.shape == (105,)
     assert w[100:].mean() > w[:100].mean()      # sparse outliers up-weighted
     assert (w >= 1.0 / 50.0).all() and (w <= 50.0).all()
+
+
+def test_langevin_recovers_harmonic_statistics():
+    # U = 0.5*k*||t - c||^2  → stationary p(t) is Gaussian, mean c, var kT/k
+    k, kT = 2.0, 1.0
+    c = torch.tensor([3.0, -1.0, 0.0])
+
+    class Harmonic(torch.nn.Module):
+        def forward(self, t, res_type, chain_id):
+            return 0.5 * k * ((t - c) ** 2).sum()
+
+    torch.manual_seed(0)
+    t0 = torch.zeros(1, 3)
+    rt = torch.zeros(1, dtype=torch.long); cid = torch.zeros(1, dtype=torch.long)
+    samples = langevin_sample(Harmonic(), t0, rt, cid,
+                              n_steps=20000, dt=5e-3, kT=kT, stride=5)
+    flat = samples.reshape(-1, 3)
+    assert torch.allclose(flat.mean(0), c, atol=0.2)
+    assert abs(float(flat.var(0).mean()) - kT / k) < 0.15

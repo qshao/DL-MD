@@ -86,3 +86,23 @@ def inverse_density_weights(cv, *, bins=30, clip=10.0):
     w = 1.0 / counts[flat]                              # inverse density
     w = w / w.mean()
     return w.clamp(1.0 / clip, clip).to(torch.float32)
+
+
+def langevin_sample(energy, t0, res_type, chain_id, *,
+                    n_steps=2000, dt=1e-3, kT=0.593, stride=10):
+    """Overdamped Langevin sampling from p ∝ exp(-U/kT) (γ = 1, reduced units).
+
+    Update: x ← x - dt·∇U(x) + sqrt(2·kT·dt)·N(0, I).
+    Returns the collected samples [S, N, 3] (one every `stride` steps).
+    """
+    t = t0.clone()
+    samples = []
+    noise_scale = (2.0 * kT * dt) ** 0.5
+    for step in range(n_steps):
+        t = t.detach().requires_grad_(True)
+        U = energy(t, res_type, chain_id)
+        grad = torch.autograd.grad(U, t)[0]
+        t = (t - dt * grad + noise_scale * torch.randn_like(t)).detach()
+        if step % stride == 0:
+            samples.append(t.clone())
+    return torch.stack(samples, dim=0)
