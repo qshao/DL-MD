@@ -1,5 +1,5 @@
 import torch
-from lsmd.physics_loss import energy_match_loss
+from lsmd.physics_loss import energy_match_loss, fdt_loss
 from lsmd.learned_energy import LearnedCGEnergy
 from lsmd import geometry as g
 
@@ -40,4 +40,27 @@ def test_energy_match_positive_for_clashing_prediction():
     u_cut = -10.0                        # low ceiling so the hinge activates
     loss = energy_match_loss(R, t, u, res_type, protein_id, chain_id, energy,
                              u_cut=u_cut)
+    assert float(loss) > 0.0
+
+
+def test_fdt_loss_zero_when_variance_matches_target():
+    N = 200
+    protein_id = torch.zeros(N, dtype=torch.long)
+    torch.manual_seed(0)
+    s2 = 0.09
+    u = torch.zeros(N, 6)
+    u[:, :3] = torch.randn(N, 3) * (s2 ** 0.5)   # translational variance ≈ s2
+    target = torch.tensor([u[:, :3].pow(2).mean()])   # exact per-protein target
+    loss = fdt_loss(u, protein_id, target)
+    assert float(loss) < 1e-6
+
+
+def test_fdt_loss_positive_when_diffusion_too_fast():
+    N = 200
+    protein_id = torch.zeros(N, dtype=torch.long)
+    torch.manual_seed(0)
+    u = torch.zeros(N, 6)
+    u[:, :3] = torch.randn(N, 3) * 1.0            # large step variance
+    target = torch.tensor([0.01])                  # MD is much slower
+    loss = fdt_loss(u, protein_id, target)
     assert float(loss) > 0.0

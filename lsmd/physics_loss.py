@@ -215,3 +215,28 @@ def energy_match_loss(R_cur, t_cur, u_denorm, res_type, protein_id, chain_id,
             u_tru = energy(t_true[m], rt, cid).detach() / max(n, 1)
             total = total + w_lo * torch.relu(u_pred - u_tru)
     return total / max(pids.numel(), 1)
+
+
+def fdt_loss(u_denorm, protein_id, sigma_md_tau):
+    """Fluctuation-dissipation step-variance matching (Phase 3 Stage 2).
+
+    Matches the per-protein translational step variance of the predicted update
+    to the MD one-step displacement variance at the same lag τ. Because
+    apply_update gives t_f = R·local_trans + t and R is orthogonal, the CA
+    displacement variance equals Var(u_denorm[:, :3]).
+
+    Args:
+        u_denorm:     [ΣN,6] de-normalized predicted update.
+        protein_id:   [ΣN] per-protein id.
+        sigma_md_tau: [G] MD target variances, aligned to sorted unique pids.
+    Returns:
+        scalar tensor (mean squared error over proteins).
+    """
+    pids = protein_id.unique()                      # sorted ascending
+    total = u_denorm.new_zeros(())
+    for gi, pid in enumerate(pids):
+        m = protein_id == pid
+        var_model = u_denorm[m][:, :3].pow(2).mean()
+        var_target = sigma_md_tau[gi].to(var_model.dtype).to(var_model.device)
+        total = total + (var_model - var_target) ** 2
+    return total / max(pids.numel(), 1)
