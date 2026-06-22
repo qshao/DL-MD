@@ -51,3 +51,22 @@ def radius_of_gyration(ca):
 def rg_distribution_js(ca_model, ca_md, bins=30):
     """JS divergence between the two radius-of-gyration distributions ([0, 1])."""
     return _hist_js(radius_of_gyration(ca_model), radius_of_gyration(ca_md), bins)
+
+
+def shared_pca(ca_ref, n_components=2):
+    """PCA basis from a reference ensemble.
+
+    ca_ref: [F, N, 3]. Returns (mean [N*3], components [n_components, N*3]).
+    Use the same basis to project both ensembles into a shared CV space.
+    """
+    F, N, _ = ca_ref.shape
+    X = ca_ref.reshape(F, N * 3).double()
+    mean = X.mean(dim=0)
+    _, _, Vh = torch.linalg.svd(X - mean, full_matrices=False)
+    return mean, Vh[:n_components]
+
+
+def project_cv(ca, mean, components):
+    """Project [F, N, 3] onto the PCA basis -> [F, n_components]."""
+    X = ca.reshape(ca.shape[0], -1).double()
+    return (X - mean) @ components.T
