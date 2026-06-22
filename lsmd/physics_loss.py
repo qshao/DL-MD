@@ -94,9 +94,14 @@ def collate_physics(examples):
     Returns:
         R_cur [ΣN,3,3], t_cur [ΣN,3],
         global_chain [ΣN]  — graph_idx*10_000 + chain_id, unique per chain,
-        protein_id   [ΣN]  — graph_idx, unique per protein (used for clash).
+        protein_id   [ΣN]  — graph_idx, unique per protein (used for clash),
+        res_type     [ΣN]  — canonical residue type indices,
+        chain_id     [ΣN]  — local chain id within each protein,
+        u_cut        [G]   — per-protein energy ceiling (Phase 3; 0.0 if absent),
+        sigma_md_tau [G]   — per-protein MD step variance (Phase 3; 0.0 if absent).
     """
     R_cur, t_cur, chains, pids = [], [], [], []
+    res_types, local_chains, u_cuts, sig_taus = [], [], [], []
     for gi, ex in enumerate(examples):
         R_cur.append(ex["R_cur"])
         t_cur.append(ex["t_cur"])
@@ -107,12 +112,23 @@ def collate_physics(examples):
                 f"got max={int(cid.max())} in example {gi}"
             )
         chains.append(gi * 10_000 + cid)
+        local_chains.append(cid)
         pids.append(torch.full((cid.shape[0],), gi, dtype=torch.long))
+        rt = ex.get("res_type")
+        if rt is None:
+            rt = torch.zeros(cid.shape[0], dtype=torch.long)
+        res_types.append(rt.long())
+        u_cuts.append(float(ex.get("u_cut", 0.0)))
+        sig_taus.append(float(ex.get("sigma_md_tau", 0.0)))
     return {
         "R_cur": torch.cat(R_cur, dim=0),
         "t_cur": torch.cat(t_cur, dim=0),
         "global_chain": torch.cat(chains, dim=0),
         "protein_id": torch.cat(pids, dim=0),
+        "res_type": torch.cat(res_types, dim=0),
+        "chain_id": torch.cat(local_chains, dim=0),
+        "u_cut": torch.tensor(u_cuts),
+        "sigma_md_tau": torch.tensor(sig_taus),
     }
 
 
@@ -174,6 +190,35 @@ def ddpm_physics_loss(net, union, physics, scale, schedule, *, rama_pot=None,
                             rama_pot=rama_pot, w_bond=w_bond, w_clash=w_clash,
                             w_rama=w_rama)
     return score_loss + lam * pen
+
+
+def recover_u_denorm(net, union, scale, schedule):
+    """Return (u0_hat, u_denorm): the model's clean-update estimate and its
+    de-normalized form, for use by the Phase 3 energy/FDT terms.
+
+    Samples a fresh random diffusion timestep (independent of ddpm_physics_loss)
+    and uses the score network to recover the clean update estimate x0_hat, then
+    de-normalizes by scale. The physics terms act on the clean estimate, not the
+    score, so an independent noise draw is acceptable.
+    """
+    scale_dev = scale.to(device=union["u_target"].device)
+    u_target = union["u_target"] / scale_dev
+    batch = union["batch"].to(u_target.device)
+    G = union["tau"].shape[0]
+    T = schedule.T
+    t_min = max(1, T // 20)
+    t_idx = torch.randint(t_min, T + 1, (G,), device=u_target.device)
+    t_nodes = t_idx[batch]
+    eps = torch.randn_like(u_target)
+    sqrt_ab = schedule.sqrt_alphas_bar[t_nodes].to(u_target.dtype).unsqueeze(-1)
+    sqrt_1mab = schedule.sqrt_one_minus_alphas_bar[t_nodes].to(u_target.dtype).unsqueeze(-1)
+    noisy = sqrt_ab * u_target + sqrt_1mab * eps
+    s = (t_idx.float() / T).to(u_target.dtype)
+    pred = net(noisy, s, union["node_feats"], union["edge_index"],
+               union["edge_feats"], union["tau"], batch,
+               temp_K=union.get("temp_K"))
+    u0_hat = (noisy - sqrt_1mab * pred) / sqrt_ab.clamp_min(1e-8)
+    return u0_hat, u0_hat * scale_dev
 
 
 def energy_match_loss(R_cur, t_cur, u_denorm, res_type, protein_id, chain_id,
