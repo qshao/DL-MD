@@ -128,6 +128,7 @@ def test_total_cg_energy_w_mj_zero():
     chain_id = torch.zeros(N, dtype=torch.long)
     E_full  = total_cg_energy(t, res_type, chain_id, w_mj=1.0, w_wca=0.0)
     E_nomj  = total_cg_energy(t, res_type, chain_id, w_mj=0.0, w_wca=0.0)
-    # Both should equal the angle energy
+    # Wide spacing → no MJ contacts, so w_mj=1.0 and w_mj=0.0 produce the same result
     angle_E = angle_energy(t, chain_id)
     assert abs(float(E_nomj) - float(angle_E)) < 1e-4
+    assert abs(float(E_full) - float(angle_E)) < 1e-4
