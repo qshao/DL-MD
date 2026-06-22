@@ -19,7 +19,7 @@ _METRICS = [
 
 def _mean(proteins, section, key):
     vals = [p[section][key] for p in proteins.values()
-            if p[section].get(key) is not None]
+            if (p.get(section) or {}).get(key) is not None]
     return sum(vals) / len(vals) if vals else None
 
 
@@ -49,7 +49,7 @@ def main():
 
     header = f"{'Metric':<14}" + "".join(f"{n:>{W}}" for n in names)
     if len(loaded) > 1:
-        header += "".join(f"{'Δvs-' + names[0]:>{W}}" for n in names[1:])
+        header += "".join(f"{'Δ' + n:>{W}}" for n in names[1:])
     print(header)
     print("-" * len(header))
 

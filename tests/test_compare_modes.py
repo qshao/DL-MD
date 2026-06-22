@@ -1,5 +1,4 @@
 import json, subprocess, sys
-import pytest
 
 
 def test_compare_modes_runs(tmp_path):
@@ -39,4 +38,4 @@ def test_compare_modes_runs(tmp_path):
     # Mode B relax_ratio is null → "null" in output
     assert "null" in result.stdout
     # Mode A improved relax_ratio: 1.33 → 0.9 → negative delta
-    assert "-" in result.stdout
+    assert any("-" in line for line in result.stdout.splitlines() if "relax_ratio" in line)
