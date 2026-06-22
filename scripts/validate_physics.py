@@ -51,11 +51,14 @@ def build_report(ckpt, shard_paths, settings, device):
             bond_constraint_iters=settings["bond_constraint_iters"],
             max_update_norm=settings["max_update_norm"],
             wca_sigma=settings["wca_sigma"], wca_eps=settings["wca_eps"],
-            wca_lam=settings["wca_lam"], device=device).cpu()
+            wca_lam=settings["wca_lam"],
+            noether=settings.get("noether", False),
+            device=device).cpu()
         rep = tv.validate(traj, shard["t"].float(),
                           tau_ps=settings["tau_ps"], dt_md_ps=float(shard["dt"]),
                           kT=settings["kT"], n_states=settings["n_states"])
         rep["n_res"] = int(shard["n_res"])
+        rep["reweight"] = None
         proteins[_protein_id(path)] = rep
     return proteins
 
@@ -89,6 +92,8 @@ def main():
     ap.add_argument("--wca_lam", type=float, default=0.05)
     ap.add_argument("--bond_constraint_iters", type=int, default=5)
     ap.add_argument("--max_update_norm", type=float, default=3.0)
+    ap.add_argument("--noether", action="store_true", default=False,
+                    help="Apply Noether momentum projection after each step (Mode A).")
     ap.add_argument("--n_states", type=int, default=6)
     ap.add_argument("--kT", type=float, default=1.0)
     ap.add_argument("--out", default="validation_baseline.json")
@@ -102,7 +107,7 @@ def main():
         "wca_sigma": args.wca_sigma, "wca_eps": args.wca_eps,
         "wca_lam": args.wca_lam, "bond_constraint_iters": args.bond_constraint_iters,
         "max_update_norm": args.max_update_norm, "n_states": args.n_states,
-        "kT": args.kT,
+        "kT": args.kT, "noether": args.noether,
     }
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     proteins = build_report(ckpt, args.shards, settings, device)
