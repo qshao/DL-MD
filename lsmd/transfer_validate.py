@@ -39,3 +39,15 @@ def curve_rmse(time_a, val_a, time_b, val_b, n=50):
     a = interp_to_grid(time_a, val_a, grid)
     b = interp_to_grid(time_b, val_b, grid)
     return torch.sqrt(((a - b) ** 2).mean()).item()
+
+
+def radius_of_gyration(ca):
+    """Per-frame radius of gyration. ca: [F, N, 3] -> [F]."""
+    centroid = ca.mean(dim=1, keepdim=True)            # [F, 1, 3]
+    sq = ((ca - centroid) ** 2).sum(dim=-1)            # [F, N]
+    return sq.mean(dim=1).sqrt()                       # [F]
+
+
+def rg_distribution_js(ca_model, ca_md, bins=30):
+    """JS divergence between the two radius-of-gyration distributions ([0, 1])."""
+    return _hist_js(radius_of_gyration(ca_model), radius_of_gyration(ca_md), bins)
