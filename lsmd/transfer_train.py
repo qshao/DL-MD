@@ -373,19 +373,22 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
                 phys = {kk: vv.to(device)
                         for kk, vv in pl.collate_physics(group).items()}
                 loss = pl.ddpm_physics_loss(net, b_dev, phys, scale,
-                                            schedule, lam=lam_t)
-                if energy is not None and (lam_e > 0.0 or lam_f > 0.0):
-                    _, u_denorm = pl.recover_u_denorm(net, b_dev, scale, schedule)
-                    if lam_e > 0.0:
-                        loss = loss + lam_e * pl.energy_match_loss(
-                            phys["R_cur"], phys["t_cur"], u_denorm,
-                            phys["res_type"], phys["protein_id"], phys["chain_id"],
-                            energy, u_cut=float(phys["u_cut"].mean()),
-                            u_denorm_target=b_dev["u_target"], w_hi=w_hi, w_lo=w_lo)
-                    if lam_f > 0.0:
-                        loss = loss + lam_f * pl.fdt_loss(
-                            u_denorm, phys["protein_id"], phys["sigma_md_tau"])
-                loss = loss / accum
+                                            schedule, lam=lam_t) / accum
+        # Energy/FDT losses computed in float32 (outside autocast) to avoid
+        # WCA overflow: at r≈0 the WCA gradient is ~1e22, which overflows
+        # float16 (max 65504) → NaN in every tensor.
+        if energy is not None and (lam_e > 0.0 or lam_f > 0.0):
+            _, u_denorm = pl.recover_u_denorm(net, b_dev, scale, schedule)
+            u_denorm = u_denorm.float()
+            if lam_e > 0.0:
+                loss = loss + (lam_e / accum) * pl.energy_match_loss(
+                    phys["R_cur"].float(), phys["t_cur"].float(), u_denorm,
+                    phys["res_type"], phys["protein_id"], phys["chain_id"],
+                    energy, u_cut=float(phys["u_cut"].mean()),
+                    u_denorm_target=b_dev["u_target"].float(), w_hi=w_hi, w_lo=w_lo)
+            if lam_f > 0.0:
+                loss = loss + (lam_f / accum) * pl.fdt_loss(
+                    u_denorm, phys["protein_id"], phys["sigma_md_tau"])
         loss_val = loss.item()
         if torch.isfinite(loss):
             scaler.scale(loss).backward()
