@@ -19,7 +19,10 @@ def _wca_energy(t_pred, chain_id, sigma=4.5, eps=0.3):
         Scalar energy (differentiable w.r.t. t_pred).
     """
     N = t_pred.shape[0]
-    d = torch.cdist(t_pred, t_pred)                          # [N, N]
+    # Use manual pairwise distances instead of torch.cdist so that
+    # create_graph=True (second-order gradients) works for score-matching.
+    diff = t_pred.unsqueeze(0) - t_pred.unsqueeze(1)         # [N, N, 3]
+    d = (diff * diff).sum(-1).clamp_min(1e-8).sqrt()         # [N, N]
     idx = torch.arange(N, device=t_pred.device)
     seq_sep = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()    # [N, N]
     same_chain = (chain_id.unsqueeze(0) == chain_id.unsqueeze(1))
