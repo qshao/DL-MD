@@ -174,3 +174,44 @@ def ddpm_physics_loss(net, union, physics, scale, schedule, *, rama_pot=None,
                             rama_pot=rama_pot, w_bond=w_bond, w_clash=w_clash,
                             w_rama=w_rama)
     return score_loss + lam * pen
+
+
+def energy_match_loss(R_cur, t_cur, u_denorm, res_type, protein_id, chain_id,
+                      energy, *, u_cut, u_denorm_target=None, w_hi=1.0, w_lo=0.05):
+    """Soft, mostly one-sided energy-consistency loss (Phase 3 Stage 2).
+
+    For each protein in the union batch:
+      - hinge term  w_hi · relu(U_θ(x_pred)/N - u_cut)   penalizes ONLY
+        high-energy / unphysical predicted frames (zero below the ceiling, so
+        novel low-energy basins are free), and
+      - weak term   w_lo · relu(U_θ(x_pred)/N - U_θ(x_true)/N)  gently
+        discourages predictions higher-energy than the real MD transition.
+
+    Args:
+        R_cur, t_cur:    [ΣN,3,3], [ΣN,3] current frames.
+        u_denorm:        [ΣN,6] de-normalized predicted update.
+        res_type:        [ΣN] CANONICAL residue indices.
+        protein_id:      [ΣN] per-protein id (groups atoms; energy is per-protein).
+        chain_id:        [ΣN] local chain id within each protein.
+        energy:          frozen LearnedCGEnergy (no grad on its params).
+        u_cut:           per-residue energy ceiling (scalar; from frame_energy_cut).
+        u_denorm_target: [ΣN,6] de-normalized TRUE update (enables the weak term).
+    Returns:
+        scalar tensor (mean over proteins).
+    """
+    R_pred, t_pred = feat.apply_update(R_cur, t_cur, u_denorm)
+    if u_denorm_target is not None:
+        _, t_true = feat.apply_update(R_cur, t_cur, u_denorm_target)
+    total = t_pred.new_zeros(())
+    pids = protein_id.unique()
+    for pid in pids:
+        m = protein_id == pid
+        n = int(m.sum())
+        rt = res_type[m]
+        cid = chain_id[m]
+        u_pred = energy(t_pred[m], rt, cid) / max(n, 1)
+        total = total + w_hi * torch.relu(u_pred - u_cut)
+        if u_denorm_target is not None:
+            u_tru = energy(t_true[m], rt, cid).detach() / max(n, 1)
+            total = total + w_lo * torch.relu(u_pred - u_tru)
+    return total / max(pids.numel(), 1)
