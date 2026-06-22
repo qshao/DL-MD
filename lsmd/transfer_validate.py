@@ -242,3 +242,57 @@ def relaxation_time_ps(time_ps, acf):
     if end < 2:
         return 0.0
     return torch.trapz(acf[:end], time_ps[:end]).item()
+
+
+def validate(ca_model, ca_md, *, tau_ps, dt_md_ps, kT=1.0, n_states=6):
+    """Full kinetic + thermodynamic + structural validation report.
+
+    ca_model: [F_m, N, 3] generated CA frames (model time step = tau_ps).
+    ca_md:    [F_d, N, 3] reference MD CA frames (time step = dt_md_ps).
+
+    Returns a dict with three sub-dicts:
+        structural:    rmsf_corr, dist_js, rg_js, ca_bond_mean, clash_count
+        thermodynamic: fes_js, fes_rmse_kT, pop_tv
+        kinetic:       msd_rmse, acf_rmse, relax_model_ps, relax_md_ps, relax_ratio
+    """
+    from lsmd import validation as val
+
+    # --- structural ---
+    rmsf = val.rmsf_profile(ca_model, ca_md)
+    bonds, clashes = [], []
+    for fr in ca_model:
+        geo = val.ca_geometry(fr)
+        bonds.append(geo["ca_bond_mean"])
+        clashes.append(geo["clash_count"])
+    structural = {
+        "rmsf_corr": rmsf["corr"],
+        "dist_js": val.distance_matrix_js(ca_model, ca_md),
+        "rg_js": rg_distribution_js(ca_model, ca_md),
+        "ca_bond_mean": float(sum(bonds) / len(bonds)),
+        "clash_count": float(sum(clashes) / len(clashes)),
+    }
+
+    # --- shared CV basis (fit on MD) ---
+    mean, comps = shared_pca(ca_md, n_components=2)
+    cv_model = project_cv(ca_model, mean, comps)
+    cv_md = project_cv(ca_md, mean, comps)
+
+    # --- thermodynamic ---
+    thermo = fes_comparison(cv_model, cv_md, kT=kT)
+    thermo["pop_tv"] = state_populations(cv_model, cv_md, n_states=n_states)["pop_tv"]
+
+    # --- kinetic (shared physical time axis) ---
+    tm, mm = msd_curve(ca_model, tau_ps)
+    td, md_ = msd_curve(ca_md, dt_md_ps)
+    tam, am = cv_autocorrelation(cv_model[:, 0], tau_ps)
+    tad, ad = cv_autocorrelation(cv_md[:, 0], dt_md_ps)
+    rm = relaxation_time_ps(tam, am)
+    rd = relaxation_time_ps(tad, ad)
+    kinetic = {
+        "msd_rmse": curve_rmse(tm, mm, td, md_),
+        "acf_rmse": curve_rmse(tam, am, tad, ad),
+        "relax_model_ps": rm,
+        "relax_md_ps": rd,
+        "relax_ratio": (rm / rd) if rd > 0 else float("nan"),
+    }
+    return {"structural": structural, "thermodynamic": thermo, "kinetic": kinetic}
