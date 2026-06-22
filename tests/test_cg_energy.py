@@ -132,3 +132,59 @@ def test_total_cg_energy_w_mj_zero():
     angle_E = angle_energy(t, chain_id)
     assert abs(float(E_nomj) - float(angle_E)) < 1e-4
     assert abs(float(E_full) - float(angle_E)) < 1e-4
+
+
+# ── Reweighting tests (Task 5) ────────────────────────────────────────────────
+import math
+from unittest.mock import patch
+from lsmd import transfer_modes as tm
+import lsmd.cg_energy as cge
+
+
+def test_reweight_boltzmann_uniform():
+    """All frames equal energy → uniform weights, N_eff = F, not degenerate."""
+    F, N = 20, 4
+    # All UNK, widely spaced → E ≈ 0 for every frame
+    traj = torch.zeros(F, N, 3)
+    for i in range(F):
+        for j in range(N):
+            traj[i, j] = torch.tensor([float(j) * 50, float(i) * 50, 0.0])
+    res_type = torch.ones(N, dtype=torch.long) * 20   # UNK
+    chain_id = torch.zeros(N, dtype=torch.long)
+    result = tm.reweight_boltzmann(traj, res_type, chain_id, kT=0.593, w_wca=0.0)
+    assert result["weights"].std() < 1e-4
+    assert abs(result["n_eff"] - F) < 0.5
+    assert not result["degenerate"]
+
+
+def test_reweight_boltzmann_degenerate():
+    """Frame 0 energy -1000 kcal/mol → single dominant frame → degenerate=True."""
+    F, N = 100, 3
+    traj = torch.zeros(F, N, 3)
+    res_type = torch.zeros(N, dtype=torch.long)
+    chain_id = torch.zeros(N, dtype=torch.long)
+    call_count = [0]
+    def mock_energy(t, rt, ci, **kw):
+        i = call_count[0]; call_count[0] += 1
+        return torch.tensor(-1000.0) if i == 0 else torch.tensor(0.0)
+    with patch.object(cge, "total_cg_energy", side_effect=mock_energy):
+        result = tm.reweight_boltzmann(traj, res_type, chain_id, kT=0.593)
+    assert result["degenerate"]
+    assert result["n_eff"] < 0.1 * F
+
+
+def test_resample_trajectory_shape():
+    F, N = 80, 6
+    traj = torch.randn(F, N, 3)
+    weights = torch.ones(F) / F
+    resampled = tm.resample_trajectory(traj, weights, n_samples=50)
+    assert resampled.shape == (50, N, 3)
+
+
+def test_resample_trajectory_concentrated_weights():
+    """All weight on frame 0 → all resampled frames equal frame 0."""
+    F, N = 20, 4
+    traj = torch.randn(F, N, 3)
+    weights = torch.zeros(F); weights[0] = 1.0
+    resampled = tm.resample_trajectory(traj, weights, n_samples=10)
+    assert (resampled - traj[0]).abs().max() < 1e-6
