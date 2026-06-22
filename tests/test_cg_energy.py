@@ -187,3 +187,13 @@ def test_resample_trajectory_concentrated_weights():
     weights = torch.zeros(F); weights[0] = 1.0
     resampled = tm.resample_trajectory(traj, weights, n_samples=10)
     assert (resampled - traj[0]).abs().max() < 1e-6
+
+
+def test_wca_energy_importable_from_both_modules():
+    from lsmd.cg_energy import _wca_energy as wca_cge
+    from lsmd.transfer_eval import _wca_energy as wca_te
+    assert wca_cge is wca_te          # same object (re-export, not a copy)
+    t = torch.tensor([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [8.0, 0.0, 0.0]])
+    chain_id = torch.zeros(3, dtype=torch.long)
+    e = wca_cge(t, chain_id)
+    assert torch.isfinite(e) and e.ndim == 0

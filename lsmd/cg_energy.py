@@ -1,5 +1,40 @@
 import torch
 
+# ── Excluded-volume (WCA) energy ──────────────────────────────────────────────
+
+def _wca_energy(t_pred, chain_id, sigma=4.5, eps=0.3):
+    """Weeks–Chandler–Andersen excluded-volume energy for non-bonded CA pairs.
+
+    Only applies to pairs with sequence separation > 2 within the same chain,
+    and all cross-chain pairs. Parameterisation from CG-MD literature (CA–CA
+    contact radius ~4.5 Å, well depth ~0.3 kcal/mol ≈ 0.5 kT at 300 K).
+
+    Args:
+        t_pred:   [N, 3] predicted CA positions (differentiable).
+        chain_id: [N] long, chain assignment.
+        sigma:    WCA diameter (Å). Cutoff r_cut = 2^(1/6) * sigma ≈ 5.05 Å.
+        eps:      Well depth (kcal/mol).
+
+    Returns:
+        Scalar energy (differentiable w.r.t. t_pred).
+    """
+    N = t_pred.shape[0]
+    d = torch.cdist(t_pred, t_pred)                          # [N, N]
+    idx = torch.arange(N, device=t_pred.device)
+    seq_sep = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()    # [N, N]
+    same_chain = (chain_id.unsqueeze(0) == chain_id.unsqueeze(1))
+    # Bonded: same chain AND seq_sep ≤ 2 (already handled by SHAKE)
+    bonded = same_chain & (seq_sep <= 2)
+    non_bonded = ~bonded & (seq_sep != 0)                    # exclude self
+
+    r_cut = (2.0 ** (1.0 / 6.0)) * sigma                    # ≈ 5.05 Å
+    r = d[non_bonded].clamp_min(0.1)
+    sr6 = (sigma / r).pow(6)
+    v_wca = 4.0 * eps * (sr6 * sr6 - sr6) + eps             # [M]
+    in_range = (r < r_cut).to(v_wca.dtype)
+    return (v_wca * in_range).sum()
+
+
 # ── Angle energy ──────────────────────────────────────────────────────────────
 
 def angle_energy(t: torch.Tensor,
@@ -152,7 +187,6 @@ def total_cg_energy(t: torch.Tensor,
     Returns:
         Scalar energy in kcal/mol.
     """
-    from lsmd.transfer_eval import _wca_energy   # private; moved to cg_energy in Phase 3
     E = t.new_zeros(())
     if w_wca != 0.0:
         E = E + w_wca  * _wca_energy(t, chain_id, sigma=wca_sigma, eps=wca_eps) / 2
