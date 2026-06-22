@@ -102,6 +102,8 @@ def sample_example(shard, rng, lags_ps, k, allowed_temps=None, reverse_prob=0.0)
     reverse = reverse_prob > 0.0 and rng.random() < reverse_prob
     ex = data.build_training_example(shard, start, tau_frames, k,
                                      temp_K=temp_K, reverse=reverse)
+    if ex is None:
+        return None
     # Attach per-shard Phase 3 targets (default 0.0 so non-Phase-3 calls are unaffected)
     ex["u_cut"] = float(shard.get("_u_cut", 0.0))
     sigma_map = shard.get("_sigma_md_tau_map", {})
