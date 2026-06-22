@@ -78,6 +78,9 @@ def build_report(ckpt, shard_paths, settings, device):
 
         if settings.get("reweight", False):
             rep["kinetic"] = {k: None for k in rep["kinetic"]}
+            if rw_info and rw_info["degenerate"]:
+                rep["structural"]     = {k: None for k in rep["structural"]}
+                rep["thermodynamic"]  = {k: None for k in rep["thermodynamic"]}
 
         proteins[_protein_id(path)] = rep
     return proteins

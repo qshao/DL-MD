@@ -155,7 +155,7 @@ def total_cg_energy(t: torch.Tensor,
     from lsmd.transfer_eval import _wca_energy   # private; moved to cg_energy in Phase 3
     E = t.new_zeros(())
     if w_wca != 0.0:
-        E = E + w_wca  * _wca_energy(t, chain_id, sigma=wca_sigma, eps=wca_eps)
+        E = E + w_wca  * _wca_energy(t, chain_id, sigma=wca_sigma, eps=wca_eps) / 2
     if w_angle != 0.0:
         E = E + w_angle * angle_energy(t, chain_id, k_angle=k_angle, theta0=theta0)
     if w_mj != 0.0:

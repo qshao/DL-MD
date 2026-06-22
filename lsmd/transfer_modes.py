@@ -46,6 +46,8 @@ def resample_trajectory(traj: torch.Tensor,
     Returns:
         [n_samples, N, 3] resampled trajectory.
     """
+    if weights.sum() <= 0 or (weights < 0).any():
+        raise ValueError("resample_trajectory: weights must be non-negative with positive sum")
     idx = torch.multinomial(weights, n_samples, replacement=True)
     return traj[idx]
 
