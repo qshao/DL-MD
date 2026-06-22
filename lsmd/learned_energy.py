@@ -106,3 +106,31 @@ def langevin_sample(energy, t0, res_type, chain_id, *,
         if step % stride == 0:
             samples.append(t.clone())
     return torch.stack(samples, dim=0)
+
+
+def frame_energy_cut(energy, t, res_type, chain_id, *, pct=95.0):
+    """High-percentile per-residue energy ceiling over MD frames.
+
+    Returns the `pct`-percentile of U_θ(frame)/N across frames, so the Stage-2
+    hinge ceiling is comparable across protein sizes.
+    """
+    N = t.shape[1]
+    with torch.no_grad():
+        per = torch.tensor([float(energy(t[i], res_type, chain_id)) / max(N, 1)
+                            for i in range(t.shape[0])])
+    return float(torch.quantile(per, pct / 100.0))
+
+
+def md_step_cov(t, dt_md_ps, tau_ps):
+    """Mean per-atom, per-coordinate squared CA displacement at lag τ.
+
+    Args:
+        t:         [F, N, 3] MD CA frames.
+        dt_md_ps:  MD frame spacing (ps).
+        tau_ps:    physical lag (ps); converted to a frame lag by rounding.
+    Returns:
+        scalar float: mean over atoms/coords of Var(x_{i+lag} - x_i).
+    """
+    lag = max(1, int(round(float(tau_ps) / float(dt_md_ps))))
+    disp = t[lag:] - t[:-lag]                  # [F-lag, N, 3]
+    return float((disp ** 2).mean())

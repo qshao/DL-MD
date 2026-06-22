@@ -1,6 +1,6 @@
 import math
 import torch
-from lsmd.learned_energy import LearnedCGEnergy, score_matching_loss, inverse_density_weights, langevin_sample
+from lsmd.learned_energy import LearnedCGEnergy, score_matching_loss, inverse_density_weights, langevin_sample, frame_energy_cut, md_step_cov
 from lsmd import cg_energy as cge
 
 
@@ -110,3 +110,25 @@ def test_langevin_recovers_harmonic_statistics():
     flat = samples.reshape(-1, 3)
     assert torch.allclose(flat.mean(0), c, atol=0.2)
     assert abs(float(flat.var(0).mean()) - kT / k) < 0.15
+
+
+def test_frame_energy_cut_is_percentile_per_residue():
+    torch.manual_seed(0)
+    t = torch.randn(50, 8, 3) * 5.0
+    rt = torch.randint(0, 20, (8,)); cid = torch.zeros(8, dtype=torch.long)
+    e = LearnedCGEnergy()
+    cut95 = frame_energy_cut(e, t, rt, cid, pct=95.0)
+    cut50 = frame_energy_cut(e, t, rt, cid, pct=50.0)
+    assert isinstance(cut95, float) and cut95 >= cut50
+
+
+def test_md_step_cov_matches_known_random_walk():
+    # Brownian frames: x_{i+1} = x_i + step, step ~ N(0, s^2 I). One-step (lag=1)
+    # mean squared displacement per coordinate ≈ s^2.
+    torch.manual_seed(0)
+    s = 0.3
+    F, N = 4000, 5
+    steps = torch.randn(F, N, 3) * s
+    t = torch.cumsum(steps, dim=0)
+    var = md_step_cov(t, dt_md_ps=1.0, tau_ps=1.0)   # lag = 1 frame
+    assert abs(var - s * s) < 0.02
