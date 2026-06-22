@@ -289,10 +289,14 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
         energy = LearnedCGEnergy.load(energy_ckpt, map_location=device)
         for p in energy.parameters():
             p.requires_grad_(False)
+        edev = next(energy.parameters()).device
         for s in shards:
             s["_u_cut"] = frame_energy_cut(
-                energy, s["t"].float(), s["res_type"].long(),
-                s["chain_id"].long(), pct=95.0)
+                energy,
+                s["t"].float().to(edev),
+                s["res_type"].long().to(edev),
+                s["chain_id"].long().to(edev),
+                pct=95.0)
             s["_sigma_md_tau_map"] = {
                 float(lag): md_step_cov(s["t"].float(), float(s["dt"]), float(lag))
                 for lag in lags_ps
