@@ -12,6 +12,7 @@ from lsmd import validation as val
 from lsmd.transfer_model import PropagatorNet, sample_ddpm_union
 from lsmd.normalize import UpdateNorm
 from lsmd.model import NoiseSchedule
+from lsmd.noether import noether_project
 
 
 def load_checkpoint(ckpt, device):
@@ -139,7 +140,7 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
             *, steps, tau_ps, k, diff_steps=50, eta=1.0, temp_K=300.0,
             bond_constraint_iters=5, max_update_norm=3.0,
             wca_sigma=4.5, wca_eps=0.3, wca_lam=0.05,
-            device="cpu"):
+            noether=False, device="cpu"):
     """Autoregressive CA trajectory from a reference structure.
 
     The graph is rebuilt from current (R, t) each step (state-conditional).
@@ -232,6 +233,8 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
         if bond_constraint_iters > 0:
             t = _apply_bond_constraint(t, ref_dists, chain_id,
                                        n_iter=bond_constraint_iters)
+        if noether:
+            t = noether_project(traj[-1], t, chain_id)
         traj.append(t.clone())
 
     return torch.stack(traj, dim=0)
