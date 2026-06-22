@@ -13,11 +13,12 @@ python scripts/eval_transfer.py \\
 import argparse
 import json
 import torch
-from lsmd import geometry as g
+from lsmd import geometry as g  # for so3_exp on compact R_aa shards
 from lsmd import transfer_eval as te
 
 
-def _run(ckpt, shard, steps, tau_ps, k, diff_steps, eta, temp_K, device):
+def _run(ckpt, shard, steps, tau_ps, k, diff_steps, eta, temp_K,
+         bond_constraint_iters, max_update_norm, device):
     net, sched, norm = te.load_checkpoint(ckpt, device=device)
     k_eff = ckpt["hparams"].get("k", k)
     # support both compact (R_aa float16) and legacy (R float32) shard formats
@@ -31,6 +32,8 @@ def _run(ckpt, shard, steps, tau_ps, k, diff_steps, eta, temp_K, device):
                       shard["res_type"], shard["chain_id"], shard["res_index"],
                       steps=steps, tau_ps=tau_ps, k=k_eff,
                       diff_steps=diff_steps, eta=eta, temp_K=temp_K,
+                      bond_constraint_iters=bond_constraint_iters,
+                      max_update_norm=max_update_norm,
                       device=device)
     return te.evaluate(traj, t_md)
 
@@ -48,6 +51,13 @@ def main():
                     help="Reverse-process stochasticity: 1.0=DDPM (default), 0.0=DDIM")
     ap.add_argument("--temp_K", type=float, default=300.0,
                     help="Simulation temperature in Kelvin (default 300; used when model has temp_emb_dim > 0)")
+    ap.add_argument("--max_update_norm", type=float, default=3.0,
+                    help="Clip per-residue normalized update norm before de-normalization "
+                         "(default 3.0). Prevents rotation drift explosion. Set None to disable.")
+    ap.add_argument("--bond_constraint_iters", type=int, default=5,
+                    help="SHAKE iterations enforcing CA–CA pseudo-bond lengths after each "
+                         "diffusion step (default 5). Set 0 to disable. Prevents systematic "
+                         "bond-length expansion that causes autoregressive explosion.")
     ap.add_argument("--oracle", default=None, help="per-protein checkpoint (upper bracket)")
     ap.add_argument("--lower", default=None, help="marginal-prior checkpoint (lower bracket)")
     ap.add_argument("--out", default="eval.json")
@@ -59,15 +69,18 @@ def main():
 
     report = {"model": _run(torch.load(args.checkpoint, map_location="cpu"),
                             shard, args.steps, args.tau_ps, args.k,
-                            args.diff_steps, args.eta, args.temp_K, device)}
+                            args.diff_steps, args.eta, args.temp_K,
+                            args.bond_constraint_iters, args.max_update_norm, device)}
     if args.oracle:
         report["oracle"] = _run(torch.load(args.oracle, map_location="cpu"),
                                 shard, args.steps, args.tau_ps, args.k,
-                                args.diff_steps, args.eta, args.temp_K, device)
+                                args.diff_steps, args.eta, args.temp_K,
+                                args.bond_constraint_iters, args.max_update_norm, device)
     if args.lower:
         report["lower"] = _run(torch.load(args.lower, map_location="cpu"),
                                shard, args.steps, args.tau_ps, args.k,
-                               args.diff_steps, args.eta, args.temp_K, device)
+                               args.diff_steps, args.eta, args.temp_K,
+                               args.bond_constraint_iters, args.max_update_norm, device)
 
     with open(args.out, "w") as fh:
         json.dump(report, fh, indent=2)
