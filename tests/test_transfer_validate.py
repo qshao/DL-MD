@@ -52,3 +52,25 @@ def test_pca_projection_is_zero_mean_on_fitting_set():
     mean, comps = tv.shared_pca(base, n_components=2)
     cv = tv.project_cv(base, mean, comps)
     assert cv.mean(dim=0).abs().max() < 1e-6
+
+
+def test_fes_identical_gaussians_low_rmse():
+    torch.manual_seed(3)
+    a = torch.randn(4000, 2)
+    b = torch.randn(4000, 2)
+    out = tv.fes_comparison(a, b, bins=20)
+    assert out["fes_js"] < 0.1
+    assert out["fes_rmse_kT"] < 0.6
+
+
+def test_fes_disjoint_clouds_high_js():
+    a = torch.randn(2000, 2) * 0.2 + torch.tensor([-5.0, 0.0])
+    b = torch.randn(2000, 2) * 0.2 + torch.tensor([5.0, 0.0])
+    out = tv.fes_comparison(a, b, bins=20)
+    assert out["fes_js"] > 0.9
+
+
+def test_free_energy_surface_empty_bins_are_nan():
+    cv = torch.randn(500, 2)
+    fg, _ = tv.free_energy_surface(cv, bins=30)
+    assert torch.isnan(fg).any()
