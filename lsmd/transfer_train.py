@@ -297,6 +297,7 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
     lam_t = 0.0
     loss_acc = 0.0       # accumulated (scaled) loss for logging
     nodes_acc = 0        # nodes processed since last log
+    had_backward = False  # tracks whether any sub-batch in current accum window ran backward
     t0 = time.perf_counter()
     t_log = t0
     _prev_max_temp = _allowed_state[0] and max(_allowed_state[0])
@@ -326,28 +327,30 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
         if torch.isfinite(loss):
             scaler.scale(loss).backward()
             loss_acc += loss_val * accum  # undo the /accum to log full-step loss
-        # Non-finite loss: skip backward; gradient stays zero (or from prior valid
-        # sub-batches in this accumulation window).  Optimizer step below always runs
-        # so GradScaler state remains consistent.
+            had_backward = True
 
         if (i + 1) % accum == 0:
-            scaler.unscale_(opt)
-            if grad_clip > 0.0:
-                torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
-            # GradScaler only guards against Inf gradients (from AMP overflow), not
-            # NaN.  Explicitly zero NaN/Inf gradients so they cannot corrupt weights.
-            nan_params = 0
-            for p in net.parameters():
-                if p.grad is not None and not p.grad.isfinite().all():
-                    p.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
-                    nan_params += 1
-            if nan_params:
-                step = (i + 1) // accum
-                print(f"  [step {step}] NaN/Inf gradient in {nan_params} tensors — zeroed",
-                      flush=True)
-            scaler.step(opt)
+            if had_backward:
+                # scaler.unscale_ requires at least one scaled backward in the window;
+                # skip entirely when all sub-batches had non-finite loss to avoid the
+                # "No inf checks were recorded" assertion in PyTorch >= 2.4.
+                scaler.unscale_(opt)
+                if grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
+                # GradScaler guards against Inf (AMP overflow) but not NaN; zero both.
+                nan_params = 0
+                for p in net.parameters():
+                    if p.grad is not None and not p.grad.isfinite().all():
+                        p.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+                        nan_params += 1
+                if nan_params:
+                    step = (i + 1) // accum
+                    print(f"  [step {step}] NaN/Inf gradient in {nan_params} tensors — zeroed",
+                          flush=True)
+                scaler.step(opt)
             scaler.update()
             opt.zero_grad()
+            had_backward = False
 
             local_step = (i + 1) // accum
             step = init_step + local_step
