@@ -1,6 +1,5 @@
 import math
 import torch
-import pytest
 from lsmd.cg_energy import angle_energy
 
 
