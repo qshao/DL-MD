@@ -95,6 +95,8 @@ def langevin_sample(energy, t0, res_type, chain_id, *,
     Update: x ← x - dt·∇U(x) + sqrt(2·kT·dt)·N(0, I).
     Returns the collected samples [S, N, 3] (one every `stride` steps).
     """
+    if n_steps <= 0:
+        raise ValueError(f"langevin_sample requires n_steps >= 1, got {n_steps}")
     t = t0.clone()
     samples = []
     noise_scale = (2.0 * kT * dt) ** 0.5

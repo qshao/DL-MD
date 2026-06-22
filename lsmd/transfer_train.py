@@ -104,7 +104,13 @@ def sample_example(shard, rng, lags_ps, k, allowed_temps=None, reverse_prob=0.0)
                                      temp_K=temp_K, reverse=reverse)
     # Attach per-shard Phase 3 targets (default 0.0 so non-Phase-3 calls are unaffected)
     ex["u_cut"] = float(shard.get("_u_cut", 0.0))
-    ex["sigma_md_tau"] = float(shard.get("_sigma_md_tau", 0.0))
+    sigma_map = shard.get("_sigma_md_tau_map", {})
+    if sigma_map:
+        actual_tau_ps = tau_frames * float(shard["dt"])
+        best_lag = min(sigma_map, key=lambda k: abs(k - actual_tau_ps))
+        ex["sigma_md_tau"] = sigma_map[best_lag]
+    else:
+        ex["sigma_md_tau"] = 0.0
     # Ensure res_type is present (union node features depend on it; build_training_example
     # should already include it, but copy from shard as a fallback)
     if "res_type" not in ex:
@@ -281,13 +287,14 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
         energy = LearnedCGEnergy.load(energy_ckpt, map_location=device)
         for p in energy.parameters():
             p.requires_grad_(False)
-        tau_ps0 = float(min(lags_ps))
         for s in shards:
             s["_u_cut"] = frame_energy_cut(
                 energy, s["t"].float(), s["res_type"].long(),
                 s["chain_id"].long(), pct=95.0)
-            s["_sigma_md_tau"] = md_step_cov(
-                s["t"].float(), float(s["dt"]), tau_ps0)
+            s["_sigma_md_tau_map"] = {
+                float(lag): md_step_cov(s["t"].float(), float(s["dt"]), float(lag))
+                for lag in lags_ps
+            }
         print(f"  Energy model loaded from {energy_ckpt}; "
               f"precomputed targets for {len(shards)} shards", flush=True)
 
@@ -352,7 +359,7 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
             lam_f = pl.lambda_schedule(i // accum, phys_warmup, lam_fdt)
         with torch.autocast(device_type=device.type, enabled=use_amp):
             temp_K = b_dev.get("temp_K")
-            if lam_t == 0.0 and energy is None:
+            if lam_t == 0.0 and (energy is None or (lam_e == 0.0 and lam_f == 0.0)):
                 loss = ddpm_loss_union(net, b_dev["u_target"] / scale, node_feats,
                                        edge_index, edge_feats, tau, batch,
                                        schedule, temp_K=temp_K) / accum

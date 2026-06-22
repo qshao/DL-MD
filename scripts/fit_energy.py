@@ -53,31 +53,35 @@ def fit(proteins, *, steps, sigma, kT, lr, bins=30, clip=10.0, seed=0):
 
 
 def gate(energy, proteins, *, kT, threshold, n_steps=4000):
-    """Return (passed, fes_js, rho). Uses the first protein as the reference."""
-    t, rt, cid = proteins[0]
-    # tv.shared_pca takes [F, N, 3]; use the full reference trajectory
-    mean, comps = tv.shared_pca(t, n_components=2)
-    samples = langevin_sample(energy, t[0].clone(), rt, cid,
-                              n_steps=n_steps, dt=5e-3, kT=kT, stride=5)
-    cv_model = tv.project_cv(samples, mean, comps)
-    cv_md = tv.project_cv(t, mean, comps)
-    fes = tv.fes_comparison(cv_model, cv_md)["fes_js"]
-    # energy–population correlation: per-MD-frame energy vs that frame's basin count
-    with torch.no_grad():
-        e_per = torch.tensor([float(energy(t[i], rt, cid)) for i in
-                              range(0, t.shape[0], max(1, t.shape[0] // 200))])
-    rho = float("nan")
-    try:
-        from scipy.stats import spearmanr
-        cv_sub = cv_md[::max(1, t.shape[0] // 200)][: e_per.shape[0]]
-        # population proxy: negative distance density (denser = more populated)
-        idw = inverse_density_weights
-        pop = 1.0 / idw(cv_sub, bins=20, clip=1e6)
-        rho = float(spearmanr(e_per.numpy(), pop.numpy()).correlation)
-    except Exception:
+    """Return (passed, fes_js, rho) averaged across all proteins."""
+    import math
+    fes_all, rho_all = [], []
+    for t, rt, cid in proteins:
+        mean, comps = tv.shared_pca(t, n_components=2)
+        samples = langevin_sample(energy, t[0].clone(), rt, cid,
+                                  n_steps=n_steps, dt=5e-3, kT=kT, stride=5)
+        cv_model = tv.project_cv(samples, mean, comps)
+        cv_md = tv.project_cv(t, mean, comps)
+        fes_all.append(tv.fes_comparison(cv_model, cv_md)["fes_js"])
+        # energy–population correlation: per-MD-frame energy vs that frame's basin count
+        with torch.no_grad():
+            e_per = torch.tensor([float(energy(t[i], rt, cid)) for i in
+                                  range(0, t.shape[0], max(1, t.shape[0] // 200))])
         rho = float("nan")
-    passed = fes < threshold
-    return passed, fes, rho
+        try:
+            from scipy.stats import spearmanr
+            cv_sub = cv_md[::max(1, t.shape[0] // 200)][: e_per.shape[0]]
+            idw = inverse_density_weights
+            pop = 1.0 / idw(cv_sub, bins=20, clip=1e6)
+            rho = float(spearmanr(e_per.numpy(), pop.numpy()).correlation)
+        except Exception:
+            rho = float("nan")
+        rho_all.append(rho)
+    fes_js = sum(fes_all) / len(fes_all)
+    rho_vals = [r for r in rho_all if not math.isnan(r)]
+    rho = sum(rho_vals) / len(rho_vals) if rho_vals else float("nan")
+    passed = fes_js < threshold
+    return passed, fes_js, rho
 
 
 def main():

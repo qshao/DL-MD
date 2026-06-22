@@ -281,7 +281,8 @@ def fdt_loss(u_denorm, protein_id, sigma_md_tau):
     total = u_denorm.new_zeros(())
     for gi, pid in enumerate(pids):
         m = protein_id == pid
-        var_model = u_denorm[m][:, :3].pow(2).mean()
+        u_m = u_denorm[m][:, :3]
+        var_model = (u_m - u_m.mean(0, keepdim=True)).pow(2).mean()
         var_target = sigma_md_tau[gi].to(var_model.dtype).to(var_model.device)
         total = total + (var_model - var_target) ** 2
     return total / max(pids.numel(), 1)
