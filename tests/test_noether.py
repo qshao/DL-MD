@@ -1,6 +1,5 @@
 import math
 import torch
-import pytest
 from lsmd.noether import noether_project
 
 
