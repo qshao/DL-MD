@@ -74,3 +74,20 @@ def test_free_energy_surface_empty_bins_are_nan():
     cv = torch.randn(500, 2)
     fg, _ = tv.free_energy_surface(cv, bins=30)
     assert torch.isnan(fg).any()
+
+
+def test_populations_identical_ensembles_tv_zero():
+    torch.manual_seed(4)
+    cv = torch.randn(300, 2)
+    out = tv.state_populations(cv, cv.clone(), n_states=4)
+    assert out["pop_tv"] < 1e-6
+    assert abs(sum(out["pop_model"]) - 1.0) < 1e-6
+
+
+def test_populations_disjoint_clouds_tv_near_one():
+    a = torch.randn(200, 2) * 0.1 + torch.tensor([-8.0, 0.0])
+    b = torch.randn(200, 2) * 0.1 + torch.tensor([8.0, 0.0])
+    # Fit clusters on a mix so both clouds get distinct centers
+    mix = torch.cat([a, b], dim=0)
+    out = tv.state_populations(a, b, n_states=2, seed=0)
+    assert out["pop_tv"] > 0.9

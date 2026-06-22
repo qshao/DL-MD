@@ -150,3 +150,37 @@ def fes_comparison(cv_model, cv_md, bins=30, kT=1.0, min_count=5):
     else:
         rmse = float("nan")
     return {"fes_js": js, "fes_rmse_kT": rmse}
+
+
+def _kmeans(points, n_states, seed=0, iters=50):
+    """Lloyd's k-means with fixed seed. points: [M, D] -> centers [n_states, D]."""
+    gen = torch.Generator().manual_seed(seed)
+    init = torch.randperm(points.shape[0], generator=gen)[:n_states]
+    centers = points[init].clone()
+    for _ in range(iters):
+        assign = torch.cdist(points, centers).argmin(dim=1)
+        for k in range(n_states):
+            m = assign == k
+            if m.any():
+                centers[k] = points[m].mean(dim=0)
+    return centers
+
+
+def state_populations(cv_model, cv_md, n_states=6, seed=0):
+    """Cluster MD CV space; compare metastable-state populations.
+
+    Returns model/MD population vectors and their total-variation distance
+    (0 = identical populations, 1 = disjoint).
+    """
+    cv_model, cv_md = cv_model.double(), cv_md.double()
+    # Fit centers on the pooled CV space so both ensembles' modes are covered.
+    centers = _kmeans(torch.cat([cv_model, cv_md], dim=0), n_states, seed=seed)
+
+    def pops(cv):
+        a = torch.cdist(cv, centers).argmin(dim=1)
+        c = torch.bincount(a, minlength=n_states).double()
+        return c / c.sum().clamp_min(1.0)
+
+    pm, pd = pops(cv_model), pops(cv_md)
+    tv_dist = 0.5 * (pm - pd).abs().sum().item()
+    return {"pop_model": pm.tolist(), "pop_md": pd.tolist(), "pop_tv": tv_dist}
