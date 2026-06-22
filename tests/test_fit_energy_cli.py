@@ -2,6 +2,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(REPO, "scripts", "fit_energy.py")
 
@@ -15,9 +17,6 @@ def test_fit_energy_help_lists_flags():
 
 
 SHARD = os.path.join(REPO, "data", "atlas", "3u7t_A.pt")
-
-
-import pytest
 
 
 @pytest.mark.skipif(not os.path.exists(SHARD), reason="atlas shard absent")

@@ -54,7 +54,6 @@ def fit(proteins, *, steps, sigma, kT, lr, bins=30, clip=10.0, seed=0):
 
 def gate(energy, proteins, *, kT, threshold, n_steps=4000):
     """Return (passed, fes_js, rho). Uses the first protein as the reference."""
-    from scipy.stats import spearmanr  # optional; fallback below if absent
     t, rt, cid = proteins[0]
     # tv.shared_pca takes [F, N, 3]; use the full reference trajectory
     mean, comps = tv.shared_pca(t, n_components=2)
@@ -67,11 +66,12 @@ def gate(energy, proteins, *, kT, threshold, n_steps=4000):
     with torch.no_grad():
         e_per = torch.tensor([float(energy(t[i], rt, cid)) for i in
                               range(0, t.shape[0], max(1, t.shape[0] // 200))])
-    rho = 0.0
+    rho = float("nan")
     try:
+        from scipy.stats import spearmanr
         cv_sub = cv_md[::max(1, t.shape[0] // 200)][: e_per.shape[0]]
         # population proxy: negative distance density (denser = more populated)
-        from lsmd.learned_energy import inverse_density_weights as idw
+        idw = inverse_density_weights
         pop = 1.0 / idw(cv_sub, bins=20, clip=1e6)
         rho = float(spearmanr(e_per.numpy(), pop.numpy()).correlation)
     except Exception:

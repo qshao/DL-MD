@@ -43,7 +43,8 @@ class LearnedCGEnergy(nn.Module):
     @classmethod
     def load(cls, path, map_location="cpu"):
         m = cls()
-        m.load_state_dict(torch.load(path, map_location=map_location))
+        m.load_state_dict(torch.load(path, map_location=map_location, weights_only=True))
+        m.to(map_location)
         return m
 
 
@@ -75,7 +76,6 @@ def inverse_density_weights(cv, *, bins=30, clip=10.0):
         [F] weights in [1/clip, clip], mean ≈ 1 (pre-clip).
     """
     cv = cv.double()
-    F = cv.shape[0]
     lo = cv.min(dim=0).values
     hi = cv.max(dim=0).values
     span = (hi - lo).clamp_min(1e-8)
@@ -129,7 +129,7 @@ def md_step_cov(t, dt_md_ps, tau_ps):
         dt_md_ps:  MD frame spacing (ps).
         tau_ps:    physical lag (ps); converted to a frame lag by rounding.
     Returns:
-        scalar float: mean over atoms/coords of Var(x_{i+lag} - x_i).
+        scalar float: mean squared displacement per atom/coord, E[Δx²].
     """
     lag = max(1, int(round(float(tau_ps) / float(dt_md_ps))))
     disp = t[lag:] - t[:-lag]                  # [F-lag, N, 3]

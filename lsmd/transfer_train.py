@@ -329,6 +329,8 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
                                  reverse_prob=reverse_prob)
     opt.zero_grad()
     lam_t = 0.0
+    lam_e = 0.0
+    lam_f = 0.0
     loss_acc = 0.0       # accumulated (scaled) loss for logging
     nodes_acc = 0        # nodes processed since last log
     had_backward = False  # tracks whether any sub-batch in current accum window ran backward

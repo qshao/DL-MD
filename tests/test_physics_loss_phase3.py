@@ -1,7 +1,6 @@
 import torch
 from lsmd.physics_loss import energy_match_loss, fdt_loss
 from lsmd.learned_energy import LearnedCGEnergy
-from lsmd import geometry as g
 
 
 def _identity_frames(N):
