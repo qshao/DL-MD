@@ -177,6 +177,9 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
         wca_lam:               WCA guidance step size (normalized units, default
                                0.05). Scales the gradient nudge applied to u0_hat
                                at each denoising step.
+        noether:               If True, apply Noether momentum projection (remove
+                               net linear and angular momentum per chain) after
+                               each bond-constraint step (default False).
         device:                Target device.
 
     Returns:
