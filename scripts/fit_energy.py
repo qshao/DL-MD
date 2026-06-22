@@ -46,6 +46,7 @@ def fit(proteins, *, steps, sigma, kT, lr, bins=30, clip=10.0, seed=0):
         loss = weights[pi][fi] * score_matching_loss(
             energy, t[fi], rt, cid, sigma=sigma, kT=kT)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(energy.parameters(), max_norm=1.0)
         opt.step()
         if step % max(1, steps // 10) == 0:
             print(f"step {step}  loss={float(loss):.4f}")
