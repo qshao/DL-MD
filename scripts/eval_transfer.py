@@ -18,7 +18,8 @@ from lsmd import transfer_eval as te
 
 
 def _run(ckpt, shard, steps, tau_ps, k, diff_steps, eta, temp_K,
-         bond_constraint_iters, max_update_norm, device):
+         bond_constraint_iters, max_update_norm,
+         wca_sigma, wca_eps, wca_lam, device):
     net, sched, norm = te.load_checkpoint(ckpt, device=device)
     k_eff = ckpt["hparams"].get("k", k)
     # support both compact (R_aa float16) and legacy (R float32) shard formats
@@ -34,6 +35,7 @@ def _run(ckpt, shard, steps, tau_ps, k, diff_steps, eta, temp_K,
                       diff_steps=diff_steps, eta=eta, temp_K=temp_K,
                       bond_constraint_iters=bond_constraint_iters,
                       max_update_norm=max_update_norm,
+                      wca_sigma=wca_sigma, wca_eps=wca_eps, wca_lam=wca_lam,
                       device=device)
     return te.evaluate(traj, t_md)
 
@@ -53,7 +55,13 @@ def main():
                     help="Simulation temperature in Kelvin (default 300; used when model has temp_emb_dim > 0)")
     ap.add_argument("--max_update_norm", type=float, default=3.0,
                     help="Clip per-residue normalized update norm before de-normalization "
-                         "(default 3.0). Prevents rotation drift explosion. Set None to disable.")
+                         "(default 3.0). Prevents rotation drift explosion.")
+    ap.add_argument("--wca_sigma", type=float, default=4.5,
+                    help="WCA CA–CA diameter (Å, default 4.5). Set 0 to disable guidance.")
+    ap.add_argument("--wca_eps", type=float, default=0.3,
+                    help="WCA well depth (kcal/mol, default 0.3 ≈ 0.5 kT at 300 K).")
+    ap.add_argument("--wca_lam", type=float, default=0.05,
+                    help="WCA guidance step size in normalized update space (default 0.05).")
     ap.add_argument("--bond_constraint_iters", type=int, default=5,
                     help="SHAKE iterations enforcing CA–CA pseudo-bond lengths after each "
                          "diffusion step (default 5). Set 0 to disable. Prevents systematic "
@@ -67,20 +75,22 @@ def main():
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     shard = torch.load(args.shard, map_location="cpu")
 
+    run_kwargs = dict(
+        steps=args.steps, tau_ps=args.tau_ps, k=args.k,
+        diff_steps=args.diff_steps, eta=args.eta, temp_K=args.temp_K,
+        bond_constraint_iters=args.bond_constraint_iters,
+        max_update_norm=args.max_update_norm,
+        wca_sigma=args.wca_sigma, wca_eps=args.wca_eps, wca_lam=args.wca_lam,
+        device=device,
+    )
     report = {"model": _run(torch.load(args.checkpoint, map_location="cpu"),
-                            shard, args.steps, args.tau_ps, args.k,
-                            args.diff_steps, args.eta, args.temp_K,
-                            args.bond_constraint_iters, args.max_update_norm, device)}
+                            shard, **run_kwargs)}
     if args.oracle:
         report["oracle"] = _run(torch.load(args.oracle, map_location="cpu"),
-                                shard, args.steps, args.tau_ps, args.k,
-                                args.diff_steps, args.eta, args.temp_K,
-                                args.bond_constraint_iters, args.max_update_norm, device)
+                                shard, **run_kwargs)
     if args.lower:
         report["lower"] = _run(torch.load(args.lower, map_location="cpu"),
-                               shard, args.steps, args.tau_ps, args.k,
-                               args.diff_steps, args.eta, args.temp_K,
-                               args.bond_constraint_iters, args.max_update_norm, device)
+                               shard, **run_kwargs)
 
     with open(args.out, "w") as fh:
         json.dump(report, fh, indent=2)

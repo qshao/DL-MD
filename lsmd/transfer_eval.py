@@ -28,6 +28,82 @@ def load_checkpoint(ckpt, device):
     return net, schedule, update_norm
 
 
+def _wca_energy(t_pred, chain_id, sigma=4.5, eps=0.3):
+    """Weeks–Chandler–Andersen excluded-volume energy for non-bonded CA pairs.
+
+    Only applies to pairs with sequence separation > 2 within the same chain,
+    and all cross-chain pairs. Parameterisation from CG-MD literature (CA–CA
+    contact radius ~4.5 Å, well depth ~0.3 kcal/mol ≈ 0.5 kT at 300 K).
+
+    Args:
+        t_pred:   [N, 3] predicted CA positions (differentiable).
+        chain_id: [N] long, chain assignment.
+        sigma:    WCA diameter (Å). Cutoff r_cut = 2^(1/6) * sigma ≈ 5.05 Å.
+        eps:      Well depth (kcal/mol).
+
+    Returns:
+        Scalar energy (differentiable w.r.t. t_pred).
+    """
+    N = t_pred.shape[0]
+    d = torch.cdist(t_pred, t_pred)                          # [N, N]
+    idx = torch.arange(N, device=t_pred.device)
+    seq_sep = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()    # [N, N]
+    same_chain = (chain_id.unsqueeze(0) == chain_id.unsqueeze(1))
+    # Bonded: same chain AND seq_sep ≤ 2 (already handled by SHAKE)
+    bonded = same_chain & (seq_sep <= 2)
+    non_bonded = ~bonded & (seq_sep != 0)                    # exclude self
+
+    r_cut = (2.0 ** (1.0 / 6.0)) * sigma                    # ≈ 5.05 Å
+    r = d[non_bonded].clamp_min(0.1)
+    sr6 = (sigma / r).pow(6)
+    v_wca = 4.0 * eps * (sr6 * sr6 - sr6) + eps             # [M]
+    in_range = (r < r_cut).to(v_wca.dtype)
+    return (v_wca * in_range).sum()
+
+
+def _build_wca_guidance(R, t, chain_id, scale, sigma=4.5, eps=0.3, lam=0.05):
+    """Build a C2 guidance callable for one rollout step.
+
+    Returns guidance_fn(u0_hat) -> u0_hat_guided. The function:
+      1. De-normalizes u0_hat and applies the SE(3) update to (R, t) to get
+         the Tweedie-predicted CA positions.
+      2. Computes the WCA excluded-volume energy on those positions.
+      3. Differentiates through apply_update to get ∂E/∂u0_hat via autograd.
+      4. Nudges u0_hat toward lower energy: u0_hat -= lam * ∂E/∂u0_hat.
+
+    The guidance operates in normalized update space (before × scale), so lam
+    is dimensionless and independent of the physical scale of the update.
+    torch.enable_grad() is used internally so this works inside @no_grad rollout.
+
+    Args:
+        R:      [N, 3, 3] current residue rotation matrices.
+        t:      [N, 3] current CA positions.
+        chain_id: [N] long.
+        scale:  [6] UpdateNorm de-normalization scale.
+        sigma:  WCA diameter (Å), default 4.5.
+        eps:    WCA well depth (kcal/mol), default 0.3.
+        lam:    Guidance step size (normalized-space units), default 0.05.
+    """
+    R_ref = R.detach()
+    t_ref = t.detach()
+    cid   = chain_id.detach()
+    sc    = scale.detach()
+
+    def guidance_fn(u0_hat):
+        with torch.enable_grad():
+            u0 = u0_hat.detach().requires_grad_(True)
+            _, t_pred = feat.apply_update(R_ref, t_ref, u0 * sc)
+            energy = _wca_energy(t_pred, cid, sigma=sigma, eps=eps)
+            energy.backward()
+        grad = u0.grad.detach()
+        # Normalise gradient to prevent very large steps when many atoms clash
+        grad_norm = grad.norm().clamp_min(1e-8)
+        grad = grad / grad_norm
+        return (u0_hat - lam * grad_norm.clamp_max(1.0) * grad).detach()
+
+    return guidance_fn
+
+
 def _apply_bond_constraint(t, ref_dists, chain_id, n_iter=5, k=0.5):
     """SHAKE-style soft constraint on adjacent CA–CA pseudo-bonds.
 
@@ -61,7 +137,9 @@ def _apply_bond_constraint(t, ref_dists, chain_id, n_iter=5, k=0.5):
 @torch.no_grad()
 def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
             *, steps, tau_ps, k, diff_steps=50, eta=1.0, temp_K=300.0,
-            bond_constraint_iters=5, max_update_norm=3.0, device="cpu"):
+            bond_constraint_iters=5, max_update_norm=3.0,
+            wca_sigma=4.5, wca_eps=0.3, wca_lam=0.05,
+            device="cpu"):
     """Autoregressive CA trajectory from a reference structure.
 
     The graph is rebuilt from current (R, t) each step (state-conditional).
@@ -90,10 +168,14 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
         eta:                   Stochasticity: 1.0=DDPM, 0.0=DDIM.
         temp_K:                Simulation temperature in Kelvin.
         bond_constraint_iters: SHAKE iterations after each step (0 = disabled).
-        max_update_norm:       Clip per-residue normalized update L2 norm to this
-                               value before de-normalization (default 3.0). Prevents
-                               runaway rotation drift when structure leaves training
-                               distribution. None = disabled.
+        max_update_norm:       Clip per-residue normalized update L2 norm before
+                               de-normalization (default 3.0). None = disabled.
+        wca_sigma:             WCA CA–CA diameter (Å, default 4.5). Set to 0 to
+                               disable WCA guidance entirely.
+        wca_eps:               WCA well depth (kcal/mol, default 0.3 ≈ 0.5 kT).
+        wca_lam:               WCA guidance step size (normalized units, default
+                               0.05). Scales the gradient nudge applied to u0_hat
+                               at each denoising step.
         device:                Target device.
 
     Returns:
@@ -121,17 +203,24 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
     # Reference CA–CA bond lengths from the initial frame (per-protein geometry)
     ref_dists = (t[1:] - t[:-1]).norm(dim=-1)       # [N-1]
 
+    # Build WCA guidance once per rollout step (captures current R, t via closure)
+    use_wca = wca_sigma > 0 and wca_lam > 0
+
     traj = [t.clone()]
     for _ in range(steps):
         # Rebuild graph from current frames
         edge_index, edge_feats = feat.frame_graph(R, t, k)
-        # Sample normalized update via reverse DDPM/DDIM
+        # Build WCA C2 guidance function for this step (closes over current R, t)
+        guidance_fn = (
+            _build_wca_guidance(R, t, chain_id, scale,
+                                sigma=wca_sigma, eps=wca_eps, lam=wca_lam)
+            if use_wca else None
+        )
+        # Sample normalized update via reverse DDPM/DDIM with optional WCA guidance
         u = sample_ddpm_union(net, node_feats, edge_index, edge_feats,
                               tau, batch, schedule, steps=diff_steps,
-                              eta=eta, temp_K=t_K)
+                              eta=eta, temp_K=t_K, guidance_fn=guidance_fn)
         # Clip per-residue update in normalized space to bound rotation drift.
-        # Normalized outputs are ~unit scale; clipping at 3 stops runaway
-        # while leaving typical steps (norm ~0.5–1.5) completely unchanged.
         if max_update_norm is not None:
             u_norm = u.norm(dim=-1, keepdim=True).clamp_min(1e-8)
             u = u * (u_norm.clamp_max(max_update_norm) / u_norm)
@@ -139,9 +228,7 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
         u = u * scale
         # Advance SE(3) frames
         R, t = feat.apply_update(R, t, u)
-        # Restore CA–CA pseudo-bond lengths toward reference values.
-        # Equivalent to the bonded potential in coarse-grained MD; prevents
-        # systematic bond-length drift that causes autoregressive explosion.
+        # SHAKE: restore CA–CA pseudo-bond lengths (bonded potential in CG-MD)
         if bond_constraint_iters > 0:
             t = _apply_bond_constraint(t, ref_dists, chain_id,
                                        n_iter=bond_constraint_iters)

@@ -141,11 +141,17 @@ def ddpm_loss_union(net, u_target, node_feats, edge_index, edge_feats, tau,
 
 @torch.no_grad()
 def sample_ddpm_union(net, node_feats, edge_index, edge_feats, tau, batch,
-                      schedule, steps=50, eta=1.0, sigma_init=1.0, temp_K=None):
+                      schedule, steps=50, eta=1.0, sigma_init=1.0, temp_K=None,
+                      guidance_fn=None):
     """Reverse-diffusion sampler over a union graph (one update per node).
 
     eta=1.0 → stochastic DDPM; eta=0.0 → deterministic DDIM.  Use eta=0 with
     steps=10-20 for fast rollout (10-20x speedup with little quality loss).
+
+    guidance_fn: optional callable(u0_hat) -> u0_hat_guided. Applied to the
+        Tweedie x0-estimate at every denoising step (C2 guidance). The guided
+        u0_hat is used consistently: eps is recomputed from it so the DDPM
+        posterior remains well-formed.
     """
     T = schedule.T
     N = node_feats.shape[0]
@@ -166,6 +172,10 @@ def sample_ddpm_union(net, node_feats, edge_index, edge_feats, tau, batch,
         ab_t = schedule.alphas_bar[t].to(dtype)
 
         u0_hat = (u - sqrt_1mab_t * eps_pred) / sqrt_ab_t.clamp_min(1e-8)
+        if guidance_fn is not None:
+            u0_hat = guidance_fn(u0_hat)
+            # Recompute eps from guided u0_hat so posterior stays consistent.
+            eps_pred = (u - sqrt_ab_t * u0_hat) / sqrt_1mab_t.clamp_min(1e-8)
         pv = (1 - ab_prev) / (1 - ab_t).clamp_min(1e-8) * (1 - ab_t / ab_prev.clamp_min(1e-8))
         sigma_t = eta * pv.clamp_min(0.0).sqrt()
         dir_coeff = (1 - ab_prev - sigma_t ** 2).clamp_min(0.0).sqrt()
@@ -275,13 +285,15 @@ class CachedPropagator(nn.Module):
 @torch.no_grad()
 def sample_ddpm_union_cached(net, node_feats, edge_index, edge_feats, tau, batch,
                              schedule, steps=50, eta=1.0, sigma_init=1.0,
-                             temp_K=None):
+                             temp_K=None, guidance_fn=None):
     """Reverse-diffusion sampler that encodes the static graph once.
 
     `net` must expose `encode`/`denoise` (a CachedPropagator). Identical reverse
     math to sample_ddpm_union; the only difference is the structural context is
     computed once and reused across all reverse steps. eta=0 -> deterministic
     DDIM (use with a small `steps` for fast rollout).
+
+    guidance_fn: same interface as in sample_ddpm_union.
     """
     T = schedule.T
     N = node_feats.shape[0]
@@ -303,6 +315,9 @@ def sample_ddpm_union_cached(net, node_feats, edge_index, edge_feats, tau, batch
         ab_t = schedule.alphas_bar[t].to(dtype)
 
         u0_hat = (u - sqrt_1mab_t * eps_pred) / sqrt_ab_t.clamp_min(1e-8)
+        if guidance_fn is not None:
+            u0_hat = guidance_fn(u0_hat)
+            eps_pred = (u - sqrt_ab_t * u0_hat) / sqrt_1mab_t.clamp_min(1e-8)
         pv = (1 - ab_prev) / (1 - ab_t).clamp_min(1e-8) * (1 - ab_t / ab_prev.clamp_min(1e-8))
         sigma_t = eta * pv.clamp_min(0.0).sqrt()
         dir_coeff = (1 - ab_prev - sigma_t ** 2).clamp_min(0.0).sqrt()
