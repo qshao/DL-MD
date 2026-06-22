@@ -143,7 +143,7 @@ def fes_comparison(cv_model, cv_md, bins=30, kT=1.0, min_count=5):
     js = (js / math.log(2)).clamp(0.0, 1.0).item()
 
     well = (cm >= min_count) & (cd >= min_count)
-    if well.any():
+    if well.sum() >= 2:
         fm = -kT * torch.log(pm[well]); fm = fm - fm.min()
         fd = -kT * torch.log(pd[well]); fd = fd - fd.min()
         rmse = torch.sqrt(((fm - fd) ** 2).mean()).item()
@@ -234,11 +234,12 @@ def cv_autocorrelation(cv_1d, dt_ps, max_lag=None):
 
 
 def relaxation_time_ps(time_ps, acf):
-    """Integral relaxation time: trapezoid integral of acf to first zero crossing."""
+    """Integral relaxation time: trapz integral of acf to first zero crossing."""
     time_ps = torch.as_tensor(time_ps, dtype=torch.float64)
     acf = torch.as_tensor(acf, dtype=torch.float64)
-    cross = (acf <= 0).nonzero()
-    end = int(cross[0].item()) if cross.numel() > 0 else acf.shape[0]
+    # Skip lag-0 (always 1.0) when finding the zero crossing
+    cross = (acf[1:] <= 0).nonzero()
+    end = int(cross[0].item()) + 1 if cross.numel() > 0 else acf.shape[0]
     if end < 2:
         return 0.0
     return torch.trapz(acf[:end], time_ps[:end]).item()
