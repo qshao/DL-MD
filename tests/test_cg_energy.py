@@ -135,7 +135,6 @@ def test_total_cg_energy_w_mj_zero():
 
 
 # ── Reweighting tests (Task 5) ────────────────────────────────────────────────
-import math
 from unittest.mock import patch
 from lsmd import transfer_modes as tm
 import lsmd.cg_energy as cge
