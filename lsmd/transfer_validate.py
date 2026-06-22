@@ -209,3 +209,36 @@ def msd_curve(ca, dt_ps, max_lag=None):
         msds.append((d ** 2).sum(dim=-1).mean().item())
     return (torch.tensor(times, dtype=torch.float64),
             torch.tensor(msds, dtype=torch.float64))
+
+
+def cv_autocorrelation(cv_1d, dt_ps, max_lag=None):
+    """Normalized time autocorrelation of a 1-D CV series.
+
+    C(l) = mean_t[dq(t) dq(t+l)] / var(q), with dq = q - mean(q). acf[0] = 1.
+    Returns (time_ps [L], acf [L]) with time_ps[l] = l * dt_ps.
+    """
+    q = cv_1d.double()
+    F = q.shape[0]
+    if max_lag is None:
+        max_lag = F // 2
+    max_lag = min(max_lag, F - 1)
+    dq = q - q.mean()
+    var = (dq * dq).mean().clamp_min(1e-12)
+    times, acf = [], []
+    for lag in range(0, max_lag + 1):
+        c = (dq[lag:] * dq[:F - lag]).mean() / var
+        times.append(lag * dt_ps)
+        acf.append(c.item())
+    return (torch.tensor(times, dtype=torch.float64),
+            torch.tensor(acf, dtype=torch.float64))
+
+
+def relaxation_time_ps(time_ps, acf):
+    """Integral relaxation time: trapezoid integral of acf to first zero crossing."""
+    time_ps = torch.as_tensor(time_ps, dtype=torch.float64)
+    acf = torch.as_tensor(acf, dtype=torch.float64)
+    cross = (acf <= 0).nonzero()
+    end = int(cross[0].item()) if cross.numel() > 0 else acf.shape[0]
+    if end < 2:
+        return 0.0
+    return torch.trapz(acf[:end], time_ps[:end]).item()

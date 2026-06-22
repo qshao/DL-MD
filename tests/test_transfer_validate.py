@@ -108,3 +108,26 @@ def test_msd_diffusion_increases_monotonically():
     # First half should be non-decreasing on average
     assert msd[5] > msd[1]
     assert msd[-1] > msd[0]
+
+
+def test_acf_lag_zero_is_one():
+    torch.manual_seed(6)
+    q = torch.randn(200)
+    t, acf = tv.cv_autocorrelation(q, dt_ps=2.0)
+    assert abs(acf[0].item() - 1.0) < 1e-6
+    assert t[0].item() == 0.0
+
+
+def test_relaxation_time_recovers_ou_timescale():
+    # Ornstein-Uhlenbeck: q[t+1] = (1 - 1/theta) q[t] + noise
+    torch.manual_seed(7)
+    theta = 20.0
+    n = 8000
+    q = torch.zeros(n)
+    for i in range(1, n):
+        q[i] = (1.0 - 1.0 / theta) * q[i - 1] + torch.randn(1).item()
+    dt_ps = 1.0
+    t, acf = tv.cv_autocorrelation(q, dt_ps=dt_ps)
+    tau = tv.relaxation_time_ps(t, acf)
+    # Continuous-time relaxation time of this AR(1) is ~theta * dt_ps
+    assert 0.5 * theta * dt_ps < tau < 2.0 * theta * dt_ps
