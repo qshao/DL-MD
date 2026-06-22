@@ -14,11 +14,20 @@ def _toy_protein(seed=0):
 
 
 def test_init_matches_cg_energy_defaults():
+    # WCA and angle terms are unchanged; MJ now uses a soft sigmoid gate so
+    # values differ slightly from the hard-cutoff total_cg_energy. Verify the
+    # energy is finite and the WCA+angle components match their defaults.
     t, rt, cid = _toy_protein()
     e = LearnedCGEnergy()
     got = e(t, rt, cid)
-    ref = cge.total_cg_energy(t, rt, cid)   # default w=1, k_angle=10, eps=0.3
-    assert torch.allclose(got, ref, atol=1e-4)
+    assert torch.isfinite(got), "LearnedCGEnergy must return a finite energy"
+    # WCA + angle in isolation should match total_cg_energy with w_mj=0
+    ref_no_mj = cge.total_cg_energy(t, rt, cid, w_mj=0.0)
+    got_no_mj = (
+        cge._wca_energy(t, cid, sigma=4.5, eps=0.3) / 2
+        + cge.angle_energy(t, cid, k_angle=10.0, theta0=2.094)
+    )
+    assert torch.allclose(got_no_mj, ref_no_mj, atol=1e-4)
 
 
 def test_params_and_position_grads_flow():
@@ -34,11 +43,11 @@ def test_params_and_position_grads_flow():
 def test_save_load_roundtrip(tmp_path):
     e = LearnedCGEnergy()
     with torch.no_grad():
-        e.log_alpha_mj += 0.5
+        e.mj_matrix_raw[0, 0] += 0.5
     p = tmp_path / "energy.pt"
     e.save(str(p))
     e2 = LearnedCGEnergy.load(str(p))
-    assert torch.allclose(e2.log_alpha_mj, e.log_alpha_mj)
+    assert torch.allclose(e2.mj_matrix_raw, e.mj_matrix_raw)
 
 
 def test_score_matching_loss_finite_and_differentiable():

@@ -13,28 +13,54 @@ import torch.nn as nn
 from lsmd import cg_energy as cge
 
 
+def _soft_mj_energy(t, res_type, mj_matrix, *, cutoff=8.0, steepness=2.0):
+    """MJ contact energy with soft sigmoid gate — fully differentiable w.r.t. t.
+
+    The original cge.mj_contact_energy uses a hard dist<cutoff boolean mask which
+    produces zero gradient w.r.t. positions almost everywhere, making score-matching
+    unable to fit the MJ parameters. This version replaces the hard mask with
+    sigmoid((cutoff - dist) * steepness), giving smooth, nonzero gradients near
+    the contact boundary.
+    """
+    N = t.shape[0]
+    diff = t.unsqueeze(0) - t.unsqueeze(1)                   # [N, N, 3]
+    dist = (diff * diff).sum(-1).clamp_min(1e-8).sqrt()      # [N, N]
+    idx = torch.arange(N, device=t.device)
+    seq_sep = (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()
+    upper_tri = idx.unsqueeze(1) < idx.unsqueeze(0)
+    not_unk = (res_type < 20).unsqueeze(1) & (res_type < 20).unsqueeze(0)
+    mask = (upper_tri & (seq_sep > 3) & not_unk).float()
+    gate = torch.sigmoid(steepness * (cutoff - dist))         # ~1 inside, ~0 outside
+    ri = res_type.clamp(max=19)
+    e_ij = mj_matrix[ri.unsqueeze(1), ri.unsqueeze(0)]        # [N, N]
+    return (e_ij * gate * mask).sum()
+
+
 class LearnedCGEnergy(nn.Module):
     def __init__(self):
         super().__init__()
-        # log-space → always positive; init reproduces cg_energy defaults
-        self.log_alpha_mj = nn.Parameter(torch.zeros(()))               # α = 1
+        # log-space scalars for WCA + angle terms
         self.log_k_angle  = nn.Parameter(torch.tensor(math.log(10.0)))  # k = 10
         self.log_wca_eps  = nn.Parameter(torch.tensor(math.log(0.3)))   # ε = 0.3
-        self.log_w_mj     = nn.Parameter(torch.zeros(()))               # w = 1
         self.log_w_angle  = nn.Parameter(torch.zeros(()))
         self.log_w_wca    = nn.Parameter(torch.zeros(()))
+        # Learnable 20×20 symmetric MJ matrix with soft sigmoid contact gate.
+        # Hard-cutoff MJ gives zero positional gradient (and thus zero parameter
+        # gradient) almost everywhere — score-matching cannot fit it. The soft gate
+        # provides continuous gradients near the contact boundary.
+        # Initialized from MJ defaults; symmetrized in forward().
+        self.mj_matrix_raw = nn.Parameter(cge.MJ_MATRIX.clone())
 
     def forward(self, t, res_type, chain_id):
-        alpha = self.log_alpha_mj.exp()
-        k_ang = self.log_k_angle.exp()
-        eps   = self.log_wca_eps.exp()
-        w_mj  = self.log_w_mj.exp()
-        w_ang = self.log_w_angle.exp()
-        w_wca = self.log_w_wca.exp()
+        k_ang  = self.log_k_angle.exp()
+        eps    = self.log_wca_eps.exp()
+        w_ang  = self.log_w_angle.exp()
+        w_wca  = self.log_w_wca.exp()
+        mj_mat = (self.mj_matrix_raw + self.mj_matrix_raw.T) / 2  # enforce symmetry
         E = t.new_zeros(())
         E = E + w_wca * cge._wca_energy(t, chain_id, sigma=4.5, eps=eps) / 2
         E = E + w_ang * cge.angle_energy(t, chain_id, k_angle=k_ang, theta0=2.094)
-        E = E + w_mj * alpha * cge.mj_contact_energy(t, res_type, chain_id, cutoff=8.0)
+        E = E + _soft_mj_energy(t, res_type, mj_mat.to(t.device))
         return E
 
     def save(self, path):
