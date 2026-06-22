@@ -198,7 +198,8 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
           norm_samples=256, device="cpu", seed=0, lam=0.0, lam_warmup=500,
           log_every=100, grad_clip=1.0, norm_shards=None,
           frame_weighted=True, compile_model=False, temp_schedule=None,
-          temp_emb_dim=8, reverse_prob=0.0, resume_from=None):
+          temp_emb_dim=8, reverse_prob=0.0, resume_from=None,
+          checkpoint_every=0, checkpoint_path=None):
     """Train the union-graph propagator across proteins; return a checkpoint.
 
     Args:
@@ -225,6 +226,11 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
                         weights and optimizer state are loaded and training
                         continues from checkpoint['step']. The 'steps' arg then
                         means additional steps beyond the checkpoint, not total.
+        checkpoint_every: Save an intermediate checkpoint every this many
+                        gradient steps (0 = disabled). Requires checkpoint_path.
+        checkpoint_path: Path template for periodic saves; '{step}' is replaced
+                        with the absolute step number, e.g.
+                        'checkpoints/v2_{step}.pt'.
     """
     if lam > 0.0 and lam_warmup >= steps:
         peak = pl.lambda_schedule(max(0, steps - 1), lam_warmup, lam)
@@ -348,7 +354,9 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
                     print(f"  [step {step}] NaN/Inf gradient in {nan_params} tensors — zeroed",
                           flush=True)
                 scaler.step(opt)
-            scaler.update()
+                scaler.update()
+            # When had_backward is False, skip ALL scaler calls — PyTorch >= 2.4
+            # requires inf checks before both step() and update().
             opt.zero_grad()
             had_backward = False
 
@@ -385,6 +393,33 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
                 loss_acc = 0.0
                 nodes_acc = 0
                 t_log = now
+
+            if (checkpoint_every > 0 and checkpoint_path is not None
+                    and local_step % checkpoint_every == 0):
+                raw_net_cp = net._orig_mod if hasattr(net, "_orig_mod") else net
+                cp = {
+                    "model_state": {kk: vv.cpu()
+                                    for kk, vv in raw_net_cp.state_dict().items()},
+                    "optimizer_state": opt.state_dict(),
+                    "step": step,
+                    "T_diff": T_diff,
+                    "update_norm": update_norm.state_dict(),
+                    "n_aa_types": 21,
+                    "hparams": {"hidden": hidden, "layers": layers, "k": k,
+                                "lags_ps": list(lags_ps), "point_dim": 6,
+                                "node_dim": 24, "edge_dim": 13,
+                                "lam": lam, "lam_warmup": lam_warmup,
+                                "frame_weighted": frame_weighted,
+                                "temp_schedule": temp_schedule,
+                                "temp_emb_dim": temp_emb_dim,
+                                "reverse_prob": reverse_prob},
+                }
+                save_path = checkpoint_path.replace("{step}", str(step))
+                import os as _os
+                _os.makedirs(_os.path.dirname(_os.path.abspath(save_path)),
+                             exist_ok=True)
+                torch.save(cp, save_path)
+                print(f"  [step {step}] checkpoint saved → {save_path}", flush=True)
 
     # Unwrap compiled model for serialization
     raw_net = net._orig_mod if hasattr(net, "_orig_mod") else net
