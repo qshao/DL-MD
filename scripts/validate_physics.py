@@ -54,24 +54,44 @@ def build_report(ckpt, shard_paths, settings, device):
             wca_lam=settings["wca_lam"],
             noether=settings.get("noether", False),
             device=device).cpu()
-        rep = tv.validate(traj, shard["t"].float(),
+
+        rw_info = None
+        ca_for_validate = traj
+
+        if settings.get("reweight", False):
+            from lsmd.transfer_modes import reweight_boltzmann, resample_trajectory
+            rw = reweight_boltzmann(
+                traj, shard["res_type"], shard["chain_id"],
+                kT=settings.get("kT_reweight", 0.593),
+                w_wca=settings.get("w_wca_cg", 1.0),
+                w_angle=settings.get("w_angle", 1.0),
+                w_mj=settings.get("w_mj", 1.0))
+            ca_for_validate = resample_trajectory(traj, rw["weights"])
+            rw_info = {"n_eff": float(rw["n_eff"]),
+                       "degenerate": bool(rw["degenerate"])}
+
+        rep = tv.validate(ca_for_validate, shard["t"].float(),
                           tau_ps=settings["tau_ps"], dt_md_ps=float(shard["dt"]),
                           kT=settings["kT"], n_states=settings["n_states"])
         rep["n_res"] = int(shard["n_res"])
-        rep["reweight"] = None
+        rep["reweight"] = rw_info
+
+        if settings.get("reweight", False):
+            rep["kinetic"] = {k: None for k in rep["kinetic"]}
+
         proteins[_protein_id(path)] = rep
     return proteins
 
 
 def summarize(proteins):
-    """Mean headline metrics across proteins."""
+    """Mean headline metrics across proteins, skipping None (Mode B kinetics)."""
     def mean(getter):
-        vals = [getter(p) for p in proteins.values()]
+        vals = [v for v in [getter(p) for p in proteins.values()] if v is not None]
         return float(sum(vals) / len(vals)) if vals else float("nan")
     return {
-        "mean_rmsf_corr": mean(lambda p: p["structural"]["rmsf_corr"]),
-        "mean_dist_js": mean(lambda p: p["structural"]["dist_js"]),
-        "mean_fes_js": mean(lambda p: p["thermodynamic"]["fes_js"]),
+        "mean_rmsf_corr":   mean(lambda p: p["structural"]["rmsf_corr"]),
+        "mean_dist_js":     mean(lambda p: p["structural"]["dist_js"]),
+        "mean_fes_js":      mean(lambda p: p["thermodynamic"]["fes_js"]),
         "mean_relax_ratio": mean(lambda p: p["kinetic"]["relax_ratio"]),
     }
 
@@ -94,6 +114,16 @@ def main():
     ap.add_argument("--max_update_norm", type=float, default=3.0)
     ap.add_argument("--noether", action="store_true", default=False,
                     help="Apply Noether momentum projection after each step (Mode A).")
+    ap.add_argument("--reweight", action="store_true", default=False,
+                    help="Post-process trajectory with Boltzmann reweighting (Mode B).")
+    ap.add_argument("--kT_reweight", type=float, default=0.593,
+                    help="kT for Boltzmann reweighting in kcal/mol (default 0.593).")
+    ap.add_argument("--w_angle", type=float, default=1.0,
+                    help="Weight on angle term in CG energy for reweighting.")
+    ap.add_argument("--w_mj", type=float, default=1.0,
+                    help="Weight on MJ contact term in CG energy for reweighting.")
+    ap.add_argument("--w_wca_cg", type=float, default=1.0,
+                    help="Weight on WCA term in CG energy for reweighting (distinct from --wca_lam).")
     ap.add_argument("--n_states", type=int, default=6)
     ap.add_argument("--kT", type=float, default=1.0)
     ap.add_argument("--out", default="validation_baseline.json")
@@ -108,6 +138,8 @@ def main():
         "wca_lam": args.wca_lam, "bond_constraint_iters": args.bond_constraint_iters,
         "max_update_norm": args.max_update_norm, "n_states": args.n_states,
         "kT": args.kT, "noether": args.noether,
+        "reweight": args.reweight, "kT_reweight": args.kT_reweight,
+        "w_angle": args.w_angle, "w_mj": args.w_mj, "w_wca_cg": args.w_wca_cg,
     }
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     proteins = build_report(ckpt, args.shards, settings, device)
