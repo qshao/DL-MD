@@ -91,3 +91,20 @@ def test_populations_disjoint_clouds_tv_near_one():
     mix = torch.cat([a, b], dim=0)
     out = tv.state_populations(a, b, n_states=2, seed=0)
     assert out["pop_tv"] > 0.9
+
+
+def test_msd_static_structure_is_zero():
+    ca = torch.randn(1, 6, 3).repeat(20, 1, 1)
+    t, msd = tv.msd_curve(ca, dt_ps=10.0)
+    assert msd.abs().max() < 1e-6
+    assert torch.allclose(t, torch.arange(1, 11, dtype=torch.float64) * 10.0)
+
+
+def test_msd_diffusion_increases_monotonically():
+    torch.manual_seed(5)
+    steps = torch.randn(40, 6, 3) * 0.5
+    ca = steps.cumsum(dim=0)            # Brownian per residue
+    _, msd = tv.msd_curve(ca, dt_ps=1.0)
+    # First half should be non-decreasing on average
+    assert msd[5] > msd[1]
+    assert msd[-1] > msd[0]

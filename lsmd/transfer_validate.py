@@ -184,3 +184,28 @@ def state_populations(cv_model, cv_md, n_states=6, seed=0):
     pm, pd = pops(cv_model), pops(cv_md)
     tv_dist = 0.5 * (pm - pd).abs().sum().item()
     return {"pop_model": pm.tolist(), "pop_md": pd.tolist(), "pop_tv": tv_dist}
+
+
+def msd_curve(ca, dt_ps, max_lag=None):
+    """Internal mean-squared displacement vs lag.
+
+    ca: [F, N, 3]. Each frame is Kabsch-aligned to frame 0 to remove global
+    translation/rotation, so MSD reflects internal motion (same convention as
+    RMSF). Returns (time_ps [L], msd [L]) with time_ps[l] = l * dt_ps.
+    """
+    F = ca.shape[0]
+    if max_lag is None:
+        max_lag = F // 2
+    max_lag = min(max_lag, F - 1)
+    ref = ca[0].double()
+    aligned = torch.empty(F, ca.shape[1], 3, dtype=torch.float64)
+    for f in range(F):
+        R, t = g.kabsch(ref, ca[f].double())
+        aligned[f] = ca[f].double() @ R.T + t
+    times, msds = [], []
+    for lag in range(1, max_lag + 1):
+        d = aligned[lag:] - aligned[:-lag]              # [F-lag, N, 3]
+        times.append(lag * dt_ps)
+        msds.append((d ** 2).sum(dim=-1).mean().item())
+    return (torch.tensor(times, dtype=torch.float64),
+            torch.tensor(msds, dtype=torch.float64))
