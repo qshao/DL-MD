@@ -216,8 +216,7 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
           frame_weighted=True, compile_model=False, temp_schedule=None,
           temp_emb_dim=8, reverse_prob=0.0, resume_from=None,
           checkpoint_every=0, checkpoint_path=None,
-          energy_ckpt=None, lam_energy=0.0, lam_fdt=0.0, phys_warmup=500,
-          w_hi=1.0, w_lo=0.05):
+          lam_fdt=0.0, phys_warmup=500):
     """Train the union-graph propagator across proteins; return a checkpoint.
 
     Args:
@@ -281,28 +280,15 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
     schedule = NoiseSchedule(T=T_diff).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
 
-    # --- Phase 3: Load frozen energy model and precompute per-shard targets ---
-    energy = None
-    if energy_ckpt is not None:
-        from lsmd.learned_energy import (LearnedCGEnergy, frame_energy_cut,
-                                         md_step_cov)
-        energy = LearnedCGEnergy.load(energy_ckpt, map_location=device)
-        for p in energy.parameters():
-            p.requires_grad_(False)
-        edev = next(energy.parameters()).device
+    # --- Phase 3: Precompute per-shard FDT targets (MD step variance at each lag) ---
+    if lam_fdt > 0.0:
+        from lsmd.learned_energy import md_step_cov
         for s in shards:
-            s["_u_cut"] = frame_energy_cut(
-                energy,
-                s["t"].float().to(edev),
-                s["res_type"].long().to(edev),
-                s["chain_id"].long().to(edev),
-                pct=95.0)
             s["_sigma_md_tau_map"] = {
                 float(lag): md_step_cov(s["t"].float(), float(s["dt"]), float(lag))
                 for lag in lags_ps
             }
-        print(f"  Energy model loaded from {energy_ckpt}; "
-              f"precomputed targets for {len(shards)} shards", flush=True)
+        print(f"  Precomputed FDT targets for {len(shards)} shards", flush=True)
 
     # Resume from checkpoint: load weights and optimizer state, offset step counter
     init_step = 0
@@ -342,7 +328,6 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
                                  reverse_prob=reverse_prob)
     opt.zero_grad()
     lam_t = 0.0
-    lam_e = 0.0
     lam_f = 0.0
     loss_acc = 0.0       # accumulated (scaled) loss for logging
     nodes_acc = 0        # nodes processed since last log
@@ -361,34 +346,24 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
         nodes_acc  += int(node_feats.shape[0])
         if i % accum == 0:  # recompute once per gradient step
             lam_t = pl.lambda_schedule(i // accum, lam_warmup, lam)
-            lam_e = pl.lambda_schedule(i // accum, phys_warmup, lam_energy)
             lam_f = pl.lambda_schedule(i // accum, phys_warmup, lam_fdt)
         with torch.autocast(device_type=device.type, enabled=use_amp):
             temp_K = b_dev.get("temp_K")
-            if lam_t == 0.0 and (energy is None or (lam_e == 0.0 and lam_f == 0.0)):
+            if lam_t == 0.0 and lam_f == 0.0:
                 loss = ddpm_loss_union(net, b_dev["u_target"] / scale, node_feats,
                                        edge_index, edge_feats, tau, batch,
                                        schedule, temp_K=temp_K) / accum
             else:
                 phys = {kk: vv.to(device)
                         for kk, vv in pl.collate_physics(group).items()}
+                # geometric_penalty is inside ddpm_physics_loss via lam=lam_t
                 loss = pl.ddpm_physics_loss(net, b_dev, phys, scale,
                                             schedule, lam=lam_t) / accum
-        # Energy/FDT losses computed in float32 (outside autocast) to avoid
-        # WCA overflow: at r≈0 the WCA gradient is ~1e22, which overflows
-        # float16 (max 65504) → NaN in every tensor.
-        if energy is not None and (lam_e > 0.0 or lam_f > 0.0):
+        # FDT loss outside autocast: recover_u_denorm calls net in float32
+        if lam_f > 0.0:
             _, u_denorm = pl.recover_u_denorm(net, b_dev, scale, schedule)
-            u_denorm = u_denorm.float()
-            if lam_e > 0.0:
-                loss = loss + (lam_e / accum) * pl.energy_match_loss(
-                    phys["R_cur"].float(), phys["t_cur"].float(), u_denorm,
-                    phys["res_type"], phys["protein_id"], phys["chain_id"],
-                    energy, u_cut=float(phys["u_cut"].mean()),
-                    u_denorm_target=b_dev["u_target"].float(), w_hi=w_hi, w_lo=w_lo)
-            if lam_f > 0.0:
-                loss = loss + (lam_f / accum) * pl.fdt_loss(
-                    u_denorm, phys["protein_id"], phys["sigma_md_tau"])
+            loss = loss + (lam_f / accum) * pl.fdt_loss(
+                u_denorm.float(), phys["protein_id"], phys["sigma_md_tau"])
         loss_val = loss.item()
         if torch.isfinite(loss):
             scaler.scale(loss).backward()

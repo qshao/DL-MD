@@ -5,7 +5,7 @@ from lsmd import transfer_train as tt
 
 def test_train_exposes_phase3_kwargs():
     params = inspect.signature(tt.train).parameters
-    for name in ["energy_ckpt", "lam_energy", "lam_fdt", "phys_warmup", "w_hi", "w_lo"]:
+    for name in ["lam_fdt", "phys_warmup"]:
         assert name in params
 
 

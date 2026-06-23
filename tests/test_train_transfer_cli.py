@@ -10,6 +10,5 @@ def test_train_transfer_help_lists_phase3_flags():
     out = subprocess.run([sys.executable, SCRIPT, "--help"],
                          capture_output=True, text=True, cwd=REPO)
     assert out.returncode == 0
-    for flag in ["--energy_ckpt", "--lam_energy", "--lam_fdt", "--phys_warmup",
-                 "--w_hi", "--w_lo"]:
+    for flag in ["--lam_fdt", "--phys_warmup"]:
         assert flag in out.stdout

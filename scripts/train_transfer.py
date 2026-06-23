@@ -41,18 +41,10 @@ def main():
                     help="Max physics-penalty weight (C1 soft loss; 0=disabled)")
     ap.add_argument("--lam_warmup", type=int, default=500,
                     help="Gradient steps to ramp lam from 0 to --lam")
-    ap.add_argument("--energy_ckpt", default=None,
-                    help="Frozen LearnedCGEnergy checkpoint (Phase 3 Stage 2).")
-    ap.add_argument("--lam_energy", type=float, default=0.0,
-                    help="Max energy-match loss weight (0 = disabled).")
     ap.add_argument("--lam_fdt", type=float, default=0.0,
                     help="Max FDT step-variance loss weight (0 = disabled).")
     ap.add_argument("--phys_warmup", type=int, default=500,
-                    help="Gradient steps to ramp lam_energy/lam_fdt from 0.")
-    ap.add_argument("--w_hi", type=float, default=1.0,
-                    help="Energy-match hinge weight (unphysical excursions).")
-    ap.add_argument("--w_lo", type=float, default=0.05,
-                    help="Energy-match weak Boltzmann-consistency weight.")
+                    help="Gradient steps to ramp lam_fdt from 0.")
     ap.add_argument("--log_every", type=int, default=100,
                     help="Print loss + speed every N gradient steps")
     ap.add_argument("--grad_clip", type=float, default=1.0,
@@ -162,9 +154,7 @@ def main():
                     temp_emb_dim=args.temp_emb_dim,
                     reverse_prob=0.5 if args.time_reversal else 0.0,
                     resume_from=resume_ckpt,
-                    energy_ckpt=args.energy_ckpt, lam_energy=args.lam_energy,
-                    lam_fdt=args.lam_fdt, phys_warmup=args.phys_warmup,
-                    w_hi=args.w_hi, w_lo=args.w_lo)
+                    lam_fdt=args.lam_fdt, phys_warmup=args.phys_warmup)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     torch.save(ckpt, args.out)
