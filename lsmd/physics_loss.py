@@ -179,6 +179,12 @@ def ddpm_physics_loss(net, union, physics, scale, schedule, *, rama_pot=None,
         return score_loss
 
     u0_hat = (noisy - sqrt_1mab * pred) / sqrt_ab.clamp_min(1e-8)
+    # Clamp before the geometry penalty: at t→T, sqrt_alpha_bar→0 so u0_hat→∞.
+    # Bond deviations then overflow float16 (max 65504) inside autocast → Inf loss.
+    # ±5 normalized units ≈ ±5σ of the clean-update distribution; geometry beyond
+    # this is meaningless to penalise. Gradient is 0 at the boundary, which is
+    # intentional — we only want geometry feedback at low-to-mid noise levels.
+    u0_hat = u0_hat.clamp(-5.0, 5.0)
     u_denorm = u0_hat * scale_dev
     dev = u_denorm.device
     _pid = physics.get("protein_id")
