@@ -229,6 +229,10 @@ def recover_u_denorm(net, union, scale, schedule):
                union["edge_feats"], union["tau"], batch,
                temp_K=union.get("temp_K"))
     u0_hat = (noisy - sqrt_1mab * pred) / sqrt_ab.clamp_min(1e-8)
+    # Cap at ±5 normalized units — same bound as ddpm_physics_loss.
+    # Prevents bad model predictions at any noise level from producing
+    # u_denorm with huge variance that spikes the FDT loss quadratically.
+    u0_hat = u0_hat.clamp(-5.0, 5.0)
     return u0_hat, u0_hat * scale_dev
 
 
@@ -295,5 +299,8 @@ def fdt_loss(u_denorm, protein_id, sigma_md_tau):
         u_m = u_denorm[m][:, :3]
         var_model = (u_m - u_m.mean(0, keepdim=True)).pow(2).mean()
         var_target = sigma_md_tau[gi].to(var_model.dtype).to(var_model.device)
-        total = total + (var_model - var_target) ** 2
+        # MAE instead of MSE: (var_model - var_target)^2 grows quadratically
+        # with prediction errors and produces catastrophic spikes when u_denorm
+        # is occasionally large. Absolute error has bounded gradient (±1).
+        total = total + (var_model - var_target).abs()
     return total / max(pids.numel(), 1)

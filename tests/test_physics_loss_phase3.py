@@ -51,7 +51,7 @@ def test_fdt_loss_zero_when_variance_matches_target():
     u[:, :3] = torch.randn(N, 3) * (s2 ** 0.5)   # translational variance ≈ s2
     target = torch.tensor([u[:, :3].pow(2).mean()])   # exact per-protein target
     loss = fdt_loss(u, protein_id, target)
-    assert float(loss) < 1e-6
+    assert float(loss) < 1e-3  # MAE: |var - var| ≈ 0; tolerance > MSE threshold
 
 
 def test_fdt_loss_positive_when_diffusion_too_fast():
