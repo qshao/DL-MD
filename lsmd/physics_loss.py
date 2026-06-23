@@ -207,7 +207,12 @@ def recover_u_denorm(net, union, scale, schedule):
     G = union["tau"].shape[0]
     T = schedule.T
     t_min = max(1, T // 20)
-    t_idx = torch.randint(t_min, T + 1, (G,), device=u_target.device)
+    # Cap at T//2: at t=T sqrt_alpha_bar→0, so u0_hat = O(1)/1e-8 ≈ 10^8 Å.
+    # All atom pairs then collapse to r≈0, producing WCA energies ~10^19 and
+    # gradients ~10^22 that overflow the backward pass. At T//2 the max
+    # amplification is ~1.4x — u_denorm stays in physically reasonable range.
+    t_max_energy = T // 2
+    t_idx = torch.randint(t_min, t_max_energy + 1, (G,), device=u_target.device)
     t_nodes = t_idx[batch]
     eps = torch.randn_like(u_target)
     sqrt_ab = schedule.sqrt_alphas_bar[t_nodes].to(u_target.dtype).unsqueeze(-1)

@@ -31,7 +31,9 @@ def _wca_energy(t_pred, chain_id, sigma=4.5, eps=0.3):
     non_bonded = ~bonded & (seq_sep != 0)                    # exclude self
 
     r_cut = (2.0 ** (1.0 / 6.0)) * sigma                    # ≈ 5.05 Å
-    r = d[non_bonded].clamp_min(0.1)
+    # 3.0 Å is still extremely unphysical for Cα–Cα; clamping here bounds the
+    # WCA gradient (∝ r^-13) so backward doesn't overflow during energy-loss training.
+    r = d[non_bonded].clamp_min(3.0)
     sr6 = (sigma / r).pow(6)
     v_wca = 4.0 * eps * (sr6 * sr6 - sr6) + eps             # [M]
     in_range = (r < r_cut).to(v_wca.dtype)
