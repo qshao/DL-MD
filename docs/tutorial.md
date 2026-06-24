@@ -270,11 +270,23 @@ The **PropagatorNet** is a union-graph GNN that processes multiple proteins simu
 - Edges carry 13-dimensional SE(3)-relative geometric features (inter-frame distances, relative rotations).
 - DDPM ε-prediction with T=200 noise levels; DDIM sampling with η=0 for fast inference.
 
+## Checkpoint hierarchy
+
+The recommended workflow starts from a pre-trained checkpoint and proceeds through two fine-tuning stages:
+
+```
+v2_256h_90k.pt          ← pre-trained on large protein library (hidden=256, 6 layers, 90k steps)
+    └── v4_longlags.pt  ← Phase 1: universal ATLAS fine-tune, wide lag range (20k steps)
+            └── v4_{protein}.pt  ← Phase 2: per-protein fine-tune (5k steps each)
+```
+
+This hierarchy is managed by `scripts/run_v4_pipeline.sh` (see [V4 pipeline](#v4-per-protein-fine-tuning-pipeline) below).
+
 ## Training datasets
 
 | Dataset | Proteins | Frames | Temperature | Lag |
 |---|---|---|---|---|
-| ATLAS | 1938 | 1.9 M | 300 K (physiological) | 200 ps |
+| ATLAS | 1938 | 1.9 M | 300 K (physiological) | 100 ps/frame |
 | mdCATH | 1000 | 11 M | 320, 348, 379, 413, 450 K | 1–10 ns |
 
 ---
@@ -302,7 +314,37 @@ ATLAS shards are assumed to be at 300 K. mdCATH shards carry 5 temperatures (320
 
 ## Step 2 — Train the transferable model
 
-### Recommended training command
+### Recommended training commands
+
+**Phase 1 — Universal fine-tune from a pre-trained checkpoint (ATLAS only, 20k steps):**
+
+```bash
+python scripts/train_transfer.py \
+    --shards_dir data/atlas \
+    --resume checkpoints/v2_256h_90k.pt \
+    --lags_ps 100 200 500 1000 2000 5000 10000 20000 50000 \
+    --hidden 256 --layers 6 \
+    --lam 0.0 \
+    --steps 20000 \
+    --out checkpoints/v4_longlags.pt
+```
+
+**Phase 2 — Per-protein fine-tune from the universal checkpoint (5k steps each):**
+
+```bash
+python scripts/train_transfer.py \
+    --shard data/atlas/3u7t_A.pt \
+    --resume checkpoints/v4_longlags.pt \
+    --lags_ps 100 200 500 1000 2000 5000 10000 20000 50000 \
+    --hidden 256 --layers 6 \
+    --lam 0.0 \
+    --steps 5000 \
+    --out checkpoints/v4_3u7t_A.pt
+```
+
+Repeat Phase 2 for each protein. The `scripts/run_v4_pipeline.sh` script automates both phases across all proteins with three-temperature validation.
+
+**Pre-training from scratch (optional, for new architectures):**
 
 ```bash
 python scripts/train_transfer.py \
@@ -322,9 +364,11 @@ This takes ~4–5 hours on a single GPU at ~10 step/s. Key flags explained:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--shards_dir` | required | One or more shard directories (e.g. `data/atlas data/mdcath`) |
-| `--lags_ps` | `200 1000` | Physical lag times in picoseconds (can list multiple) |
-| `--norm_dir` | first dir | Directory to fit UpdateNorm on; defaults to ATLAS to avoid high-T mdCATH scale inflation |
+| `--shards_dir` | — | One or more directories of `*.pt` shards (e.g. `data/atlas data/mdcath`) |
+| `--shard PATH` | — | Individual shard file(s), repeatable. Use instead of `--shards_dir` for per-protein fine-tuning |
+| `--lags_ps` | `200 1000` | Physical lag times in picoseconds. Recommended: `100 200 500 1000 2000 5000 10000 20000 50000` for ATLAS fine-tuning |
+| `--resume CKPT` | — | Resume from an existing checkpoint. Weights and optimizer state are loaded; `--steps` means additional steps beyond the checkpoint |
+| `--norm_dir` | first dir | Directory to sample for UpdateNorm. Always re-fitted from current training data, so scale correctly reflects the active lag distribution |
 | `--no_frame_weighted` | off | By default, shards are sampled proportional to frame count so every MD frame has equal probability regardless of how many shards come from that dataset |
 
 ### Model architecture
@@ -341,8 +385,10 @@ This takes ~4–5 hours on a single GPU at ~10 step/s. Key flags explained:
 |---|---|---|
 | `--temp_schedule` | off | Temperature curriculum: `STEP:TEMP_K` pairs. Starts training on low-temperature (well-behaved) data and gradually introduces higher temperatures. Prevents NaN gradients caused by SO(3) singularities at high-T large backbone rotations |
 | `--time_reversal` | off | Enable time-reversal augmentation (`reverse_prob=0.5`). Each training example is randomly flipped (x_{t+τ}→x_t instead of x_t→x_{t+τ}), doubling effective training data and enforcing microscopic reversibility |
-| `--lam` | `0.0` | Physics penalty weight (C1 soft loss: bond lengths + steric clashes). Enabled by setting > 0 |
+| `--lam` | `0.0` | Physics penalty weight (C1 soft loss: bond lengths + steric clashes). Set `--lam 0.0` for ATLAS fine-tuning — the geometric penalty conflicts with SHAKE bond constraints at inference and degrades structural metrics (see validation analysis) |
 | `--lam_warmup` | `500` | Steps to ramp physics penalty from 0 to `--lam` |
+| `--lam_fdt` | `0.0` | FDT step-variance loss weight. Implemented but **not recommended** for ATLAS-scale datasets — insufficient trajectory density to reliably constrain kinetics via fluctuation-dissipation. Leave at 0 |
+| `--phys_warmup` | `0` | Steps to ramp `--lam_fdt` from 0 |
 
 ### Training efficiency
 
@@ -390,56 +436,85 @@ The curriculum transition lines confirm that temperature gates fire at the right
 
 ---
 
-## Step 3 — Evaluate zero-shot
+## Step 3 — Validate physics
 
-Evaluate on a protein that was never seen during training:
+`validate_physics.py` is the comprehensive validation script. It rolls out the model,
+then computes structural, thermodynamic, and kinetic metrics against the MD reference
+trajectory. Use it after every fine-tuning run.
 
 ```bash
-python scripts/eval_transfer.py \
-    --checkpoint checkpoints/v2_256h_curriculum.pt \
-    --shard      data/atlas/1abc.pt \
-    --steps      200 \
+python scripts/validate_physics.py \
+    --checkpoint checkpoints/v4_3u7t_A.pt \
+    --shard      data/atlas/3u7t_A.pt \
+    --steps      300 \
     --tau_ps     2000 \
     --diff_steps 20 \
-    --eta        0.0 \
+    --eta        1.0 \
     --temp_K     300.0 \
-    --out        eval_1abc.json
+    --noether \
+    --out        validation_3u7t_A_T300.json
 ```
 
-Output `eval_1abc.json`:
+To sweep inference temperatures (300 / 375 / 450 K), run the command three times with `--temp_K`.
+The best temperature is usually 300–375 K; 450 K tends to degrade structural metrics.
+
+Output JSON structure:
 ```json
 {
-  "model": {
-    "rmsf_corr": 0.87,
-    "dist_js": 0.003,
-    "ca_bond_mean": 3.81,
-    "clash_count": 0.0
+  "summary": {
+    "mean_rmsf_corr": 0.939,
+    "mean_dist_js": 0.000142,
+    "mean_fes_js": 0.360,
+    "mean_relax_ratio": 0.414
+  },
+  "proteins": {
+    "3u7t_A": {
+      "structural":    { "rmsf_corr": 0.939, "dist_js": 0.000142, "rg_js": 0.025,
+                         "ca_bond_mean": 3.829, "clash_count": 0.0 },
+      "thermodynamic": { "fes_js": 0.360, "fes_rmse_kT": 0.0, "pop_tv": 0.234 },
+      "kinetic":       { "msd_rmse": 0.246, "acf_rmse": 0.194,
+                         "relax_model_ps": 3125, "relax_md_ps": 7554, "relax_ratio": 0.414 },
+      "n_res": 46
+    }
   }
 }
 ```
 
-| Metric | Meaning | Good value |
-|---|---|---|
-| `rmsf_corr` | Pearson correlation of per-residue RMSF vs MD reference | > 0.80 for zero-shot |
-| `dist_js` | Jensen-Shannon divergence of Cα–Cα pairwise distance distributions | < 0.01 |
-| `ca_bond_mean` | Mean Cα–Cα bond length in generated frames | 3.7–3.9 Å |
-| `clash_count` | Mean steric clashes per frame (non-bonded Cα pairs < 3.0 Å) | < 1.0 |
+### Metric reference
 
-**All `eval_transfer.py` flags:**
+| Metric | Location | Good value | Meaning |
+|---|---|---|---|
+| `rmsf_corr` | structural | > 0.90 | Per-residue flexibility matches MD (Pearson r) |
+| `dist_js` | structural | < 0.005 | Cα pairwise-distance distributions match MD |
+| `rg_js` | structural | < 0.10 | Radius-of-gyration distribution matches MD |
+| `ca_bond_mean` | structural | 3.7–3.9 Å | Backbone bond geometry correct |
+| `clash_count` | structural | < 0.5 | Mean clashes per frame |
+| `fes_js` | thermodynamic | < 0.5 | Free-energy surface in PCA space matches MD |
+| `pop_tv` | thermodynamic | < 0.3 | Metastable-state populations match MD |
+| `relax_ratio` | kinetic | 0.5–2.0 | Model relaxation time vs MD (1 = ideal) |
+
+**All `validate_physics.py` flags:**
 
 | Flag | Default | Description |
 |---|---|---|
 | `--checkpoint` | required | Path to trained `.pt` checkpoint |
-| `--shard` | required | Held-out protein shard `.pt` |
+| `--shard` | required | Protein shard `.pt` (repeatable for multi-protein reports) |
 | `--steps` | `200` | Number of autoregressive rollout steps |
-| `--tau_ps` | `1000` | Lag time in picoseconds |
-| `--diff_steps` | `50` | Denoising steps per rollout step (50 = DDPM quality; 10–20 = DDIM) |
-| `--eta` | `1.0` | Reverse-process stochasticity: 1.0 = DDPM, 0.0 = deterministic DDIM |
-| `--temp_K` | `300.0` | Simulation temperature in Kelvin passed to the model |
-| `--oracle` | — | Per-protein checkpoint (upper-bound bracket) |
-| `--lower` | — | Marginal-prior checkpoint (lower-bound bracket) |
-| `--out` | `eval.json` | Output path |
+| `--tau_ps` | `2000` | Physical lag per step in picoseconds |
+| `--diff_steps` | `20` | Denoising steps per rollout step |
+| `--eta` | `1.0` | Stochasticity: 1.0 = DDPM, 0.0 = deterministic DDIM |
+| `--temp_K` | `300.0` | Simulation temperature in Kelvin |
+| `--noether` | off | Apply Noether momentum projection after each step (recommended — prevents COM drift) |
+| `--wca_sigma` | `4.5` | WCA excluded-volume diameter (Å); set to 0 to disable WCA guidance |
+| `--wca_lam` | `0.05` | WCA guidance step size (normalized units) |
+| `--bond_constraint_iters` | `5` | SHAKE pseudo-bond iterations per step |
+| `--max_update_norm` | `3.0` | Per-residue update norm clip before de-normalization |
+| `--n_states` | `6` | Number of k-means states for population analysis |
+| `--kT` | `1.0` | kT in kcal/mol for FES computation |
+| `--out` | `validation_baseline.json` | Output path |
 | `--device` | auto | `cuda` or `cpu` |
+
+> **Note:** `eval_transfer.py` still exists and produces a simpler four-metric JSON (rmsf_corr, dist_js, ca_bond_mean, clash_count). Use it for quick checks; use `validate_physics.py` for full kinetic + thermodynamic analysis.
 
 ### DDIM vs DDPM at inference
 
@@ -453,6 +528,54 @@ The model is trained with T=200 DDPM noise levels but supports any number of den
 | 10 | 0.0 | Aggressive DDIM | **20×** |
 
 For production rollouts, `--diff_steps 20 --eta 0.0` provides a good quality/speed balance.
+
+---
+
+---
+
+## V4 Per-Protein Fine-Tuning Pipeline
+
+`scripts/run_v4_pipeline.sh` automates the full two-phase workflow across multiple proteins
+and produces per-protein checkpoints with three-temperature validation reports.
+
+```bash
+# Full pipeline (~5–6 hours on a single GPU for 6 proteins)
+bash scripts/run_v4_pipeline.sh
+
+# Dry run — print all commands without executing
+bash scripts/run_v4_pipeline.sh --dry-run
+```
+
+**What it does:**
+
+| Phase | What | Output |
+|---|---|---|
+| Phase 1 train | 20k steps, all proteins, lags 100 ps–50k ps | `checkpoints/v4_longlags.pt` |
+| Phase 1 validate | 300 steps, T=300 K, all proteins | `validation_v4_longlags_T300.json` |
+| Phase 2 train (×N) | 5k steps per protein from longlags checkpoint | `checkpoints/v4_{protein}.pt` |
+| Phase 2 validate (×N×3) | T=300, 375, 450 K per protein | `validation_v4_{protein}_T{temp}.json` |
+
+**Prerequisites:**
+- `checkpoints/v3_lam0.pt` (Phase 1 base checkpoint)
+- `data/atlas/{protein}.pt` shards for each protein in `PROTEINS`
+
+**Customising the protein list or lag set:** edit the shell variables at the top of the script:
+```bash
+PROTEINS="3u7t_A 4p3a_B 1b2s_F 2y4x_B 1z0b_A 6ovk_R"
+BASE_TRAIN="--hidden 256 --layers 6 --lags_ps 100 200 500 1000 2000 5000 10000 20000 50000 --lam 0.0"
+VFLAGS="--steps 300 --tau_ps 2000 --diff_steps 20 --eta 1.0 --noether"
+```
+
+### Why wide lags matter
+
+The ATLAS frame interval is **100 ps**. If the minimum training lag is larger than the
+inference τ, the model must extrapolate out-of-distribution — an unstable regime for DDPM
+that produces NaN positions during rollout.
+
+The recommended lag set `[100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000]` ps:
+- Places the inference τ = 2000 ps in the **middle** of the distribution (not at an edge)
+- Provides short-lag anchoring (100–500 ps) for local structural stability
+- Covers slow barrier-crossing timescales up to 50% of one ATLAS trajectory
 
 ---
 
@@ -500,24 +623,26 @@ With `--time_reversal`, each training example has a 50% chance of being reversed
 2. Enforces **microscopic reversibility** — the model learns dynamics that could be run forward or backward in time, consistent with equilibrium statistical mechanics
 3. Naturally prevents the model from learning irreversible drift artifacts
 
-### C1 physics loss (`--lam 0.01`)
+### C1 physics loss (`--lam`)
 
-When `--lam > 0`, an auxiliary loss penalizes the model's predicted clean-update estimate x0_hat for geometric violations:
-- Cα–Cα consecutive bond deviations from 3.8 Å
-- Steric clashes (non-bonded Cα pairs < 3.0 Å)
+When `--lam > 0`, an auxiliary loss penalizes the model's predicted clean-update estimate for geometric violations (Cα–Cα bond deviations from 3.8 Å; steric clashes). **Validation on ATLAS showed this hurts structural metrics**: the geometric penalty conflicts with the SHAKE bond constraint applied during inference rollout, causing bond lengths to settle at ~4.5 Å instead of 3.8 Å. Keep `--lam 0.0` for ATLAS fine-tuning. See `docs/validation_analysis.md` for the full analysis.
 
-This does not change the DDPM noise schedule or sampling procedure; it provides a supervision signal that the predicted endpoint should be geometrically reasonable.
+### C2 WCA guidance (at inference)
 
-### C2 guidance (at inference, via `lsmd.guidance`)
-
-At inference, `sample_ddpm_union_guided` applies a per-step gradient nudge toward valid geometry during the reverse diffusion process. This is distinct from the C1 training loss — it actively steers each denoising step:
+During the reverse diffusion process, a WCA (Weeks-Chandler-Andersen) excluded-volume
+potential steers each denoising step away from steric clashes. This is distinct from the
+C1 training loss — it actively nudges `u0_hat` in normalized update space at each of
+the `--diff_steps` denoising steps:
 
 ```python
-from lsmd.guidance import sample_ddpm_union_guided
-u = sample_ddpm_union_guided(net, ..., gamma=0.1)  # gamma=0 → plain DDPM
+# Controlled via validate_physics.py / rollout() flags:
+#   --wca_sigma 4.5   WCA CA–CA diameter (Å)
+#   --wca_eps   0.3   well depth (kcal/mol)
+#   --wca_lam   0.05  guidance step size (normalized units)
 ```
 
-`gamma > 0` reduces geometric violations at the cost of some sample diversity. Start with `gamma=0.05–0.1`.
+Set `--wca_sigma 0` to disable WCA guidance entirely. The default `--wca_lam 0.05`
+produces near-zero clash counts across all proteins without measurably reducing sample diversity.
 
 ---
 
@@ -604,13 +729,16 @@ Then train with `--shards_dir data/my_protein` alongside ATLAS/mdCATH. Set `--la
 
 ## Summary
 
-| | Per-protein DDPM | Transferable propagator |
+| | Per-protein DDPM | Transferable propagator (v4) |
 |---|---|---|
-| Training data | Single MD trajectory | ATLAS (1938) + mdCATH (1000) proteins |
-| Proteins at inference | Same protein only | Any new protein (zero-shot) |
-| Step interval | 200 ps – 1 ns | 2 – 10 ns |
+| Training data | Single MD trajectory | ATLAS fine-tune + per-protein fine-tune |
+| Proteins at inference | Same protein only | Any protein (zero-shot or fine-tuned) |
+| Lag range trained | 200 ps – 1 ns | 100 ps – 50 ns |
+| Inference τ | Matches training | 2000 ps (recommended) |
 | Throughput (N=100) | Protein-specific | ~1300 μs/day (DDPM) / ~13 ms/day (DDIM-20) |
-| Temperature | Single (training T) | 300–450 K (conditioning) |
+| Temperature | Single (training T) | 300–450 K sweep; best T chosen per protein |
 | Checkpoint size | ~1 MB | ~20 MB (hidden=256) |
-| Training time | ~10 min (GPU) | ~4–5 h (GPU, 50 K steps) |
+| Training time | ~10 min (GPU) | ~3 h Phase 1 + ~48 min/protein Phase 2 |
+| Validation script | `infer.py` | `validate_physics.py` (structural + kinetic + thermo) |
+| Typical RMSF corr (ATLAS) | Per-protein only | 0.72–0.98 (v4 per-protein fine-tune) |
 | All-atom reconstruction | Template nearest-neighbor | Not included (Cα-level output) |
