@@ -1,0 +1,56 @@
+{
+  "heldout": false,
+  "checkpoint": "checkpoints/v4_2y4x_B.pt",
+  "settings": {
+    "steps": 300,
+    "tau_ps": 2000.0,
+    "k": 12,
+    "diff_steps": 20,
+    "eta": 1.0,
+    "temp_K": 450.0,
+    "wca_sigma": 4.5,
+    "wca_eps": 0.3,
+    "wca_lam": 0.05,
+    "bond_constraint_iters": 5,
+    "max_update_norm": 3.0,
+    "n_states": 6,
+    "kT": 1.0,
+    "noether": true,
+    "reweight": false,
+    "kT_reweight": 0.593,
+    "w_angle": 1.0,
+    "w_mj": 1.0,
+    "w_wca_cg": 1.0
+  },
+  "proteins": {
+    "2y4x_B": {
+      "structural": {
+        "rmsf_corr": 0.9209867119789124,
+        "dist_js": 0.0008820352959446609,
+        "rg_js": 0.30244264006614685,
+        "ca_bond_mean": 3.8314716815948486,
+        "clash_count": 0.717607973421927
+      },
+      "thermodynamic": {
+        "fes_js": 0.6383392849592643,
+        "fes_rmse_kT": 0.0,
+        "pop_tv": 0.5603698626954441
+      },
+      "kinetic": {
+        "msd_rmse": 4.586177838480464,
+        "acf_rmse": 0.829312356085236,
+        "relax_model_ps": 68297.7273058271,
+        "relax_md_ps": 10901.569122057885,
+        "relax_ratio": 6.264944664491983
+      },
+      "n_res": 93,
+      "reweight": null
+    }
+  },
+  "summary": {
+    "mean_rmsf_corr": 0.9209867119789124,
+    "mean_dist_js": 0.0008820352959446609,
+    "mean_fes_js": 0.6383392849592643,
+    "mean_relax_ratio": 6.264944664491983
+  }
+}
