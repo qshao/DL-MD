@@ -335,6 +335,74 @@ def fig_structural(out_dir):
     return save(fig, out_dir, "fig6_structural.png")
 
 
+# ── Fig 7: MD acceleration estimate ──────────────────────────────────────────
+
+def fig_acceleration(out_dir):
+    # Throughput: ~540 µs/day (pure rollout estimate from pipeline timing)
+    # Classical MD: 100–300 ns/day for explicit-solvent ~100 aa on A100
+    tp_lo, tp_hi = 1800, 5400   # raw throughput speedup range
+
+    best_T = [375, 375, 300, 375, 300, 375]
+    relax_ratios = []
+    for p, T in zip(PROTEINS, best_T):
+        rr = get_v4_metric(p, T, ["proteins", p, "kinetic", "relax_ratio"])
+        relax_ratios.append(rr)
+
+    eff_lo = [tp_lo / rr for rr in relax_ratios]
+    eff_hi = [tp_hi / rr for rr in relax_ratios]
+    eff_mid = [(lo + hi) / 2 for lo, hi in zip(eff_lo, eff_hi)]
+    eff_err = [(hi - lo) / 2 for lo, hi in zip(eff_lo, eff_hi)]
+
+    n_res = [46, 79, 90, 93, 207, 219]
+    # colour by size: small=blue, large=orange
+    colours = ["#2166ac" if n < 150 else "#d6604d" for n in n_res]
+
+    with plt.rc_context({**STYLE, "axes.grid.axis": "x"}):
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+
+    ax1, ax2 = axes
+    x = np.arange(len(PROTEINS))
+
+    # Left: effective speedup (log scale)
+    bars = ax1.barh(x, eff_mid, xerr=eff_err, color=colours, edgecolor="white",
+                    height=0.55, capsize=4, error_kw={"elinewidth": 1.2})
+    ax1.set_xscale("log")
+    ax1.set_yticks(x)
+    ax1.set_yticklabels([f"{p.replace('_',' ')}\n({n} aa)"
+                         for p, n in zip(PROTEINS, n_res)], fontsize=9)
+    ax1.set_xlabel("Effective speedup vs classical MD (×)", fontsize=9.5)
+    ax1.set_title("Estimated MD Acceleration\n(throughput × kinetic factor)",
+                  fontsize=10, fontweight="bold")
+    ax1.axvline(1000, color="gray", linewidth=0.8, linestyle=":", alpha=0.7)
+    ax1.axvline(10000, color="gray", linewidth=0.8, linestyle=":", alpha=0.7)
+    for xi, (mid, lo, hi) in enumerate(zip(eff_mid, eff_lo, eff_hi)):
+        ax1.text(hi * 1.15, xi, f"{lo:.0f}–{hi:.0f}×",
+                 va="center", fontsize=7.5, color="#333")
+
+    # Right: decomposition — throughput vs kinetic factor
+    w = 0.35
+    ax2.bar(x - w/2, [tp_lo]*len(PROTEINS), width=w, label="Throughput (lower bound)",
+            color="#98df8a", edgecolor="white", alpha=0.9)
+    ax2.bar(x + w/2, [1/rr for rr in relax_ratios], width=w,
+            label="Kinetic factor (1 / relax_ratio)", color="#aec7e8", edgecolor="white", alpha=0.9)
+    ax2.axhline(1.0, color="black", linewidth=1, linestyle="--", alpha=0.6)
+    ax2.set_xticks(x)
+    ax2.set_xticklabels([p.replace("_", " ") for p in PROTEINS], fontsize=8.5,
+                         rotation=15, ha="right")
+    ax2.set_ylabel("Factor", fontsize=9.5)
+    ax2.set_title("Throughput vs Kinetic Contribution",
+                  fontsize=10, fontweight="bold")
+    ax2.set_yscale("log")
+    ax2.legend(fontsize=8, loc="upper right")
+
+    legend_elements = [mpatches.Patch(color="#2166ac", label="Small protein (< 150 aa)"),
+                       mpatches.Patch(color="#d6604d", label="Large protein (≥ 150 aa)")]
+    ax1.legend(handles=legend_elements, fontsize=8, loc="lower right")
+
+    fig.tight_layout()
+    return save(fig, out_dir, "fig7_acceleration.png")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="docs/figures")
@@ -348,6 +416,7 @@ def main():
     fig_temp_heatmap(args.out)
     fig_kinetics(args.out)
     fig_structural(args.out)
+    fig_acceleration(args.out)
     print("Done.")
 
 

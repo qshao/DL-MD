@@ -13,8 +13,9 @@
 3. [Lag Strategy: What We Tried](#3-lag-strategy-what-we-tried)
 4. [Engineering Fixes](#4-engineering-fixes)
 5. [Results](#5-results)
-6. [V4 Pipeline Summary](#6-v4-pipeline-summary)
-7. [Conclusions and Next Steps](#7-conclusions-and-next-steps)
+6. [MD Acceleration Estimate](#6-md-acceleration-estimate)
+7. [V4 Pipeline Summary](#7-v4-pipeline-summary)
+8. [Conclusions and Next Steps](#8-conclusions-and-next-steps)
 
 ---
 
@@ -202,7 +203,51 @@ The v2 baseline showed highly variable performance (r = –0.001 to 0.71). The v
 
 ---
 
-## 6. V4 Pipeline Summary
+## 6. MD Acceleration Estimate
+
+Acceleration of MD by a surrogate model has two independent components that must be considered separately.
+
+### Two kinds of acceleration
+
+**Throughput** measures how much simulated time the model generates per GPU-day compared to classical MD:
+- Model (pure rollout, τ = 2000 ps, diff_steps = 20): **~540 μs/day** estimated from pipeline timing
+- Classical explicit-solvent MD (~100 aa, A100 GPU): **~100–300 ns/day**
+- Raw throughput speedup: **~1800–5400×**
+
+**Kinetic factor** measures whether the model explores conformational space faster *per unit of simulated time*. This is directly given by the relax_ratio:
+- relax_ratio < 1 → model decorrelates faster than MD → additional kinetic benefit
+- relax_ratio > 1 → model decorrelates slower → throughput partially cancelled
+
+Effective acceleration = throughput × kinetic factor = throughput / relax_ratio.
+
+### Figure 7 — Estimated MD acceleration per protein
+
+![MD acceleration](figures/fig7_acceleration.png)
+
+*Left: effective speedup over classical MD (log scale), showing error bars for the 100–300 ns/day MD reference range. Right: decomposition into throughput (green) and kinetic factor (blue). Values above the dashed line (kinetic factor > 1) indicate the model samples faster per unit of simulated time than MD.*
+
+### Per-protein estimates
+
+| Protein | N (aa) | Relax ratio | Kinetic factor | **Effective speedup** |
+|---|---|---|---|---|
+| 3u7t_A | 46  | 0.48 | 2.1× faster | **~3800–11300×** |
+| 4p3a_B | 79  | 0.58 | 1.7× faster | **~3100–9400×** |
+| 1b2s_F | 90  | 0.79 | 1.3× faster | **~2300–6800×** |
+| 2y4x_B | 93  | 1.05 | ~1× (neutral) | **~1700–5100×** |
+| 1z0b_A | 207 | 4.17 | 0.24× (slower) | **~430–1300×** |
+| 6ovk_R | 219 | 5.09 | 0.20× (slower) | **~350–1060×** |
+
+### Interpretation by use case
+
+**Local flexibility and RMSF studies** — the model is highly effective. Small proteins (< 100 aa) achieve 2000–11000× speedup with excellent structural fidelity (RMSF corr > 0.94). For larger proteins (~200 aa), slower kinetics reduce the net gain to ~400–1300×.
+
+**Conformational transitions and rare events** — more cautious interpretation required. The FES JS values (0.33–0.57) indicate the model does not fully sample the conformational landscape: it reproduces local fluctuations around the starting basin well but does not cross free-energy barriers proportionally faster than MD. The effective acceleration for *discovering new conformational states* is substantially lower than the throughput numbers suggest.
+
+**Summary:** The v4 model provides a genuine **~1000–10000× wall-clock speedup** for studying flexibility and ensemble properties of small-to-medium proteins. For slow conformational transitions in large proteins, the throughput gain (~350–1000×) is partially offset by slower per-step kinetics, and the FES coverage (JS ~ 0.5) means the model should not yet be used as a primary accelerated sampler of rare events.
+
+---
+
+## 7. V4 Pipeline Summary
 
 | Phase | Script | Output | Wall time |
 |---|---|---|---|
@@ -220,7 +265,7 @@ bash scripts/run_v4_pipeline.sh
 
 ---
 
-## 7. Conclusions and Next Steps
+## 8. Conclusions and Next Steps
 
 The v4 pipeline demonstrates that combining a wide-lag universal fine-tune with per-protein adaptation and inference temperature tuning yields dramatically better structural and thermodynamic agreement with MD than the v3 baseline. Five of six proteins now achieve RMSF correlation > 0.93, and all five validation criteria pass.
 
