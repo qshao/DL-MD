@@ -198,8 +198,15 @@ def msd_curve(ca, dt_ps, max_lag=None):
         max_lag = F // 2
     max_lag = min(max_lag, F - 1)
     ref = ca[0].double()
+    if not torch.isfinite(ref).all():
+        nan = float("nan")
+        dummy = torch.full((max_lag,), nan, dtype=torch.float64)
+        return dummy.clone(), dummy.clone()
     aligned = torch.empty(F, ca.shape[1], 3, dtype=torch.float64)
     for f in range(F):
+        if not torch.isfinite(ca[f]).all():
+            aligned[f] = float("nan")
+            continue
         R, t = g.kabsch(ref, ca[f].double())
         aligned[f] = ca[f].double() @ R.T + t
     times, msds = [], []

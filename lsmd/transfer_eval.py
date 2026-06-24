@@ -201,7 +201,14 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
         # De-normalize update
         u = u * scale
         # Advance SE(3) frames
-        R, t = feat.apply_update(R, t, u)
+        R_new, t_new = feat.apply_update(R, t, u)
+        if not torch.isfinite(t_new).all():
+            # Denoising produced NaN/Inf; keep previous frame to prevent cascade
+            import warnings
+            warnings.warn(f"rollout: NaN position at step {len(traj)} — keeping previous frame")
+            traj.append(t.clone())
+            continue
+        R, t = R_new, t_new
         # SHAKE: restore CA–CA pseudo-bond lengths (bonded potential in CG-MD)
         if bond_constraint_iters > 0:
             t = _apply_bond_constraint(t, ref_dists, chain_id,

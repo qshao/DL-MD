@@ -70,9 +70,15 @@ def build_report(ckpt, shard_paths, settings, device):
             rw_info = {"n_eff": float(rw["n_eff"]),
                        "degenerate": bool(rw["degenerate"])}
 
-        rep = tv.validate(ca_for_validate, shard["t"].float(),
-                          tau_ps=settings["tau_ps"], dt_md_ps=float(shard["dt"]),
-                          kT=settings["kT"], n_states=settings["n_states"])
+        try:
+            rep = tv.validate(ca_for_validate, shard["t"].float(),
+                              tau_ps=settings["tau_ps"], dt_md_ps=float(shard["dt"]),
+                              kT=settings["kT"], n_states=settings["n_states"])
+        except Exception as exc:
+            print(f"  WARNING: validation failed for {_protein_id(path)}: {exc}",
+                  flush=True)
+            proteins[_protein_id(path)] = {"error": str(exc)}
+            continue
         rep["n_res"] = int(shard["n_res"])
         rep["reweight"] = rw_info
 
@@ -87,9 +93,18 @@ def build_report(ckpt, shard_paths, settings, device):
 
 
 def summarize(proteins):
-    """Mean headline metrics across proteins, skipping None (Mode B kinetics)."""
+    """Mean headline metrics across proteins, skipping None and error entries."""
     def mean(getter):
-        vals = [v for v in [getter(p) for p in proteins.values()] if v is not None]
+        vals = []
+        for p in proteins.values():
+            if "error" in p:
+                continue
+            try:
+                v = getter(p)
+                if v is not None:
+                    vals.append(v)
+            except (KeyError, TypeError):
+                pass
         return float(sum(vals) / len(vals)) if vals else float("nan")
     return {
         "mean_rmsf_corr":   mean(lambda p: p["structural"]["rmsf_corr"]),
