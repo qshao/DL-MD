@@ -29,12 +29,12 @@ mkdir -p "$LOG_DIR" checkpoints
 
 PROTEINS="3u7t_A 4p3a_B 1b2s_F 2y4x_B 1z0b_A 6ovk_R"
 VFLAGS="--steps 300 --tau_ps 2000 --diff_steps 20 --eta 1.0 --noether"
-BASE_TRAIN="--hidden 256 --layers 6 --lags_ps 5000 10000 20000 --lam 0.0"
+BASE_TRAIN="--hidden 256 --layers 6 --lags_ps 2000 5000 10000 20000 30000 50000 --lam 0.0"
 
 echo "=== V4 PIPELINE START $(date) ===" | tee "$LOG_DIR/v4_pipeline_$(date +%Y%m%d_%H%M%S).log"
 
 # ── Phase 1: Long-lag universal fine-tune ─────────────────────────────────────
-echo "[Phase 1] Train v4_longlags (lags=5k/10k/20k ps, 20k steps)"
+echo "[Phase 1] Train v4_longlags (lags=2k/5k/10k/20k/30k/50k ps, 20k steps)"
 run python scripts/train_transfer.py \
     --shards_dir data/atlas \
     --resume checkpoints/v3_lam0.pt \
