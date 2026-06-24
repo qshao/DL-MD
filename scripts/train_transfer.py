@@ -23,8 +23,12 @@ from lsmd import transfer_train as tt
 
 def main():
     ap = argparse.ArgumentParser(description="Train transferable propagator")
-    ap.add_argument("--shards_dir", nargs="+", required=True,
+    ap.add_argument("--shards_dir", nargs="+", default=None,
                     help="One or more directories of *.pt shards")
+    ap.add_argument("--shard", action="append", default=None, dest="extra_shards",
+                    metavar="PATH",
+                    help="Individual .pt shard file(s). Repeatable. "
+                         "Use instead of --shards_dir for per-protein fine-tuning.")
     ap.add_argument("--split", default=None,
                     help="split.json with a 'train' id list (applied to first dir only)")
     ap.add_argument("--lags_ps", type=float, nargs="+", default=[200.0, 1000.0])
@@ -81,33 +85,46 @@ def main():
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
 
+    if not args.shards_dir and not args.extra_shards:
+        ap.error("At least one of --shards_dir or --shard must be provided.")
+
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    # --- Load shards from all requested directories ---
+    # --- Load shards ---
     shards = []
     dir_shard_lists = {}
-    for i, shard_dir in enumerate(args.shards_dir):
-        paths = sorted(glob.glob(os.path.join(shard_dir, "*.pt")))
-        # split filter only applies to the first directory
-        if i == 0 and args.split:
-            with open(args.split) as fh:
-                train_ids = set(json.load(fh)["train"])
-            paths = [p for p in paths
-                     if os.path.splitext(os.path.basename(p))[0] in train_ids]
+
+    if args.shards_dir:
+        for i, shard_dir in enumerate(args.shards_dir):
+            paths = sorted(glob.glob(os.path.join(shard_dir, "*.pt")))
+            if i == 0 and args.split:
+                with open(args.split) as fh:
+                    train_ids = set(json.load(fh)["train"])
+                paths = [p for p in paths
+                         if os.path.splitext(os.path.basename(p))[0] in train_ids]
+            t0 = time.perf_counter()
+            dir_shards = [torch.load(p, map_location="cpu", weights_only=False)
+                          for p in paths]
+            elapsed = time.perf_counter() - t0
+            n_frames = sum(s["t"].shape[0] for s in dir_shards)
+            print(f"  {shard_dir}: {len(dir_shards)} shards, "
+                  f"{n_frames:,} total frames  ({elapsed:.1f}s)", flush=True)
+            shards.extend(dir_shards)
+            dir_shard_lists[shard_dir] = dir_shards
+
+    if args.extra_shards:
         t0 = time.perf_counter()
-        dir_shards = [torch.load(p, map_location="cpu", weights_only=False)
-                      for p in paths]
+        extra = [torch.load(p, map_location="cpu", weights_only=False)
+                 for p in args.extra_shards]
         elapsed = time.perf_counter() - t0
-        n_frames = sum(s["t"].shape[0] for s in dir_shards)
-        print(f"  {shard_dir}: {len(dir_shards)} shards, "
+        n_frames = sum(s["t"].shape[0] for s in extra)
+        print(f"  --shard: {len(extra)} file(s), "
               f"{n_frames:,} total frames  ({elapsed:.1f}s)", flush=True)
-        shards.extend(dir_shards)
-        dir_shard_lists[shard_dir] = dir_shards
+        shards.extend(extra)
 
-    print(f"Total: {len(shards)} shards from {len(args.shards_dir)} dataset(s)",
-          flush=True)
+    n_sources = len(args.shards_dir or []) + (1 if args.extra_shards else 0)
+    print(f"Total: {len(shards)} shards from {n_sources} source(s)", flush=True)
 
-    # Resolve norm shards: default to first dir (usually ATLAS)
     norm_shards = None
     if args.norm_dir is not None:
         if args.norm_dir in dir_shard_lists:
@@ -118,11 +135,11 @@ def main():
                            for p in norm_paths]
             print(f"  norm_dir {args.norm_dir}: {len(norm_shards)} shards for UpdateNorm",
                   flush=True)
-    elif len(args.shards_dir) > 1:
-        # Multiple datasets: default norm pool = first dir (most physiologically stable)
+    elif args.shards_dir and len(args.shards_dir) > 1:
         norm_shards = dir_shard_lists[args.shards_dir[0]]
         print(f"  UpdateNorm fitted on: {args.shards_dir[0]} ({len(norm_shards)} shards)",
               flush=True)
+    # If only --shard provided, norm_shards stays None → UpdateNorm uses all shards
 
     # Parse temperature schedule: "0:320 2000:348 ..." -> [(0,320),(2000,348),...]
     temp_schedule = None
