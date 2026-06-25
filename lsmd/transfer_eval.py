@@ -110,7 +110,10 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
             *, steps, tau_ps, k, diff_steps=50, eta=1.0, temp_K=300.0,
             bond_constraint_iters=5, max_update_norm=3.0,
             wca_sigma=4.5, wca_eps=0.3, wca_lam=0.05,
-            noether=False, device="cpu"):
+            noether=False,
+            cv_space=None, cv_buffer=None, k_guide=0.05, sigma_cv=1.0,
+            guide_warmup=50,
+            device="cpu"):
     """Autoregressive CA trajectory from a reference structure.
 
     The graph is rebuilt from current (R, t) each step (state-conditional).
@@ -190,6 +193,17 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
                                 sigma=wca_sigma, eps=wca_eps, lam=wca_lam)
             if use_wca else None
         )
+        # CV-space repulsion guidance (composed with WCA if both active)
+        if (cv_space is not None and cv_buffer is not None
+                and len(cv_buffer) >= guide_warmup):
+            from lsmd.cv_guidance import build_cv_guidance as _build_cv
+            cv_fn = _build_cv(R, t, chain_id, scale, cv_space,
+                              cv_buffer, k_guide, sigma_cv)
+            if guidance_fn is not None:
+                _wca = guidance_fn
+                guidance_fn = lambda u, _w=_wca, _c=cv_fn: _c(_w(u))
+            else:
+                guidance_fn = cv_fn
         # Sample normalized update via reverse DDPM/DDIM with optional WCA guidance
         u = sample_ddpm_union(net, node_feats, edge_index, edge_feats,
                               tau, batch, schedule, steps=diff_steps,
