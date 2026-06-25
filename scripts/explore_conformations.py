@@ -89,10 +89,15 @@ def main():
     ca_ref = shard["t"].float()                      # [F, N, 3]
     mean_ca = ca_ref.mean(dim=0)                     # [N, 3]
 
-    # Fit CVSpace on training frames
-    cv_space = CVSpace(n_pc=args.n_pc)
-    cv_space.fit(ca_ref)
-    cv_space.save(os.path.join(args.out, "cv_basis.pt"))
+    # Fit CVSpace on training frames (or reload saved basis on resume to keep
+    # PC sign convention consistent with the existing cv_buffer).
+    cv_basis_path = os.path.join(args.out, "cv_basis.pt")
+    if args.resume and os.path.exists(cv_basis_path):
+        cv_space = CVSpace.load(cv_basis_path)
+    else:
+        cv_space = CVSpace(n_pc=args.n_pc)
+        cv_space.fit(ca_ref)
+        cv_space.save(cv_basis_path)
 
     # Project training frames to CV for the coverage plot
     ref_cv = np.stack([

@@ -264,13 +264,15 @@ def energy_match_loss(R_cur, t_cur, u_denorm, res_type, protein_id, chain_id,
         _, t_true = feat.apply_update(R_cur, t_cur, u_denorm_target)
     total = t_pred.new_zeros(())
     pids = protein_id.unique()
-    for pid in pids:
+    u_cut_is_vec = isinstance(u_cut, torch.Tensor) and u_cut.numel() > 1
+    for gi, pid in enumerate(pids):
         m = protein_id == pid
         n = int(m.sum())
         rt = res_type[m]
         cid = chain_id[m]
         u_pred = energy(t_pred[m], rt, cid) / max(n, 1)
-        total = total + w_hi * torch.relu(u_pred - u_cut)
+        u_cut_i = u_cut[gi] if u_cut_is_vec else u_cut
+        total = total + w_hi * torch.relu(u_pred - u_cut_i)
         if u_denorm_target is not None:
             u_tru = energy(t_true[m], rt, cid).detach() / max(n, 1)
             total = total + w_lo * torch.relu(u_pred - u_tru)

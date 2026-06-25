@@ -23,6 +23,7 @@ def union_collate(graphs):
     """
     node_feats, edge_feats, u_target = [], [], []
     edge_index, batch, taus, temps = [], [], [], []
+    has_any_temp = any("temp_K" in gr for gr in graphs)
     offset = 0
     for i, gr in enumerate(graphs):
         n = gr["node_feats"].shape[0]
@@ -32,8 +33,8 @@ def union_collate(graphs):
         edge_index.append(gr["edge_index"] + offset)
         batch.append(torch.full((n,), i, dtype=torch.long))
         taus.append(float(gr["tau"]))
-        if "temp_K" in gr:
-            temps.append(float(gr["temp_K"]))
+        if has_any_temp:
+            temps.append(float(gr.get("temp_K", 300.0)))
         offset += n
     out = {
         "node_feats": torch.cat(node_feats, dim=0),

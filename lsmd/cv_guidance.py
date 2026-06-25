@@ -61,30 +61,46 @@ class CVSpace:
         pc = self.components.to(dev) @ (x_flat - self.mean.to(dev))   # [n_pc]
 
         centroid = t.float().mean(dim=0)
-        rg = ((t.float() - centroid) ** 2).sum(-1).mean().sqrt()
+        rg = ((t.float() - centroid) ** 2).sum(-1).mean().clamp_min(1e-8).sqrt()
         rg_norm = (rg - self.rg_mean.to(dev)) / self.rg_std.to(dev)
 
         mean_ca = self.mean.to(dev).reshape(-1, 3)
-        rmsd = ((t.float() - mean_ca) ** 2).sum(-1).mean().sqrt()
+        rmsd = ((t.float() - mean_ca) ** 2).sum(-1).mean().clamp_min(1e-8).sqrt()
         rmsd_norm = rmsd / self.rmsd_std.to(dev)
 
         return torch.cat([pc, rg_norm.unsqueeze(0), rmsd_norm.unsqueeze(0)])
 
-    def repulsion(self, cv: torch.Tensor, buffer: list,
+    def to(self, device) -> "CVSpace":
+        """Move all stored tensors to device in-place and return self."""
+        self.mean = self.mean.to(device)
+        self.components = self.components.to(device)
+        self.rg_mean = self.rg_mean.to(device)
+        self.rg_std = self.rg_std.to(device)
+        self.rmsd_std = self.rmsd_std.to(device)
+        return self
+
+    def repulsion(self, cv: torch.Tensor, buffer,
                   sigma: float) -> torch.Tensor:
         """Gaussian repulsion potential from all structures in buffer.
 
         Args:
             cv: [n_cv] current CV vector, connected to computation graph.
-            buffer: list of [n_cv] detached CV tensors (accepted structures).
+            buffer: list of [n_cv] detached CV tensors, or pre-stacked [B, n_cv]
+                    tensor (accepted structures). Pre-stacking avoids repeated
+                    allocation inside the DDPM denoising loop.
             sigma: Gaussian width in normalized CV units.
 
         Returns:
             V: scalar — sum of repulsive Gaussians. Zero when buffer is empty.
         """
-        if not buffer:
+        if isinstance(buffer, torch.Tensor):
+            if buffer.numel() == 0:
+                return torch.zeros((), device=cv.device, dtype=cv.dtype)
+            buf = buffer.to(cv.device).to(cv.dtype)
+        elif not buffer:
             return torch.zeros((), device=cv.device, dtype=cv.dtype)
-        buf = torch.stack([b.to(cv.device).to(cv.dtype) for b in buffer])
+        else:
+            buf = torch.stack([b.to(cv.device).to(cv.dtype) for b in buffer])
         diff = cv.unsqueeze(0) - buf                           # [B, n_cv]
         dists_sq = (diff ** 2).sum(-1)                        # [B]
         return torch.exp(-dists_sq / (2.0 * sigma ** 2)).sum()
@@ -135,13 +151,15 @@ def build_cv_guidance(R, t, chain_id, scale, cv_space, buffer, k_guide, sigma_cv
     R_ref = R.detach()
     t_ref = t.detach()
     sc = scale.detach()
+    # Pre-stack buffer once to avoid O(B) allocation on every denoising step.
+    buf_stacked = torch.stack(buffer)  # [B, n_cv]
 
     def guidance_fn(u0_hat):
         with torch.enable_grad():
             u0 = u0_hat.detach().requires_grad_(True)
             _, t_pred = feat.apply_update(R_ref, t_ref, u0 * sc)
             cv = cv_space.project_single(t_pred)
-            V = cv_space.repulsion(cv, buffer, sigma_cv)
+            V = cv_space.repulsion(cv, buf_stacked, sigma_cv)
             V.backward()
         grad = u0.grad.detach()
         grad_norm = grad.norm().clamp_min(1e-8)

@@ -284,8 +284,9 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
     if lam_fdt > 0.0:
         from lsmd.learned_energy import md_step_cov
         for s in shards:
+            t_f = s["t"].float()
             s["_sigma_md_tau_map"] = {
-                float(lag): md_step_cov(s["t"].float(), float(s["dt"]), float(lag))
+                float(lag): md_step_cov(t_f, float(s["dt"]), float(lag))
                 for lag in lags_ps
             }
         print(f"  Precomputed FDT targets for {len(shards)} shards", flush=True)
