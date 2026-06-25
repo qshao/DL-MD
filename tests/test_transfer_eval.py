@@ -55,7 +55,6 @@ from lsmd.cv_guidance import CVSpace
 
 
 def test_rollout_with_cv_space_runs_and_has_correct_shape():
-    import random
     shards = [_synthetic_shard(N=10, seed=i) for i in range(3)]
     ckpt = tt.train(shards, lags_ps=[200.0], k=4, hidden=16, layers=2,
                     max_union_nodes=25, accum=1, steps=2, T_diff=20,
@@ -65,7 +64,7 @@ def test_rollout_with_cv_space_runs_and_has_correct_shape():
     # Fit CVSpace on training frames
     cv_space = CVSpace(n_pc=2)
     cv_space.fit(sh["t"])   # sh["t"]: [F, N, 3]
-    cv_buffer = []
+    cv_buffer = [cv_space.project_single(sh["t"][0]).detach()]
     traj = te.rollout(net, sched, norm, sh["R"][0], sh["t"][0],
                       sh["res_type"], sh["chain_id"], sh["res_index"],
                       steps=4, tau_ps=200.0, k=4, diff_steps=3, device="cpu",
@@ -77,7 +76,6 @@ def test_rollout_with_cv_space_runs_and_has_correct_shape():
 
 def test_rollout_cv_none_matches_original():
     """cv_space=None must reproduce the original rollout exactly."""
-    import random
     shards = [_synthetic_shard(N=10, seed=i) for i in range(3)]
     ckpt = tt.train(shards, lags_ps=[200.0], k=4, hidden=16, layers=2,
                     max_union_nodes=25, accum=1, steps=2, T_diff=20,

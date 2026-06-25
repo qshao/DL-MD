@@ -153,6 +153,16 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
         noether:               If True, apply Noether momentum projection (remove
                                net linear and angular momentum per chain) after
                                each bond-constraint step (default False).
+        cv_space:              CVSpace instance for CV-space repulsion guidance. None
+                               disables CV guidance entirely (default None).
+        cv_buffer:             list of [n_cv] detached CV tensors from accepted
+                               structures. Passed by reference; read but not mutated
+                               by rollout (default None).
+        k_guide:               CV repulsion strength (normalized-update units,
+                               default 0.05).
+        sigma_cv:              Gaussian width in normalized CV units (default 1.0).
+        guide_warmup:          Minimum buffer size before CV repulsion activates
+                               (default 50).
         device:                Target device.
 
     Returns:
