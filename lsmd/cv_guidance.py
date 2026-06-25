@@ -7,8 +7,6 @@ existing DDPM guidance hook (same interface as _build_wca_guidance).
 """
 import torch
 
-from lsmd import featurize as feat
-
 
 class CVSpace:
     """PCA + Rg + RMSD collective-variable space for one protein.

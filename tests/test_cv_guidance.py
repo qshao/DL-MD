@@ -1,7 +1,6 @@
 import torch
 import pytest
 from lsmd.cv_guidance import CVSpace
-from lsmd import geometry as g
 
 
 def _coords(F=20, N=10, seed=0):
