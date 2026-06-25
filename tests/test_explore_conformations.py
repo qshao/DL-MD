@@ -44,7 +44,7 @@ def test_explore_smoke(tmp_path):
          "--guide_warmup", "0",
          "--out", out_dir,
          "--seed", "0"],
-        capture_output=True, text=True, cwd="/home/qshao/DL-MD"
+        capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent)
     )
     assert result.returncode == 0, result.stderr
     out = Path(out_dir)
@@ -68,7 +68,7 @@ def test_explore_output_structure(tmp_path):
          "--guide_warmup", "0",
          "--out", out_dir,
          "--seed", "42"],
-        capture_output=True, text=True, cwd="/home/qshao/DL-MD", check=True
+        capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent), check=True
     )
     out = Path(out_dir)
     summary = json.loads((out / "summary.json").read_text())

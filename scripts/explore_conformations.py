@@ -20,7 +20,6 @@ import os
 import numpy as np
 import torch
 
-from lsmd import featurize as feat
 from lsmd import geometry as g
 from lsmd import transfer_eval as te
 from lsmd import validation as val
@@ -124,6 +123,12 @@ def main():
     rng.manual_seed(args.seed)
 
     all_coords = []  # accumulate accepted Cα tensors for structures.pt
+    if args.resume and os.path.exists(os.path.join(args.out, "structures.pt")):
+        saved = torch.load(os.path.join(args.out, "structures.pt"),
+                           map_location="cpu", weights_only=False)
+        all_coords = list(saved)  # list of [N,3] tensors
+
+    ref_bond = (mean_ca[1:] - mean_ca[:-1]).norm(dim=-1).mean().item()
 
     for attempt in range(start_id, args.n_explore):
         # Pick random training frame as starting point
@@ -148,7 +153,6 @@ def main():
         # Geometry filter
         geo = val.ca_geometry(x_final)
         clashes = geo["clash_count"]
-        ref_bond = (mean_ca[1:] - mean_ca[:-1]).norm(dim=-1).mean().item()
         bond_rmsd = abs(geo["ca_bond_mean"] - ref_bond)
         if clashes >= 0.5 or bond_rmsd >= 0.1:
             continue
