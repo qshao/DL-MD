@@ -186,6 +186,8 @@ def main():
                 json.dump(results, fh, indent=2)
             np.save(os.path.join(args.out, "cv_coords.npy"),
                     np.stack([r["cv"] for r in results]))
+            torch.save(torch.stack(all_coords),
+                       os.path.join(args.out, "structures.pt"))
             _plot_coverage(cv_buffer, cv_space, ref_cv, args.out, attempt)
             print(f"[{attempt+1}/{args.n_explore}] accepted={len(results)}")
 

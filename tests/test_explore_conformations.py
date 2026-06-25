@@ -51,7 +51,7 @@ def test_explore_smoke(tmp_path):
     assert (out / "summary.json").exists()
     assert (out / "cv_basis.pt").exists()
     summary = json.loads((out / "summary.json").read_text())
-    assert len(summary) >= 0   # may be 0 if all fail geometry filter
+    assert isinstance(summary, list)
 
 
 def test_explore_output_structure(tmp_path):
