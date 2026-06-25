@@ -1,6 +1,8 @@
 import torch
 import pytest
-from lsmd.cv_guidance import CVSpace
+from lsmd.cv_guidance import CVSpace, build_cv_guidance
+from lsmd import featurize as feat
+from lsmd import geometry as g
 
 
 def _coords(F=20, N=10, seed=0):
@@ -76,3 +78,49 @@ def test_save_load_roundtrip(tmp_path):
     assert cv2.n_pc == 3
     assert torch.allclose(cv2.mean, cv.mean)
     assert torch.allclose(cv2.components, cv.components)
+
+
+def _simple_setup(N=8, n_pc=2, seed=7):
+    torch.manual_seed(seed)
+    coords = torch.randn(20, N, 3) * 5.0
+    cv_space = CVSpace(n_pc=n_pc)
+    cv_space.fit(coords)
+    R = g.so3_exp(torch.zeros(N, 3))  # identity rotations
+    t = coords[0].clone()
+    scale = torch.ones(6)
+    chain_id = torch.zeros(N, dtype=torch.long)
+    return cv_space, R, t, chain_id, scale
+
+
+def test_build_cv_guidance_empty_buffer_is_identity():
+    cv_space, R, t, chain_id, scale = _simple_setup()
+    fn = build_cv_guidance(R, t, chain_id, scale, cv_space,
+                           buffer=[], k_guide=0.5, sigma_cv=1.0)
+    u = torch.randn(8, 6)
+    out = fn(u)
+    assert torch.allclose(out, u)
+
+
+def test_build_cv_guidance_with_buffer_changes_u():
+    cv_space, R, t, chain_id, scale = _simple_setup()
+    # Put the current structure into the buffer so repulsion is strong
+    with torch.no_grad():
+        _, t_cur = feat.apply_update(R, t, torch.zeros(8, 6))
+    cv_cur = cv_space.project_single(t_cur).detach()
+    buffer = [cv_cur]
+    fn = build_cv_guidance(R, t, chain_id, scale, cv_space,
+                           buffer=buffer, k_guide=0.5, sigma_cv=1.0)
+    u = torch.randn(8, 6) * 0.1  # Small perturbation to avoid being at the peak
+    out = fn(u)
+    assert not torch.allclose(out, u), "guidance should change u when buffer is non-empty"
+    assert torch.isfinite(out).all()
+
+
+def test_build_cv_guidance_k_guide_zero_is_identity():
+    cv_space, R, t, chain_id, scale = _simple_setup()
+    cv_cur = cv_space.project_single(t).detach()
+    fn = build_cv_guidance(R, t, chain_id, scale, cv_space,
+                           buffer=[cv_cur], k_guide=0.0, sigma_cv=1.0)
+    u = torch.randn(8, 6)
+    out = fn(u)
+    assert torch.allclose(out, u)

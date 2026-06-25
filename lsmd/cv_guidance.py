@@ -6,6 +6,7 @@ build_cv_guidance() can inject history-dependent steering into the
 existing DDPM guidance hook (same interface as _build_wca_guidance).
 """
 import torch
+from lsmd import featurize as feat
 
 
 class CVSpace:
@@ -106,3 +107,45 @@ class CVSpace:
         obj.rg_std = d["rg_std"]
         obj.rmsd_std = d["rmsd_std"]
         return obj
+
+
+def build_cv_guidance(R, t, chain_id, scale, cv_space, buffer, k_guide, sigma_cv):
+    """Build a CV-space repulsion guidance callable for one rollout step.
+
+    Mirrors _build_wca_guidance in transfer_eval.py: uses torch.enable_grad()
+    internally, accepts detached tensors, returns guidance_fn(u0_hat).
+
+    Args:
+        R:         [N, 3, 3] current residue rotation matrices (detached).
+        t:         [N, 3] current Cα positions (detached).
+        chain_id:  [N] long (unused here but kept for API symmetry with WCA).
+        scale:     [6] UpdateNorm de-normalization scale (detached).
+        cv_space:  CVSpace instance (fitted).
+        buffer:    list of [n_cv] detached CV tensors (accepted structures so far).
+        k_guide:   Guidance step size (normalized-update units). 0.0 → identity.
+        sigma_cv:  Gaussian width in normalized CV units.
+
+    Returns:
+        guidance_fn(u0_hat [N,6]) -> u0_hat_guided [N,6].
+        Returns u0_hat unchanged when buffer is empty or k_guide == 0.
+    """
+    if k_guide == 0.0 or not buffer:
+        return lambda u: u
+
+    R_ref = R.detach()
+    t_ref = t.detach()
+    sc = scale.detach()
+
+    def guidance_fn(u0_hat):
+        with torch.enable_grad():
+            u0 = u0_hat.detach().requires_grad_(True)
+            _, t_pred = feat.apply_update(R_ref, t_ref, u0 * sc)
+            cv = cv_space.project_single(t_pred)
+            V = cv_space.repulsion(cv, buffer, sigma_cv)
+            V.backward()
+        grad = u0.grad.detach()
+        grad_norm = grad.norm().clamp_min(1e-8)
+        grad_n = grad / grad_norm
+        return (u0_hat - k_guide * grad_norm.clamp_max(1.0) * grad_n).detach()
+
+    return guidance_fn
