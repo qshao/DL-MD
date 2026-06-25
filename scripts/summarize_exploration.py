@@ -61,8 +61,8 @@ def main():
 
         # Category counts
         print("\nClassification breakdown:")
-        for threshold, label in _CLASSIFY:
-            count = sum(1 for r in validated if r["rmsd_native"] > threshold)
+        for _, label in _CLASSIFY:
+            count = sum(1 for r in validated if classify_rmsd(r["rmsd_native"]) == label)
             print(f"  {label}: {count}")
 
     # Plot if cv_coords available

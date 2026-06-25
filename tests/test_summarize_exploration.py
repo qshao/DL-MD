@@ -33,7 +33,7 @@ def test_summarize_runs(tmp_path):
     result = subprocess.run(
         [sys.executable, "scripts/summarize_exploration.py",
          "--out", out_dir],
-        capture_output=True, text=True, cwd="/home/qshao/DL-MD"
+        capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent)
     )
     assert result.returncode == 0, result.stderr
     assert "md_pass" in result.stdout.lower() or "validated" in result.stdout.lower()
@@ -44,6 +44,6 @@ def test_summarize_creates_figure(tmp_path):
     subprocess.run(
         [sys.executable, "scripts/summarize_exploration.py",
          "--out", out_dir],
-        capture_output=True, text=True, cwd="/home/qshao/DL-MD", check=True
+        capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent), check=True
     )
     assert (tmp_path / "md_summary.png").exists()
