@@ -70,6 +70,16 @@ def main():
                          "Override with explicit --eta / --diff_steps.")
     ap.add_argument("--diff_steps", type=int, default=20)
     ap.add_argument("--eta", type=float, default=1.0)
+    ap.add_argument("--wca_sigma", type=float, default=4.5,
+                    help="WCA CA–CA excluded-volume diameter (Å, default 4.5). "
+                         "Set 0 to disable WCA guidance.")
+    ap.add_argument("--wca_eps", type=float, default=0.3,
+                    help="WCA well depth (kcal/mol, default 0.3).")
+    ap.add_argument("--wca_lam", type=float, default=0.05,
+                    help="WCA guidance step size in normalized update space (default 0.05).")
+    ap.add_argument("--graph_rebuild_interval", type=int, default=1,
+                    help="Rebuild kNN graph topology every N rollout steps (default 1). "
+                         "Values 5–10 cut inference cost ~5–10x with minimal accuracy loss.")
     ap.add_argument("--out", default="explore_out")
     ap.add_argument("--resume", action="store_true",
                     help="Skip already-accepted structures in summary.json")
@@ -159,9 +169,11 @@ def main():
             shard["res_index"].to(args.device),
             steps=args.n_steps, tau_ps=args.tau_ps, k=k_eff,
             diff_steps=args.diff_steps, eta=args.eta, temp_K=args.temp_K,
+            wca_sigma=args.wca_sigma, wca_eps=args.wca_eps, wca_lam=args.wca_lam,
             cv_space=cv_space, cv_buffer=cv_buffer,
             k_guide=args.k_guide, sigma_cv=args.sigma_cv,
             guide_warmup=args.guide_warmup,
+            graph_rebuild_interval=args.graph_rebuild_interval,
             device=args.device,
         )
         x_final = traj[-1].cpu()    # [N, 3]
