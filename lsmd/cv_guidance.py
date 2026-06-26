@@ -70,6 +70,33 @@ class CVSpace:
 
         return torch.cat([pc, rg_norm.unsqueeze(0), rmsd_norm.unsqueeze(0)])
 
+    def project_batch(self, coords: torch.Tensor) -> torch.Tensor:
+        """Project a batch of Cα frames onto the CV basis.
+
+        Replaces a Python for-loop of project_single calls with a single
+        batched matmul — substantially faster for large training shards.
+
+        Args:
+            coords: [F, N, 3] Cα positions, float32.
+
+        Returns:
+            cv: [F, n_pc + 2] float32 — [PC1..PCn_pc, Rg_norm, RMSD_norm].
+        """
+        F, N, _ = coords.shape
+        dev = self.mean.device
+        X = coords.reshape(F, N * 3).float().to(dev)       # [F, 3N]
+        pc = (X - self.mean) @ self.components.T            # [F, n_pc]
+
+        centroid = coords.float().to(dev).mean(dim=1, keepdim=True)  # [F, 1, 3]
+        rg = ((coords.float().to(dev) - centroid) ** 2).sum(-1).mean(-1).clamp_min(1e-8).sqrt()
+        rg_norm = (rg - self.rg_mean) / self.rg_std         # [F]
+
+        mean_ca = self.mean.reshape(N, 3)                   # [N, 3]
+        rmsd = ((coords.float().to(dev) - mean_ca) ** 2).sum(-1).mean(-1).clamp_min(1e-8).sqrt()
+        rmsd_norm = rmsd / self.rmsd_std                    # [F]
+
+        return torch.cat([pc, rg_norm.unsqueeze(1), rmsd_norm.unsqueeze(1)], dim=1)
+
     def to(self, device) -> "CVSpace":
         """Move all stored tensors to device in-place and return self."""
         self.mean = self.mean.to(device)

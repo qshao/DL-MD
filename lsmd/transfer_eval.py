@@ -13,6 +13,7 @@ from lsmd.transfer_model import PropagatorNet, sample_ddpm_union
 from lsmd.normalize import UpdateNorm
 from lsmd.model import NoiseSchedule
 from lsmd.noether import noether_project
+from lsmd.cv_guidance import build_cv_guidance as _build_cv_guidance
 
 
 def load_checkpoint(ckpt, device):
@@ -113,6 +114,7 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
             noether=False,
             cv_space=None, cv_buffer=None, k_guide=0.05, sigma_cv=1.0,
             guide_warmup=50,
+            graph_rebuild_interval=1,
             device="cpu"):
     """Autoregressive CA trajectory from a reference structure.
 
@@ -163,6 +165,12 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
         sigma_cv:              Gaussian width in normalized CV units (default 1.0).
         guide_warmup:          Minimum buffer size before CV repulsion activates
                                (default 50).
+        graph_rebuild_interval: Rebuild the kNN graph topology every this many
+                               steps (default 1 = rebuild every step). Setting
+                               this to 5–10 skips the expensive O(N²) kNN search
+                               on intermediate steps while still recomputing edge
+                               features (O(N·k)) from current (R, t) each step.
+                               Use 1 for highest accuracy, 5–10 for fast inference.
         device:                Target device.
 
     Returns:
@@ -194,9 +202,14 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
     use_wca = wca_sigma > 0 and wca_lam > 0
 
     traj = [t.clone()]
-    for _ in range(steps):
-        # Rebuild graph from current frames
-        edge_index, edge_feats = feat.frame_graph(R, t, k)
+    edge_index = None
+    for step_i in range(steps):
+        # Rebuild kNN graph topology every graph_rebuild_interval steps;
+        # recompute edge features every step from current (R, t).
+        if edge_index is None or step_i % graph_rebuild_interval == 0:
+            edge_index, edge_feats = feat.frame_graph(R, t, k)
+        else:
+            edge_feats = feat.edge_features(R, t, edge_index)
         # Build WCA C2 guidance function for this step (closes over current R, t)
         guidance_fn = (
             _build_wca_guidance(R, t, chain_id, scale,
@@ -206,9 +219,8 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
         # CV-space repulsion guidance (composed with WCA if both active)
         if (cv_space is not None and cv_buffer is not None
                 and len(cv_buffer) >= guide_warmup):
-            from lsmd.cv_guidance import build_cv_guidance as _build_cv
-            cv_fn = _build_cv(R, t, chain_id, scale, cv_space,
-                              cv_buffer, k_guide, sigma_cv)
+            cv_fn = _build_cv_guidance(R, t, chain_id, scale, cv_space,
+                                       cv_buffer, k_guide, sigma_cv)
             if guidance_fn is not None:
                 _wca = guidance_fn
                 guidance_fn = lambda u, _w=_wca, _c=cv_fn: _c(_w(u))

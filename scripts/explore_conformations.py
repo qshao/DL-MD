@@ -99,11 +99,11 @@ def main():
         cv_space.fit(ca_ref)
         cv_space.save(cv_basis_path)
 
-    # Project training frames to CV for the coverage plot
-    ref_cv = np.stack([
-        cv_space.project_single(ca_ref[i]).numpy()
-        for i in range(ca_ref.shape[0])
-    ])  # [F, n_pc+2]
+    # Move CVSpace tensors to device once so project_single .to() calls are no-ops.
+    cv_space.to(args.device)
+
+    # Project training frames to CV for the coverage plot (batched, one matmul).
+    ref_cv = cv_space.project_batch(ca_ref.to(args.device)).cpu().numpy()  # [F, n_pc+2]
 
     # Resume: load existing summary and CV buffer
     summary_path = os.path.join(args.out, "summary.json")
