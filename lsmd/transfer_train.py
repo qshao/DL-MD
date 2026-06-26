@@ -216,12 +216,17 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
           frame_weighted=True, compile_model=False, temp_schedule=None,
           temp_emb_dim=8, reverse_prob=0.0, resume_from=None,
           checkpoint_every=0, checkpoint_path=None,
-          lam_fdt=0.0, phys_warmup=500):
+          lam_fdt=0.0, phys_warmup=500,
+          amp=True):
     """Train the union-graph propagator across proteins; return a checkpoint.
 
     Args:
         lam:            Max physics-penalty weight (C1 soft loss; 0=disabled).
         lam_warmup:     Gradient steps to ramp lam from 0 to lam.
+        amp:            Enable automatic mixed precision on CUDA (default True).
+                        Wraps the forward pass in torch.autocast(fp16) and uses
+                        GradScaler. Ignored on CPU. Disable with amp=False for
+                        debugging or if experiencing numerical instability.
         log_every:      Print loss + speed every this many gradient steps.
         norm_shards:    Shards to fit UpdateNorm on (default: all shards).
                         Pass ATLAS-only shards to avoid high-T mdCATH outliers.
@@ -301,7 +306,8 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
         print(f"  Resumed from checkpoint at step {init_step}; "
               f"training {steps} more steps (target: {init_step + steps})", flush=True)
 
-    use_amp = device.type == "cuda"
+    use_amp = amp and device.type == "cuda"
+    print(f"  AMP: {'enabled (fp16 forward + GradScaler)' if use_amp else 'disabled'}", flush=True)
     try:
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     except (AttributeError, TypeError):
@@ -360,11 +366,12 @@ def train(shards, *, lags_ps, k=12, hidden=128, layers=4, lr=1e-3,
                 # geometric_penalty is inside ddpm_physics_loss via lam=lam_t
                 loss = pl.ddpm_physics_loss(net, b_dev, phys, scale,
                                             schedule, lam=lam_t) / accum
-        # FDT loss outside autocast: recover_u_denorm calls net in float32
-        if lam_f > 0.0:
-            _, u_denorm = pl.recover_u_denorm(net, b_dev, scale, schedule)
-            loss = loss + (lam_f / accum) * pl.fdt_loss(
-                u_denorm.float(), phys["protein_id"], phys["sigma_md_tau"])
+            # FDT loss: recover_u_denorm runs net under autocast (fp16 on CUDA);
+            # u_denorm.float() upcasts to fp32 before the variance computation.
+            if lam_f > 0.0:
+                _, u_denorm = pl.recover_u_denorm(net, b_dev, scale, schedule)
+                loss = loss + (lam_f / accum) * pl.fdt_loss(
+                    u_denorm.float(), phys["protein_id"], phys["sigma_md_tau"])
         loss_val = loss.item()
         if torch.isfinite(loss):
             scaler.scale(loss).backward()

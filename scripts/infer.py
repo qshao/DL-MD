@@ -16,6 +16,7 @@ Outputs
 """
 import argparse
 import json
+import sys
 import os
 import torch
 from lsmd import data, featurize as f, model as m, decoder as dec, validation as val
@@ -29,6 +30,9 @@ def main():
                     help="Inference lag (frames, 200 ps/frame). Must be in training taus.")
     ap.add_argument("--K",          type=int,   default=8,   help="Samples to generate")
     ap.add_argument("--out",        default="infer_out",     help="Output directory")
+    ap.add_argument("--ddim", action="store_true",
+                    help="Fast deterministic DDIM sampling: sets eta=0.0, diff_steps=10. "
+                         "Override with explicit --eta / --diff_steps.")
     ap.add_argument("--diff_steps", type=int,   default=50,  help="Reverse diffusion steps")
     ap.add_argument("--eta",        type=float, default=1.0, help="DDPM stochasticity")
     ap.add_argument("--sigma_init", type=float, default=1.0, help="Prior scale")
@@ -36,6 +40,13 @@ def main():
                     help="Index of source frame (default: first val frame at --tau)")
     ap.add_argument("--device",     default=None, help="cuda / cpu (auto if omitted)")
     args = ap.parse_args()
+    if args.ddim:
+        _explicit = {a.lstrip('-').split('=')[0].replace('-', '_')
+                     for a in sys.argv[1:] if a.startswith('-')}
+        if 'diff_steps' not in _explicit:
+            args.diff_steps = 10
+        if 'eta' not in _explicit:
+            args.eta = 0.0
 
     device = torch.device(args.device) if args.device \
              else torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -16,6 +16,7 @@ python scripts/explore_conformations.py \
 import argparse
 import json
 import os
+import sys
 
 import numpy as np
 import torch
@@ -64,6 +65,9 @@ def main():
     ap.add_argument("--sigma_cv", type=float, default=1.0)
     ap.add_argument("--guide_warmup", type=int, default=50)
     ap.add_argument("--n_pc", type=int, default=3)
+    ap.add_argument("--ddim", action="store_true",
+                    help="Fast deterministic DDIM sampling: sets eta=0.0, diff_steps=10. "
+                         "Override with explicit --eta / --diff_steps.")
     ap.add_argument("--diff_steps", type=int, default=20)
     ap.add_argument("--eta", type=float, default=1.0)
     ap.add_argument("--out", default="explore_out")
@@ -72,6 +76,13 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
+    if args.ddim:
+        _explicit = {a.lstrip('-').split('=')[0].replace('-', '_')
+                     for a in sys.argv[1:] if a.startswith('-')}
+        if 'diff_steps' not in _explicit:
+            args.diff_steps = 10
+        if 'eta' not in _explicit:
+            args.eta = 0.0
 
     torch.manual_seed(args.seed)
     os.makedirs(args.out, exist_ok=True)

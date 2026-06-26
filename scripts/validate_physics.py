@@ -18,6 +18,7 @@ python scripts/validate_physics.py \\
 import argparse
 import json
 import os
+import sys
 
 import torch
 
@@ -122,6 +123,9 @@ def main():
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--tau_ps", type=float, default=2000.0)
     ap.add_argument("--k", type=int, default=12)
+    ap.add_argument("--ddim", action="store_true",
+                    help="Fast deterministic DDIM sampling: sets eta=0.0, diff_steps=10. "
+                         "Override with explicit --eta / --diff_steps.")
     ap.add_argument("--diff_steps", type=int, default=20)
     ap.add_argument("--eta", type=float, default=1.0)
     ap.add_argument("--temp_K", type=float, default=300.0)
@@ -147,6 +151,13 @@ def main():
     ap.add_argument("--out", default="validation_baseline.json")
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
+    if args.ddim:
+        _explicit = {a.lstrip('-').split('=')[0].replace('-', '_')
+                     for a in sys.argv[1:] if a.startswith('-')}
+        if 'diff_steps' not in _explicit:
+            args.diff_steps = 10
+        if 'eta' not in _explicit:
+            args.eta = 0.0
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     settings = {

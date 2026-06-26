@@ -42,6 +42,7 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 import torch
 from lsmd import data, model as m, decoder as dec, validation as val
@@ -363,6 +364,9 @@ def main():
     ap.add_argument("--source_frame", type=int,   default=None,
                     help="Starting CA frame index (default: first val frame at --tau)")
     ap.add_argument("--out",          default="genmd_out", help="Output directory")
+    ap.add_argument("--ddim", action="store_true",
+                    help="Fast deterministic DDIM sampling: sets eta=0.0, diff_steps=10. "
+                         "Override with explicit --eta / --diff_steps.")
     ap.add_argument("--diff_steps",   type=int,   default=50)
     ap.add_argument("--eta",          type=float, default=1.0,
                     help="DDPM stochasticity (1.0 = full stochastic, 0.0 = DDIM deterministic)")
@@ -396,6 +400,13 @@ def main():
                     help="Re-anchor interval for --sample_mode mimic (default 50 steps)")
     ap.add_argument("--device",       default=None)
     args = ap.parse_args()
+    if args.ddim:
+        _explicit = {a.lstrip('-').split('=')[0].replace('-', '_')
+                     for a in sys.argv[1:] if a.startswith('-')}
+        if 'diff_steps' not in _explicit:
+            args.diff_steps = 10
+        if 'eta' not in _explicit:
+            args.eta = 0.0
 
     device = torch.device(args.device) if args.device \
              else torch.device("cuda" if torch.cuda.is_available() else "cpu")

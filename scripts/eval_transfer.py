@@ -12,6 +12,7 @@ python scripts/eval_transfer.py \\
 """
 import argparse
 import json
+import sys
 import torch
 from lsmd import geometry as g  # for so3_exp on compact R_aa shards
 from lsmd import transfer_eval as te
@@ -47,8 +48,11 @@ def main():
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--tau_ps", type=float, default=1000.0)
     ap.add_argument("--k", type=int, default=12)
+    ap.add_argument("--ddim", action="store_true",
+                    help="Fast deterministic DDIM sampling: sets eta=0.0, diff_steps=10. "
+                         "Override with explicit --eta / --diff_steps.")
     ap.add_argument("--diff_steps", type=int, default=50,
-                    help="Denoising steps (default 50 DDPM; use 10-20 with --eta 0 for DDIM)")
+                    help="Denoising steps (default 50 DDPM; 10 recommended with --ddim/--eta 0)")
     ap.add_argument("--eta", type=float, default=1.0,
                     help="Reverse-process stochasticity: 1.0=DDPM (default), 0.0=DDIM")
     ap.add_argument("--temp_K", type=float, default=300.0,
@@ -71,6 +75,13 @@ def main():
     ap.add_argument("--out", default="eval.json")
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
+    if args.ddim:
+        _explicit = {a.lstrip('-').split('=')[0].replace('-', '_')
+                     for a in sys.argv[1:] if a.startswith('-')}
+        if 'diff_steps' not in _explicit:
+            args.diff_steps = 10
+        if 'eta' not in _explicit:
+            args.eta = 0.0
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     shard = torch.load(args.shard, map_location="cpu")
