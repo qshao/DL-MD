@@ -164,7 +164,9 @@ def main():
                            map_location="cpu", weights_only=False)
         all_coords = list(saved)  # list of [N,3] tensors
 
-    ref_bond = (mean_ca[1:] - mean_ca[:-1]).norm(dim=-1).mean().item()
+    # Use per-frame mean bond length, not mean-structure bonds (which are compressed
+    # by conformational averaging and would reject all geometrically valid frames).
+    ref_bond = (ca_ref[:, 1:] - ca_ref[:, :-1]).norm(dim=-1).mean().item()
 
     for attempt in range(start_id, args.n_explore):
         # Pick random training frame as starting point
@@ -192,7 +194,10 @@ def main():
         geo = val.ca_geometry(x_final)
         clashes = geo["clash_count"]
         bond_rmsd = abs(geo["ca_bond_mean"] - ref_bond)
+        print(f"[{attempt+1}/{args.n_explore}] accepted={len(results)}"
+              f"  clashes={clashes:.2f}  bond_rmsd={bond_rmsd:.4f}", flush=True)
         if clashes >= 0.5 or bond_rmsd >= 0.1:
+            print(f"  -> REJECTED (geometry)", flush=True)
             continue
 
         # Compute CV and add to buffer (project on the device cv_space lives on,

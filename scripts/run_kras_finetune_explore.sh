@@ -92,6 +92,8 @@ if [[ ! -f "$FINETUNED" ]]; then
         --shard        "$SHARD"       \
         --resume       "$PRETRAINED"  \
         --lags_ps      2000 5000 10000 \
+        --hidden       256            \
+        --layers       6              \
         --lr           1e-4           \
         --steps        5000           \
         --accum        4              \
@@ -135,6 +137,9 @@ echo "=== Step 3: CV-guided conformational exploration ==="
 RESUME_FLAG=""
 [[ $RESUME -eq 1 ]] && RESUME_FLAG="--resume"
 
+DEVICE="cuda"
+python -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null || DEVICE="cpu"
+
 python scripts/explore_conformations.py \
     --checkpoint  "$FINETUNED"   \
     --shard       "$SHARD"       \
@@ -152,6 +157,7 @@ python scripts/explore_conformations.py \
     --wca_lam     0.08           \
     --diff_steps  20             \
     --eta         1.0            \
+    --device      "$DEVICE"      \
     --out         "$EXPLORE_OUT" \
     --seed        42             \
     $RESUME_FLAG
