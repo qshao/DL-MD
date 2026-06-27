@@ -239,13 +239,18 @@ bash scripts/run_explore.sh          # edit config variables at top of script
 python scripts/explore_conformations.py \
     --checkpoint checkpoints/v4_3u7t_A.pt \
     --shard      data/atlas/3u7t_A.pt \
-    --n_explore  500 --n_steps 100 --tau_ps 2000 \
+    --n_explore  500 --n_steps 50 --tau_ps 2000 \
     --n_pc 5 --k_guide 0.10 --sigma_cv 1.0 --guide_warmup 50 \
     --graph_rebuild_interval 5 \
     --wca_sigma 4.5 --wca_eps 0.3 --wca_lam 0.05 \
     --diff_steps 20 --eta 1.0 --temp_K 310 \
+    --device cuda \
     --out explore_out --seed 42
 ```
+
+`--n_steps 50` (100 ns per attempt) is the recommended default for most proteins. Higher
+values (100–200) explore further from the native basin but may produce partially unfolded
+structures; always keep `--tau_ps` within the model's training lag range.
 
 **KRAS fine-tune + exploration (end-to-end):**
 
