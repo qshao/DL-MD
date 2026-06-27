@@ -68,8 +68,8 @@ def main():
     ap.add_argument("--ddim", action="store_true",
                     help="Fast deterministic DDIM sampling: sets eta=0.0, diff_steps=10. "
                          "Override with explicit --eta / --diff_steps.")
-    ap.add_argument("--diff_steps", type=int, default=20)
-    ap.add_argument("--eta", type=float, default=1.0)
+    ap.add_argument("--diff_steps", type=int, default=None)
+    ap.add_argument("--eta", type=float, default=None)
     ap.add_argument("--wca_sigma", type=float, default=4.5,
                     help="WCA CA–CA excluded-volume diameter (Å, default 4.5). "
                          "Set 0 to disable WCA guidance.")
@@ -87,12 +87,14 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
     if args.ddim:
-        _explicit = {a.lstrip('-').split('=')[0].replace('-', '_')
-                     for a in sys.argv[1:] if a.startswith('-')}
-        if 'diff_steps' not in _explicit:
+        if args.diff_steps is None:
             args.diff_steps = 10
-        if 'eta' not in _explicit:
+        if args.eta is None:
             args.eta = 0.0
+    if args.diff_steps is None:
+        args.diff_steps = 20
+    if args.eta is None:
+        args.eta = 1.0
 
     torch.manual_seed(args.seed)
     os.makedirs(args.out, exist_ok=True)
@@ -113,6 +115,15 @@ def main():
     # Fit CVSpace on training frames (or reload saved basis on resume to keep
     # PC sign convention consistent with the existing cv_buffer).
     cv_basis_path = os.path.join(args.out, "cv_basis.pt")
+    summary_path = os.path.join(args.out, "summary.json")
+    if args.resume and not os.path.exists(cv_basis_path) and os.path.exists(summary_path):
+        raise FileNotFoundError(
+            f"Cannot resume: {cv_basis_path} is missing but {summary_path} exists. "
+            "The CV buffer in summary.json was projected using a PCA basis that no "
+            "longer exists. Resuming without it would refit PCA (arbitrary sign flips) "
+            "and corrupt the repulsion direction for all new structures. "
+            "Either restore cv_basis.pt from backup or delete summary.json to start fresh."
+        )
     if args.resume and os.path.exists(cv_basis_path):
         cv_space = CVSpace.load(cv_basis_path)
     else:
@@ -127,7 +138,6 @@ def main():
     ref_cv = cv_space.project_batch(ca_ref.to(args.device)).cpu().numpy()  # [F, n_pc+2]
 
     # Resume: load existing summary and CV buffer
-    summary_path = os.path.join(args.out, "summary.json")
     results = []
     cv_buffer = []
     start_id = 0
@@ -185,8 +195,9 @@ def main():
         if clashes >= 0.5 or bond_rmsd >= 0.1:
             continue
 
-        # Compute CV and add to buffer
-        cv_i = cv_space.project_single(x_final).detach()
+        # Compute CV and add to buffer (project on the device cv_space lives on,
+        # then detach to CPU so the buffer stays CPU-resident between rollout calls).
+        cv_i = cv_space.project_single(x_final.to(cv_space.mean.device)).detach().cpu()
         cv_buffer.append(cv_i)
         all_coords.append(x_final)
 

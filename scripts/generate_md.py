@@ -367,8 +367,8 @@ def main():
     ap.add_argument("--ddim", action="store_true",
                     help="Fast deterministic DDIM sampling: sets eta=0.0, diff_steps=10. "
                          "Override with explicit --eta / --diff_steps.")
-    ap.add_argument("--diff_steps",   type=int,   default=50)
-    ap.add_argument("--eta",          type=float, default=1.0,
+    ap.add_argument("--diff_steps",   type=int,   default=None)
+    ap.add_argument("--eta",          type=float, default=None,
                     help="DDPM stochasticity (1.0 = full stochastic, 0.0 = DDIM deterministic)")
     ap.add_argument("--sigma_init",   type=float, default=1.0)
     ap.add_argument("--save_pt",      action="store_true",
@@ -401,12 +401,14 @@ def main():
     ap.add_argument("--device",       default=None)
     args = ap.parse_args()
     if args.ddim:
-        _explicit = {a.lstrip('-').split('=')[0].replace('-', '_')
-                     for a in sys.argv[1:] if a.startswith('-')}
-        if 'diff_steps' not in _explicit:
+        if args.diff_steps is None:
             args.diff_steps = 10
-        if 'eta' not in _explicit:
+        if args.eta is None:
             args.eta = 0.0
+    if args.diff_steps is None:
+        args.diff_steps = 50
+    if args.eta is None:
+        args.eta = 1.0
 
     device = torch.device(args.device) if args.device \
              else torch.device("cuda" if torch.cuda.is_available() else "cpu")

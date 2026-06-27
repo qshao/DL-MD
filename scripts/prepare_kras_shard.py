@@ -49,9 +49,11 @@ def read_pdb_ca_sequence(pdb_path):
             if line[12:16].strip() != "CA":
                 continue
             resname = line[17:20].strip()
+            chain_id = line[21]
             resnum = int(line[22:26])
-            if resnum not in seen:
-                seen.add(resnum)
+            key = (chain_id, resnum)
+            if key not in seen:
+                seen.add(key)
                 seq.append(resname)
     return seq
 

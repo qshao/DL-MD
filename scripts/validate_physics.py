@@ -126,8 +126,8 @@ def main():
     ap.add_argument("--ddim", action="store_true",
                     help="Fast deterministic DDIM sampling: sets eta=0.0, diff_steps=10. "
                          "Override with explicit --eta / --diff_steps.")
-    ap.add_argument("--diff_steps", type=int, default=20)
-    ap.add_argument("--eta", type=float, default=1.0)
+    ap.add_argument("--diff_steps", type=int, default=None)
+    ap.add_argument("--eta", type=float, default=None)
     ap.add_argument("--temp_K", type=float, default=300.0)
     ap.add_argument("--wca_sigma", type=float, default=4.5)
     ap.add_argument("--wca_eps", type=float, default=0.3)
@@ -152,12 +152,14 @@ def main():
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
     if args.ddim:
-        _explicit = {a.lstrip('-').split('=')[0].replace('-', '_')
-                     for a in sys.argv[1:] if a.startswith('-')}
-        if 'diff_steps' not in _explicit:
+        if args.diff_steps is None:
             args.diff_steps = 10
-        if 'eta' not in _explicit:
+        if args.eta is None:
             args.eta = 0.0
+    if args.diff_steps is None:
+        args.diff_steps = 20
+    if args.eta is None:
+        args.eta = 1.0
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     settings = {

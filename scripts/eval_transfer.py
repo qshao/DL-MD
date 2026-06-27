@@ -20,7 +20,7 @@ from lsmd import transfer_eval as te
 
 def _run(ckpt, shard, steps, tau_ps, k, diff_steps, eta, temp_K,
          bond_constraint_iters, max_update_norm,
-         wca_sigma, wca_eps, wca_lam, device):
+         wca_sigma, wca_eps, wca_lam, graph_rebuild_interval, device):
     net, sched, norm = te.load_checkpoint(ckpt, device=device)
     k_eff = ckpt["hparams"].get("k", k)
     # support both compact (R_aa float16) and legacy (R float32) shard formats
@@ -37,6 +37,7 @@ def _run(ckpt, shard, steps, tau_ps, k, diff_steps, eta, temp_K,
                       bond_constraint_iters=bond_constraint_iters,
                       max_update_norm=max_update_norm,
                       wca_sigma=wca_sigma, wca_eps=wca_eps, wca_lam=wca_lam,
+                      graph_rebuild_interval=graph_rebuild_interval,
                       device=device)
     return te.evaluate(traj, t_md)
 
@@ -51,9 +52,9 @@ def main():
     ap.add_argument("--ddim", action="store_true",
                     help="Fast deterministic DDIM sampling: sets eta=0.0, diff_steps=10. "
                          "Override with explicit --eta / --diff_steps.")
-    ap.add_argument("--diff_steps", type=int, default=50,
+    ap.add_argument("--diff_steps", type=int, default=None,
                     help="Denoising steps (default 50 DDPM; 10 recommended with --ddim/--eta 0)")
-    ap.add_argument("--eta", type=float, default=1.0,
+    ap.add_argument("--eta", type=float, default=None,
                     help="Reverse-process stochasticity: 1.0=DDPM (default), 0.0=DDIM")
     ap.add_argument("--temp_K", type=float, default=300.0,
                     help="Simulation temperature in Kelvin (default 300; used when model has temp_emb_dim > 0)")
@@ -66,6 +67,8 @@ def main():
                     help="WCA well depth (kcal/mol, default 0.3 ≈ 0.5 kT at 300 K).")
     ap.add_argument("--wca_lam", type=float, default=0.05,
                     help="WCA guidance step size in normalized update space (default 0.05).")
+    ap.add_argument("--graph_rebuild_interval", type=int, default=1,
+                    help="Rebuild kNN graph topology every N rollout steps (default 1 = every step).")
     ap.add_argument("--bond_constraint_iters", type=int, default=5,
                     help="SHAKE iterations enforcing CA–CA pseudo-bond lengths after each "
                          "diffusion step (default 5). Set 0 to disable. Prevents systematic "
@@ -76,12 +79,14 @@ def main():
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
     if args.ddim:
-        _explicit = {a.lstrip('-').split('=')[0].replace('-', '_')
-                     for a in sys.argv[1:] if a.startswith('-')}
-        if 'diff_steps' not in _explicit:
+        if args.diff_steps is None:
             args.diff_steps = 10
-        if 'eta' not in _explicit:
+        if args.eta is None:
             args.eta = 0.0
+    if args.diff_steps is None:
+        args.diff_steps = 50
+    if args.eta is None:
+        args.eta = 1.0
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     shard = torch.load(args.shard, map_location="cpu")
@@ -92,6 +97,7 @@ def main():
         bond_constraint_iters=args.bond_constraint_iters,
         max_update_norm=args.max_update_norm,
         wca_sigma=args.wca_sigma, wca_eps=args.wca_eps, wca_lam=args.wca_lam,
+        graph_rebuild_interval=args.graph_rebuild_interval,
         device=device,
     )
     report = {"model": _run(torch.load(args.checkpoint, map_location="cpu"),

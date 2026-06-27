@@ -176,6 +176,8 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
     Returns:
         [steps+1, N, 3] CA positions (frame 0 = reference t0).
     """
+    if graph_rebuild_interval < 1:
+        raise ValueError(f"graph_rebuild_interval must be >= 1, got {graph_rebuild_interval}")
     device = torch.device(device)
     R = R0.to(device)
     t = t0.to(device)
@@ -201,6 +203,16 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
     # Build WCA guidance once per rollout step (captures current R, t via closure)
     use_wca = wca_sigma > 0 and wca_lam > 0
 
+    # Pre-stack the CV buffer once (it is never mutated inside rollout) and move
+    # it to the compute device so guidance_fn avoids a per-denoising-step H2D copy.
+    # Require > 0 items: guide_warmup=0 means "no warmup" but an empty buffer
+    # still produces no repulsion (build_cv_guidance early-exits on empty).
+    cv_buf_stacked = None
+    if (cv_space is not None and cv_buffer is not None
+            and len(cv_buffer) > 0
+            and len(cv_buffer) >= guide_warmup):
+        cv_buf_stacked = torch.stack(cv_buffer).to(device)  # [B, n_cv]
+
     traj = [t.clone()]
     edge_index = None
     for step_i in range(steps):
@@ -217,10 +229,9 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
             if use_wca else None
         )
         # CV-space repulsion guidance (composed with WCA if both active)
-        if (cv_space is not None and cv_buffer is not None
-                and len(cv_buffer) >= guide_warmup):
+        if cv_buf_stacked is not None:
             cv_fn = _build_cv_guidance(R, t, chain_id, scale, cv_space,
-                                       cv_buffer, k_guide, sigma_cv)
+                                       cv_buf_stacked, k_guide, sigma_cv)
             if guidance_fn is not None:
                 _wca = guidance_fn
                 guidance_fn = lambda u, _w=_wca, _c=cv_fn: _c(_w(u))

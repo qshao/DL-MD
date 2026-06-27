@@ -38,12 +38,12 @@ class CVSpace:
         self.components = Vh[:self.n_pc].cpu()        # [n_pc, 3N]
 
         centroid = coords.mean(dim=1, keepdim=True)   # [F, 1, 3]
-        rg = ((coords - centroid) ** 2).sum(-1).mean(-1).sqrt()  # [F]
+        rg = ((coords - centroid) ** 2).sum(-1).mean(-1).clamp_min(1e-8).sqrt()  # [F]
         self.rg_mean = rg.mean().float().cpu()
         self.rg_std = rg.std().float().clamp_min(1e-8).cpu()
 
         mean_ca = mean.reshape(N, 3)
-        rmsd = ((coords.float() - mean_ca.unsqueeze(0)) ** 2).sum(-1).mean(-1).sqrt()
+        rmsd = ((coords.float() - mean_ca.unsqueeze(0)) ** 2).sum(-1).mean(-1).clamp_min(1e-8).sqrt()
         self.rmsd_std = rmsd.std().float().clamp_min(1e-8).cpu()
 
     def project_single(self, t: torch.Tensor) -> torch.Tensor:
@@ -87,12 +87,13 @@ class CVSpace:
         X = coords.reshape(F, N * 3).float().to(dev)       # [F, 3N]
         pc = (X - self.mean) @ self.components.T            # [F, n_pc]
 
-        centroid = coords.float().to(dev).mean(dim=1, keepdim=True)  # [F, 1, 3]
-        rg = ((coords.float().to(dev) - centroid) ** 2).sum(-1).mean(-1).clamp_min(1e-8).sqrt()
+        coords_dev = X.reshape(F, N, 3)                    # [F, N, 3] — free view of X
+        centroid = coords_dev.mean(dim=1, keepdim=True)     # [F, 1, 3]
+        rg = ((coords_dev - centroid) ** 2).sum(-1).mean(-1).clamp_min(1e-8).sqrt()
         rg_norm = (rg - self.rg_mean) / self.rg_std         # [F]
 
         mean_ca = self.mean.reshape(N, 3)                   # [N, 3]
-        rmsd = ((coords.float().to(dev) - mean_ca) ** 2).sum(-1).mean(-1).clamp_min(1e-8).sqrt()
+        rmsd = ((coords_dev - mean_ca) ** 2).sum(-1).mean(-1).clamp_min(1e-8).sqrt()
         rmsd_norm = rmsd / self.rmsd_std                    # [F]
 
         return torch.cat([pc, rg_norm.unsqueeze(1), rmsd_norm.unsqueeze(1)], dim=1)
@@ -121,9 +122,9 @@ class CVSpace:
             V: scalar — sum of repulsive Gaussians. Zero when buffer is empty.
         """
         if isinstance(buffer, torch.Tensor):
-            if buffer.numel() == 0:
+            if buffer.shape[0] == 0:
                 return torch.zeros((), device=cv.device, dtype=cv.dtype)
-            buf = buffer.to(cv.device).to(cv.dtype)
+            buf = buffer.to(device=cv.device, dtype=cv.dtype)
         elif not buffer:
             return torch.zeros((), device=cv.device, dtype=cv.dtype)
         else:
@@ -172,14 +173,19 @@ def build_cv_guidance(R, t, chain_id, scale, cv_space, buffer, k_guide, sigma_cv
         guidance_fn(u0_hat [N,6]) -> u0_hat_guided [N,6].
         Returns u0_hat unchanged when buffer is empty or k_guide == 0.
     """
-    if k_guide == 0.0 or not buffer:
+    _buf_len = buffer.shape[0] if isinstance(buffer, torch.Tensor) else len(buffer)
+    if k_guide == 0.0 or _buf_len == 0:
         return lambda u: u
 
     R_ref = R.detach()
     t_ref = t.detach()
     sc = scale.detach()
-    # Pre-stack buffer once to avoid O(B) allocation on every denoising step.
-    buf_stacked = torch.stack(buffer)  # [B, n_cv]
+    # Pre-stack buffer once and move to the compute device to avoid repeated
+    # O(B) allocation and CPU→GPU transfer inside the denoising loop.
+    if isinstance(buffer, torch.Tensor):
+        buf_stacked = buffer.to(t_ref.device)
+    else:
+        buf_stacked = torch.stack(buffer).to(t_ref.device)  # [B, n_cv]
 
     def guidance_fn(u0_hat):
         with torch.enable_grad():
