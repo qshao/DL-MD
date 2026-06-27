@@ -742,3 +742,343 @@ Then train with `--shards_dir data/my_protein` alongside ATLAS/mdCATH. Set `--la
 | Validation script | `infer.py` | `validate_physics.py` (structural + kinetic + thermo) |
 | Typical RMSF corr (ATLAS) | Per-protein only | 0.72–0.98 (v4 per-protein fine-tune) |
 | All-atom reconstruction | Template nearest-neighbor | Not included (Cα-level output) |
+
+---
+
+---
+
+# Part 3 — CV-Guided Conformational Exploration
+
+The exploration mode extends the transferable propagator with **history-dependent repulsion in collective-variable (CV) space**. Rather than sampling dynamics near the training ensemble, the model is steered away from conformations it has already generated — systematically filling the accessible free-energy landscape.
+
+This is useful for:
+- Generating diverse starting structures for MD relaxation validation
+- Discovering metastable states that are rare in short MD simulations
+- Studying conformational transitions relevant to drug binding (e.g., KRAS GDP/GTP states, kinase DFG loop flips)
+
+## Algorithm
+
+```
+Training shard (Cα frames)
+        │
+        ▼
+  1. CVSpace.fit()       Build PCA basis (n_pc PCs) + Rg/RMSD normalisation.
+                         Save basis to cv_basis.pt for resume consistency.
+        │
+        ▼
+  2. For each attempt:
+     a. Pick random starting frame from shard
+     b. rollout() for n_steps × tau_ps of simulated time
+        → WCA excluded-volume guidance active throughout
+        → CV repulsion active once guide_warmup structures accepted
+     c. Geometry filter: CA–CA bond deviation < 0.1 Å, clashes < 0.5
+     d. Accept → project to CV → append to buffer
+     e. Coverage plot written every 100 accepts
+```
+
+At each of the `diff_steps` denoising steps inside `rollout()`, the CV guidance computes:
+
+```python
+V_rep = Σ_i exp(−||cv(x) − cv_i||² / (2 σ²))   # sum over accepted structures
+grad_u = −∂V_rep/∂u                               # steers u0_hat away from V_rep
+```
+
+The gradient is normalised and scaled by `k_guide`, then subtracted from the predicted
+clean update. No retraining is required — the guidance runs entirely at inference time.
+
+---
+
+## Quick-start: explore with an ATLAS protein
+
+If you already have a fine-tuned checkpoint and an ATLAS shard:
+
+```bash
+python scripts/explore_conformations.py \
+    --checkpoint checkpoints/v4_3u7t_A.pt \
+    --shard      data/atlas/3u7t_A.pt \
+    --n_explore  500 \
+    --n_steps    100 \
+    --tau_ps     2000 \
+    --n_pc       5 \
+    --k_guide    0.10 \
+    --sigma_cv   1.0 \
+    --guide_warmup 50 \
+    --graph_rebuild_interval 5 \
+    --wca_sigma  4.5 --wca_eps 0.3 --wca_lam 0.05 \
+    --diff_steps 20 --eta 1.0 \
+    --temp_K     310 \
+    --out        explore_3u7t_A \
+    --seed       42
+```
+
+**Expected output** in `explore_3u7t_A/`:
+```
+explore_3u7t_A/
+  candidates/00000.pdb  …  candidates/00499.pdb   Cα PDB files (accepted only)
+  summary.json                                     per-structure metrics
+  cv_coords.npy                                    [M, n_pc+2] CV vectors
+  structures.pt                                    [M, N, 3] stacked Cα tensors
+  cv_coverage.png                                  PC1 vs PC2 scatter
+  cv_basis.pt                                      saved PCA basis (for resume)
+```
+
+A typical 500-attempt run on a 46-residue protein takes ~10 minutes on GPU, producing
+100–200 accepted structures depending on geometry filter strictness.
+
+---
+
+## KRAS fine-tune + exploration pipeline
+
+KRAS requires a format-conversion step because the legacy `wt_frames.pt` trajectory uses
+a different residue vocabulary and lacks the `dt` / `seq` / `n_res` metadata fields
+required by the transferable trainer.
+
+### Step 1 — Convert legacy trajectory to atlas-compatible shard
+
+```bash
+python scripts/prepare_kras_shard.py \
+    --wt_frames data/wt_frames.pt \
+    --pdb       WT/WT_fixed.pdb \
+    --dt        200.0 \
+    --out       data/kras_wt_shard.pt
+```
+
+Expected output:
+```
+Loaded 5001 frames, 169 residues
+Read 169 CA residues from WT/WT_fixed.pdb
+Canonical res_type range: [0, 20]
+Shard saved → data/kras_wt_shard.pt
+  R [5001, 169, 3, 3] float32   t [5001, 169, 3] float32
+  dt=200.0 ps   n_res=169   14918 lag pairs available
+```
+
+`WT/WT_fixed.pdb` is the PDB file with the canonical KRAS-WT sequence (169 Cα atoms).
+The script reads the residue sequence from the PDB to map the legacy 0–18 local vocabulary
+to the canonical 21-type vocabulary used by the pretrained checkpoint.
+
+### Step 2 — Fine-tune the pretrained model on KRAS-WT
+
+```bash
+python scripts/train_transfer.py \
+    --shard        data/kras_wt_shard.pt \
+    --resume       checkpoints/v2_256h_90k.pt \
+    --lags_ps      2000 5000 10000 \
+    --lr           1e-4 \
+    --steps        5000 \
+    --accum        4 \
+    --grad_clip    1.0 \
+    --temp_emb_dim 8 \
+    --time_reversal \
+    --log_every    250 \
+    --out          checkpoints/kras_ft.pt
+```
+
+Key choices:
+- `--lr 1e-4` — 10× lower than ATLAS pre-training (1e-3) to prevent catastrophic forgetting
+- `--steps 5000` — ~3 effective dataset epochs at `accum=4`
+- `--time_reversal` — doubles effective data and enforces microscopic reversibility
+
+Expected console output:
+```
+  data/kras_wt_shard.pt: 1 shard, 5001 total frames  (0.1s)
+Total: 1 shard from 1 dataset(s)
+  UpdateNorm fitted on: data/kras_wt_shard.pt (1 shard)
+step  250/5000  loss=0.183  11.3 step/s  elapsed=0.4m  ETA=6.9m
+step  500/5000  loss=0.151  11.5 step/s  elapsed=0.7m  ETA=6.6m
+...
+Checkpoint saved → checkpoints/kras_ft.pt
+```
+
+### Step 3 — Run CV-guided exploration
+
+```bash
+python scripts/explore_conformations.py \
+    --checkpoint  checkpoints/kras_ft.pt \
+    --shard       data/kras_wt_shard.pt \
+    --n_explore   1000 \
+    --n_steps     200 \
+    --tau_ps      2000 \
+    --temp_K      310 \
+    --k_guide     0.15 \
+    --sigma_cv    0.8 \
+    --n_pc        5 \
+    --guide_warmup 20 \
+    --graph_rebuild_interval 5 \
+    --wca_sigma   4.5 \
+    --wca_eps     0.3 \
+    --wca_lam     0.08 \
+    --diff_steps  20 \
+    --eta         1.0 \
+    --out         kras_exploration \
+    --seed        42
+```
+
+Or use the reproducible pipeline script that runs all three steps automatically:
+
+```bash
+# Full pipeline (create shard + fine-tune + explore)
+bash scripts/run_kras_finetune_explore.sh
+
+# Extend an existing exploration run
+bash scripts/run_kras_finetune_explore.sh --resume
+```
+
+---
+
+## Resuming an interrupted run
+
+The explorer writes `summary.json`, `cv_basis.pt`, and `structures.pt` after each accepted
+structure. If the run is interrupted, pass `--resume` to continue from where it stopped:
+
+```bash
+python scripts/explore_conformations.py \
+    --checkpoint kras_ft.pt --shard data/kras_wt_shard.pt \
+    --n_explore 1000 --out kras_exploration --resume
+```
+
+**Resume consistency**: the saved `cv_basis.pt` is reloaded instead of re-fitting PCA.
+This ensures that PC sign conventions are preserved and that new structures are repelled
+from the same coordinate system as existing ones.
+
+If `cv_basis.pt` is missing but `summary.json` exists (e.g., the basis was accidentally
+deleted), the script raises `FileNotFoundError` rather than silently refitting PCA with
+an inconsistent sign convention. Restore `cv_basis.pt` from backup or delete
+`summary.json` to start fresh.
+
+---
+
+## Analyzing results
+
+### Quick summary
+
+```bash
+python scripts/summarize_exploration.py --out kras_exploration
+```
+
+Output:
+```
+=== Exploration Summary (kras_exploration) ===
+Total accepted (geometry filter):  347
+MD-validated (md_pass=True):       0
+MD-rejected  (md_pass=False):      0
+Pending MD:                        347
+```
+
+Structures in `candidates/` are Cα-only PDB files. Run short classical MD relaxation
+on the accepted structures to validate whether they are stable. After updating
+`md_pass`, `md_rmsd_final`, and `md_rg_final` fields in `summary.json`,
+re-run `summarize_exploration.py` to get classification counts and the MD survivor plot.
+
+### CV coverage plot
+
+`cv_coverage.png` is written automatically during exploration (updated every 100 accepts).
+Grey points = training ensemble; coloured points = generated structures (early→late = purple→yellow).
+
+Load for analysis:
+```python
+import numpy as np
+import torch
+
+cv_coords = np.load("kras_exploration/cv_coords.npy")   # [M, n_pc+2]
+structures = torch.load("kras_exploration/structures.pt")  # [M, N, 3]
+
+# PC1 vs PC2 scatter
+import matplotlib.pyplot as plt
+plt.scatter(cv_coords[:, 0], cv_coords[:, 1], c=range(len(cv_coords)), cmap="plasma")
+plt.xlabel("PC1"); plt.ylabel("PC2"); plt.colorbar(label="generation index")
+```
+
+---
+
+## Flag reference — explore_conformations.py
+
+### Required
+
+| Flag | Description |
+|---|---|
+| `--checkpoint` | Trained `.pt` checkpoint (transferable propagator, fine-tuned recommended) |
+| `--shard` | Atlas-compatible protein shard `.pt` |
+
+### Exploration control
+
+| Flag | Default | Description |
+|---|---|---|
+| `--n_explore` | `500` | Maximum exploration attempts (total calls to rollout) |
+| `--n_steps` | `100` | Rollout steps per attempt (one step = one τ of simulated time) |
+| `--tau_ps` | `2000` | Physical lag per rollout step in picoseconds |
+| `--temp_K` | `300` | Simulation temperature in Kelvin |
+| `--seed` | `42` | Global random seed for reproducibility |
+| `--out` | `explore_out` | Output directory |
+| `--resume` | off | Continue from an existing `summary.json` + `cv_basis.pt` |
+
+### CV-space guidance
+
+| Flag | Default | Description |
+|---|---|---|
+| `--n_pc` | `3` | Number of PCA components in the CV basis. 3–5 captures most conformational variance for small proteins; 5–8 for larger ones |
+| `--k_guide` | `0.05` | CV repulsion strength (normalised-update units). Increase (0.10–0.20) for stronger steering away from the native basin |
+| `--sigma_cv` | `1.0` | Gaussian width in normalised CV units. Smaller values (0.5–0.8) distinguish finer structural differences |
+| `--guide_warmup` | `50` | Number of accepted structures required before activating CV repulsion. Lower (10–20) for proteins with narrow basins |
+
+### Inference speed
+
+| Flag | Default | Description |
+|---|---|---|
+| `--diff_steps` | `20` | Denoising steps per rollout step. 20 is a good default; use 50–200 for higher sample quality |
+| `--eta` | `1.0` | Stochasticity: 1.0 = full DDPM (most diverse), 0.0 = deterministic DDIM |
+| `--ddim` | off | Shorthand for `--diff_steps 10 --eta 0.0` (10× faster, less diverse). Override with explicit flags |
+| `--graph_rebuild_interval` | `1` | Rebuild kNN graph topology every N rollout steps. Values 5–10 give ~5–10× faster rollout with minimal accuracy loss |
+
+### Excluded-volume guidance (WCA)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--wca_sigma` | `4.5` | WCA Cα–Cα excluded-volume diameter in Å. Set 0 to disable |
+| `--wca_eps` | `0.3` | WCA well depth in kcal/mol |
+| `--wca_lam` | `0.05` | WCA guidance step size. Increase to 0.08–0.10 for flexible loops |
+
+### Geometry filter
+
+The geometry filter rejects structures with:
+- Cα–Cα bond deviation > 0.1 Å from the reference (mean of training shard)
+- Mean steric clashes > 0.5 per frame
+
+Accepted structures are guaranteed to have near-ideal Cα backbone geometry.
+
+---
+
+## Hyperparameter tuning guide
+
+| Symptom | Suggested fix |
+|---|---|
+| Few accepts (< 5% accept rate) | Relax WCA: `--wca_lam 0.02`. Reduce `--n_steps` to 50 |
+| Accepts cluster near native basin | Increase `--k_guide` to 0.10–0.20; reduce `--sigma_cv` to 0.6–0.8 |
+| Accepts all have very similar CV coordinates | Increase `--n_pc` to 5–8; reduce `--sigma_cv` |
+| NaN positions during rollout | Reduce `--tau_ps` (use 1000 or 500); check that inference τ is within training range |
+| Very slow (CPU or small GPU) | Add `--graph_rebuild_interval 10 --diff_steps 10 --eta 0.0` |
+| Run interrupted mid-way | Use `--resume` — exploration continues from last accepted structure |
+
+---
+
+## Preparing your own protein shard
+
+If your trajectory uses a non-ATLAS format (e.g., a legacy dataset with a local residue
+vocabulary or missing metadata), use `prepare_kras_shard.py` as a template or extend it:
+
+```bash
+python scripts/prepare_kras_shard.py \
+    --wt_frames  data/my_frames.pt \
+    --pdb        structures/my_protein.pdb \
+    --dt         200.0 \
+    --out        data/my_shard.pt
+```
+
+The script:
+1. Loads the legacy frame tensor `[F, N, 3]` or `[F, N, 3, 3]`
+2. Reads the canonical residue sequence from the PDB file (chains deduplicated correctly)
+3. Maps residue names to the 21-type canonical vocabulary used by the pretrained checkpoint
+4. Adds `dt`, `seq`, `n_res`, canonical `res_type`, `chain_id`, `res_index`
+5. Computes `R` (3×3 rotation matrices) from Cα positions if not present
+
+Output is a standard atlas-compatible shard that can be used with any LSMD script.

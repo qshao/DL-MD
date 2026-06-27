@@ -1,9 +1,10 @@
 # Long-Stride MD (LSMD)
 
-A deep-learning surrogate for protein conformational dynamics. LSMD provides two complementary models:
+A deep-learning surrogate for protein conformational dynamics. LSMD provides two complementary models plus a CV-guided exploration mode:
 
 1. **Per-protein DDPM** — trains on a single MD trajectory and generates new conformations for that specific protein at **10⁵–10⁶× speedup**.
 2. **Transferable cross-protein propagator** — trains once on ATLAS proteins then fine-tunes per-protein, achieving **RMSF correlation 0.72–0.98** across 6 diverse proteins (46–219 residues) with near-zero steric clashes and correct thermodynamic ensemble coverage.
+3. **CV-guided conformational exploration** — adds history-dependent repulsion in PCA + Rg + RMSD collective-variable space to steer inference away from already-sampled structures, systematically filling the accessible free-energy landscape without retraining.
 
 > **Current best checkpoint:** v4 per-protein fine-tune. All five validation criteria (RMSF corr > 0.90, dist JS < 0.005, FES JS < 0.50, relax ratio 0.5–5, clashes = 0) pass at the optimal inference temperature. See [`docs/validation_analysis.md`](docs/validation_analysis.md).
 
@@ -18,6 +19,8 @@ LSMD addresses this at two levels:
 **Per-protein model**: learns the displacement distribution Δ = X_{i+τ} − X_i directly from an existing MD trajectory. One neural-network call replaces τ × 200 ps of MD integration. 2500 steps at τ=2 (400 ps/step) generates 1 μs in ~6 minutes — a **2000× speedup**.
 
 **Transferable model**: learns SE(3)-equivariant backbone dynamics across 2938 proteins simultaneously. At inference, the protein's sequence and current structure are all that is required — no per-protein MD trajectory needed. For a 100-residue protein with τ=2 ns and DDPM sampling (200 steps): **~1300 μs/day** of simulated time on a single GPU.
+
+**CV-guided exploration**: no additional training — runs entirely at inference time. A PCA + Rg + RMSD collective-variable space is fitted from the training shard. During each DDPM denoising step, a history-dependent Gaussian repulsion steers the predicted structure away from all previously accepted conformations. Systematically covers the free-energy landscape while maintaining near-ideal Cα backbone geometry via WCA excluded-volume guidance and bond-length constraints.
 
 ---
 
@@ -207,6 +210,54 @@ See [tutorial Part 2](docs/tutorial.md#part-2--transferable-cross-protein-propag
 
 ---
 
+## Workflow: CV-Guided Conformational Exploration
+
+```
+Checkpoint + shard
+        │
+        ▼  CVSpace.fit(): PCA + Rg + RMSD basis
+        │
+        ▼  explore_conformations.py (N attempts × M rollout steps)
+           WCA guidance: avoid steric clashes
+           CV repulsion: steer away from accepted structures
+        │
+        ├── candidates/NNNNN.pdb     Cα PDB files
+        ├── summary.json             per-structure metrics
+        ├── cv_coords.npy            CV coordinates [M, n_pc+2]
+        └── cv_coverage.png          PC1 vs PC2 scatter
+```
+
+**Quick start with an ATLAS fine-tuned checkpoint:**
+
+```bash
+bash scripts/run_explore.sh          # edit config variables at top of script
+```
+
+**Or run directly:**
+
+```bash
+python scripts/explore_conformations.py \
+    --checkpoint checkpoints/v4_3u7t_A.pt \
+    --shard      data/atlas/3u7t_A.pt \
+    --n_explore  500 --n_steps 100 --tau_ps 2000 \
+    --n_pc 5 --k_guide 0.10 --sigma_cv 1.0 --guide_warmup 50 \
+    --graph_rebuild_interval 5 \
+    --wca_sigma 4.5 --wca_eps 0.3 --wca_lam 0.05 \
+    --diff_steps 20 --eta 1.0 --temp_K 310 \
+    --out explore_out --seed 42
+```
+
+**KRAS fine-tune + exploration (end-to-end):**
+
+```bash
+bash scripts/run_kras_finetune_explore.sh          # full run (GPU)
+bash scripts/run_kras_finetune_explore.sh --resume # extend an existing run
+```
+
+See [tutorial Part 3](docs/tutorial.md#part-3--cv-guided-conformational-exploration) for flag reference and hyperparameter tuning guide.
+
+---
+
 ## Throughput
 
 For the transferable model at inference (DDPM T=200 denoising steps, single GPU):
@@ -272,6 +323,7 @@ lsmd/
   normalize.py         — UpdateNorm: 99th-percentile per-component normalization
   noether.py           — Noether momentum projection (remove net linear/angular momentum)
   cg_energy.py         — WCA excluded-volume energy; CG angle + MJ contact potentials
+  cv_guidance.py       — CVSpace (PCA + Rg + RMSD basis) and build_cv_guidance() for exploration
   physics_loss.py      — C1 soft loss: geometric penalty (bond/clash) on x0_hat
   batching.py          — union_collate: disjoint-union batching for variable-size proteins
   atlas.py             — ATLAS shard builder: SE(3) frames + degenerate-frame filtering
@@ -283,25 +335,33 @@ lsmd/
   demo.py              — all-in-one CLI
 
 scripts/
-  run_v4_pipeline.sh         — end-to-end v4 pipeline: Phase 1 universal + Phase 2 per-protein
+  Pipeline templates (copy, edit config vars at top, run):
+  run_v4_pipeline.sh             — end-to-end v4: Phase 1 universal + Phase 2 per-protein fine-tune
+  run_per_protein.sh             — per-protein DDPM: preprocess → train → validate → generate trajectory
+  run_transferable_inference.sh  — transferable model: fine-tune one protein → validate → rollout
+  run_explore.sh                 — CV-guided exploration: fine-tune → explore → summarize
+  run_kras_finetune_explore.sh   — KRAS-specific: convert legacy shard → fine-tune → explore
+
+  Core scripts:
   train_transfer.py          — train / fine-tune transferable propagator; supports --shard / --resume
   validate_physics.py        — comprehensive validation: structural + thermodynamic + kinetic
-  eval_transfer.py           — quick four-metric evaluation (legacy; validate_physics.py preferred)
-  generate_report.py         — generate PDF comparison report (matplotlib + weasyprint)
+  eval_transfer.py           — quick four-metric evaluation + zero-shot bracket
+  explore_conformations.py   — CV-guided conformational exploration with history-dependent repulsion
+  summarize_exploration.py   — post-MD analysis of accepted structures from explore_conformations.py
+  prepare_kras_shard.py      — convert legacy trajectory to atlas-compatible shard format
   preprocess.py              — save bead point cloud to disk (per-protein model)
   train.py                   — train per-protein DDPM checkpoint
   infer.py                   — generate K snapshots from a single source frame
   generate_md.py             — autoregressive long trajectory (explore / mimic modes)
   reconstruct.py             — all-atom reconstruction from bead trajectory
+  generate_report.py         — generate PDF comparison report (matplotlib + weasyprint)
   download_atlas_full.py     — download and build all ATLAS shards
   download_mdcath.py         — download and build all mdCATH shards
-  repack_shards.py           — compact shard format conversion
-  download_and_train_atlas.py — end-to-end ATLAS pipeline
 
-tests/                       — pytest unit tests
+tests/                       — pytest unit tests (248 tests)
 
 docs/
-  tutorial.md                — step-by-step tutorial (per-protein + transferable v4 pipeline)
+  tutorial.md                — step-by-step tutorial (per-protein + transferable + exploration)
   validation_analysis.md     — v3 exploration results + v4 full results with all metrics
   next_steps.md              — prioritised improvement roadmap
 ```
