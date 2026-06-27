@@ -115,6 +115,7 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
             cv_space=None, cv_buffer=None, k_guide=0.05, sigma_cv=1.0,
             guide_warmup=50,
             graph_rebuild_interval=1,
+            return_state=False,
             device="cpu"):
     """Autoregressive CA trajectory from a reference structure.
 
@@ -264,7 +265,10 @@ def rollout(net, schedule, update_norm, R0, t0, res_type, chain_id, res_index,
             t = noether_project(traj[-1], t, chain_id)
         traj.append(t.clone())
 
-    return torch.stack(traj, dim=0)
+    stacked = torch.stack(traj, dim=0)
+    if return_state:
+        return stacked, R.cpu(), t.cpu()
+    return stacked
 
 
 def evaluate(ca_model, ca_md):
