@@ -290,3 +290,45 @@ def test_convergence_unknown_criterion():
     state = {"total_md_ns": 10.0, "last_novel_fraction": 0.5, "round": 1}
     with pytest.raises(ValueError, match="Unknown convergence criterion"):
         check_convergence("unknown", 0.5, state)
+
+
+# ---------------------------------------------------------------------------
+# Task 5: integration tests for scripts/active_learning.py
+# ---------------------------------------------------------------------------
+import subprocess
+import sys
+from pathlib import Path
+
+
+def test_active_learning_help():
+    """scripts/active_learning.py --help must exit 0."""
+    result = subprocess.run(
+        [sys.executable, "scripts/active_learning.py", "--help"],
+        capture_output=True, cwd="/home/qshao/DL-MD"
+    )
+    assert result.returncode == 0
+    assert b"--pdb" in result.stdout
+
+
+def test_active_learning_resume_skips_done(tmp_path, monkeypatch):
+    """Orchestrator skips rounds with .done stamps without re-running them."""
+    # Create a round_0 with .done stamp and pre-populated summary
+    round0 = tmp_path / "round_0"
+    round0.mkdir()
+    summary = {
+        "round": 0, "n_proposals_generated": 10, "n_novel_filtered": 5,
+        "n_md_attempted": 5, "n_md_success": 4,
+        "new_frames_this_round": 40, "total_frames_accumulated": 40,
+        "total_md_ns": 40.0, "last_novel_fraction": 0.5,
+        "fes_js": None, "converged": False,
+        "stop_criterion": "budget", "stop_threshold": 1000.0,
+    }
+    with open(round0 / "round_summary.json", "w") as fh:
+        json.dump(summary, fh)
+    (round0 / ".done").touch()
+
+    # Import and call _load_completed_rounds to verify resume logic
+    from scripts.active_learning import _load_completed_rounds
+    completed = _load_completed_rounds(str(tmp_path))
+    assert 0 in completed
+    assert completed[0]["total_md_ns"] == 40.0
