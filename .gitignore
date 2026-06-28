@@ -38,3 +38,12 @@ htmlcov/
 
 # OS
 .DS_Store
+
+# Active learning test runs (large MD data)
+tau_test/al_run/
+tau_test/*.pt
+tau_test/6QJH_raw.pdb
+bench_2bead_tau1_1us/
+kras_exploration/
+logs/
+validation_*.json

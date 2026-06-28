@@ -33,18 +33,24 @@ class CVSpace:
         F, N, _ = coords.shape
         X = coords.reshape(F, N * 3).float()
         mean = X.mean(dim=0)                          # [3N]
-        _, _, Vh = torch.linalg.svd(X - mean, full_matrices=False)
         self.mean = mean.cpu()
-        self.components = Vh[:self.n_pc].cpu()        # [n_pc, 3N]
+
+        if F >= 2:
+            _, _, Vh = torch.linalg.svd(X - mean, full_matrices=False)
+            self.components = Vh[:self.n_pc].cpu()    # [n_pc, 3N]
+        else:
+            # F=1: SVD of zero matrix is numerically unstable. Zero components
+            # → PC scores stay 0; guidance acts on Rg+RMSD dims only.
+            self.components = torch.zeros(self.n_pc, N * 3)
 
         centroid = coords.mean(dim=1, keepdim=True)   # [F, 1, 3]
         rg = ((coords - centroid) ** 2).sum(-1).mean(-1).clamp_min(1e-8).sqrt()  # [F]
         self.rg_mean = rg.mean().float().cpu()
-        self.rg_std = rg.std().float().clamp_min(1e-8).cpu()
+        self.rg_std  = rg.std().float().nan_to_num(0.0).clamp_min(1e-8).cpu()
 
         mean_ca = mean.reshape(N, 3)
         rmsd = ((coords.float() - mean_ca.unsqueeze(0)) ** 2).sum(-1).mean(-1).clamp_min(1e-8).sqrt()
-        self.rmsd_std = rmsd.std().float().clamp_min(1e-8).cpu()
+        self.rmsd_std = rmsd.std().float().nan_to_num(0.0).clamp_min(1e-8).cpu()
 
     def project_single(self, t: torch.Tensor) -> torch.Tensor:
         """Project one Cα frame onto the CV basis.
