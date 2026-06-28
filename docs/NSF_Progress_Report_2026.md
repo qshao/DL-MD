@@ -23,11 +23,18 @@
    - 5.4 [CV-Guided Conformational Exploration: KRAS Oncoproteins](#54-cv-guided-conformational-exploration-kras-oncoproteins)
    - 5.5 [Hybrid ML-MD Pipeline](#55-hybrid-ml-md-pipeline)
    - 5.6 [Computational Throughput](#56-computational-throughput)
-6. [Software and Open-Source Contributions](#6-software-and-open-source-contributions)
-7. [Challenges and Solutions](#7-challenges-and-solutions)
-8. [Future Work](#8-future-work)
-9. [Personnel and Training](#9-personnel-and-training)
-10. [References](#10-references)
+6. [Approaches Explored and Lessons Learned](#6-approaches-explored-and-lessons-learned)
+   - 6.1 [Physics-Informed Geometric Penalty Losses](#61-physics-informed-geometric-penalty-losses)
+   - 6.2 [Narrow Lag Training and Out-of-Distribution Instability](#62-narrow-lag-training-and-out-of-distribution-instability)
+   - 6.3 [Inference Temperature Calibration](#63-inference-temperature-calibration)
+   - 6.4 [Rollout Length Calibration for Conformational Exploration](#64-rollout-length-calibration-for-conformational-exploration)
+   - 6.5 [KRAS Fine-Tune: Choice of Base Checkpoint](#65-kras-fine-tune-choice-of-base-checkpoint)
+   - 6.6 [GPU Backend: CUDA vs OpenCL on AArch64](#66-gpu-backend-cuda-vs-opencl-on-aarch64)
+7. [Software and Open-Source Contributions](#7-software-and-open-source-contributions)
+8. [Challenges and Solutions](#8-challenges-and-solutions)
+9. [Future Work](#9-future-work)
+10. [Personnel and Training](#10-personnel-and-training)
+11. [References](#11-references)
 
 ---
 
@@ -255,7 +262,100 @@ At τ=2000 ps and DDIM-20, each rollout step generates 2 ns of simulated time. G
 
 ---
 
-## 6. Software and Open-Source Contributions
+## 6. Approaches Explored and Lessons Learned
+
+This section documents alternative methods tested systematically during the project — approaches that were abandoned or superseded. These explorations shaped our understanding of what works and led directly to the current architecture.
+
+### 6.1 Physics-Informed Geometric Penalty Losses
+
+**Motivation.** DDPM training in SE(3) update space does not explicitly enforce Cα–Cα bond geometry. We hypothesized that adding a soft C1 bond-length penalty loss (λ > 0) alongside the denoising objective would improve structural validity of generated conformations.
+
+Four variants were tested systematically during the v3 architecture exploration phase:
+
+| Variant | λ | Steps | RMSF corr | Dist JS | Clashes/frame | Bond length |
+|---|---|---|---|---|---|---|
+| v3_lam03 | 0.3 | 20k | 0.333 | 0.291 | **14** | — |
+| v3_phase3 | 0.1 | 20k | — | — | high | **4.54 Å** |
+| v3_lam01_10k | 0.1 | 10k | — | — | 34–40 | — |
+| **v3_lam0** | **0.0** | **20k** | **0.431** | **0.009** | **0.08–1.9** | **3.83 Å** |
+
+**Finding.** All λ > 0 variants performed worse than pure DDPM on every metric. The root cause is a fundamental conflict: the penalty loss pushes bond lengths toward the ideal 3.8 Å during training, but SHAKE bond constraints applied at inference fix bonds at whatever the SE(3) frame update implies — typically 4.5 Å for the penalized models. The penalty and the constraint encode competing objectives, and the constraint wins at inference time.
+
+**Lesson.** For SE(3) frame-space DDPM, physics-based loss augmentation should target quantities not subsequently constrained at inference. Bond geometry is better enforced by `HBonds` constraints in OpenMM than by training loss.
+
+---
+
+### 6.2 Narrow Lag Training and Out-of-Distribution Instability
+
+**Motivation.** The initial v3 training used lag times τ = 2000, 5000, 10000 ps to focus the model on slow, biologically relevant motions. This was a natural choice given the ATLAS trajectory frame spacing of 100 ps.
+
+**Problem.** At inference with τ = 2000 ps, the model encountered slight distributional differences from the training set — different protein lengths, different conformational basins — and produced NaN values mid-rollout. Having been trained only on three lag values with a lower bound of 2000 ps, the model had no capacity for graceful degradation when conditions deviated from training.
+
+**Fix.** Extending the training lag range to 100–50,000 ps (9 values spanning 2.5 orders of magnitude) in v4_longlags eliminated all NaN rollouts. Mean RMSF correlation improved from 0.431 → 0.575 as a direct consequence of this single change.
+
+**Lesson.** Diffusion propagators for time-series rollout must cover the full inference lag range during training, with margin on both ends. A factor of 500× lag range proved necessary for stable out-of-distribution rollout.
+
+---
+
+### 6.3 Inference Temperature Calibration
+
+**Motivation.** The model conditions on simulation temperature T. At training time multiple temperatures are used; at inference a single temperature is chosen per rollout. The optimal inference temperature was unknown a priori, so we swept T = 300, 375, 450 K for all six benchmark proteins.
+
+| Temperature | Behavior | Best for |
+|---|---|---|
+| 300 K | Conservative sampling; RMSF underestimated for flexible proteins | Slow-dynamics proteins (1b2s_F, 1z0b_A) |
+| 375 K | Optimal balance; broad conformational coverage | 4 of 6 benchmark proteins |
+| 450 K | Structural degradation; rmsf_corr drops 0.20–0.27 for large proteins | Not recommended |
+
+**Finding.** At 450 K, large proteins (1z0b_A, 6ovk_R) showed severe degradation: the model interprets 450 K as an instruction to sample very large displacements, effectively over-exciting the dynamics beyond the physical regime. At 300 K, small flexible proteins are undersampled. 375 K is the practical default for most proteins.
+
+**Lesson.** Inference temperature is a critical hyperparameter that must be protein-specific. A single universal temperature does not exist; a brief three-point sweep at 300/375/450 K adds minimal compute cost and reliably identifies the optimal setting.
+
+---
+
+### 6.4 Rollout Length Calibration for Conformational Exploration
+
+**Motivation.** The CV-guided exploration accumulates structural diversity by stepping n_steps × τ of simulated time per accepted conformation. The optimal step count was not known in advance.
+
+Three values were tested for KRAS (169 residues, τ = 2000 ps):
+
+| n_steps | Simulated time/attempt | RMSD from native | Outcome |
+|---|---|---|---|
+| 200 | 400 ns | 8–15 Å | Partially unfolded; switch loops displaced beyond physical relevance |
+| **50** | **100 ns** | **2–7 Å** | **Biologically relevant switch I/II rearrangements captured** |
+| 20 | 40 ns | 1–3 Å | Conservative; minimal deviation from native |
+
+**Finding.** n_steps = 200 moves the protein too far from the folded basin — RMSD > 8 Å corresponds to global domain motions and partial unfolding rather than the switch loop rearrangements relevant to drug discovery. n_steps = 20 is too conservative and barely samples beyond local fluctuations. n_steps = 50 (100 ns per attempt at τ = 2000 ps) captures biologically relevant conformational changes in the 2–7 Å RMSD range.
+
+**Lesson.** Rollout length is the primary dial controlling the scale of conformational change. For a 169-residue signaling protein at τ = 2000 ps, 50 steps (100 ns) per exploration attempt is the practical sweet spot.
+
+---
+
+### 6.5 KRAS Fine-Tune: Choice of Base Checkpoint
+
+**Motivation.** Two candidate base checkpoints were available for KRAS fine-tuning: (1) `v4_longlags`, trained on 6 ATLAS proteins with lags 100–50,000 ps; and (2) `v2_256h_90k`, the universal pretrained model on 2,938 proteins.
+
+**Rationale for v2_256h_90k.** The KRAS trajectory covers 1 μs at dt = 200 ps, with lag times τ = 2000, 5000, 10000 ps — squarely within the universal pretraining distribution. Fine-tuning from `v4_longlags` risked carrying over ATLAS-protein-specific inductive biases that might conflict with KRAS dynamics. Fine-tuning from `v2_256h_90k` at LR = 1e-4 (10× lower than pretraining) lets the KRAS trajectory dominate the weight update while preserving the universal dynamics grammar from pretraining, and avoids catastrophic forgetting.
+
+**Outcome.** The resulting `kras_ft` checkpoint achieved dist_js = 7.5×10⁻⁵ and zero steric clashes with only 5,000 fine-tuning steps, confirming that direct fine-tuning from the universal checkpoint is the more principled path when the target protein's lag distribution differs from the intermediate fine-tune.
+
+---
+
+### 6.6 GPU Backend: CUDA vs OpenCL on AArch64
+
+**Motivation.** The development hardware is an NVIDIA Grace Blackwell GB10 (AArch64 / ARM64 architecture). CUDA is the natural OpenMM backend for NVIDIA GPUs and typically delivers 3–4× better throughput than OpenCL.
+
+**Attempted.** Installation of CUDA-enabled OpenMM on AArch64 via conda-forge.
+
+**Finding.** As of mid-2026, conda-forge does not provide a CUDA-enabled OpenMM build for AArch64. The CUDA libraries are available on the system, but the pre-compiled OpenMM CUDA plugin targets x86-64 only. The only available backend on AArch64 is OpenCL, which runs on the GPU but at reduced throughput.
+
+**Alternative investigated.** Building OpenMM from source with CUDA support on AArch64. This is technically feasible but requires careful version matching of the CUDA toolkit, CMake flags, and Python bindings — a multi-hour build with non-trivial failure modes. For production runs, x86-64 cluster nodes with full CUDA support remain the path of least resistance.
+
+**Lesson.** AArch64 workstations are suitable for development and small-scale testing via OpenCL. For production hybrid-pipeline runs at scale, x86-64 HPC clusters (A100, H100, V100) with native CUDA OpenMM deliver the expected 10,000–20,000× MD acceleration.
+
+---
+
+## 7. Software and Open-Source Contributions
 
 All code, pretrained checkpoints, and documentation developed under this award are publicly available at **https://github.com/qshao/DL-MD**. The repository includes:
 
@@ -267,7 +367,7 @@ All code, pretrained checkpoints, and documentation developed under this award a
 
 ---
 
-## 7. Challenges and Solutions
+## 8. Challenges and Solutions
 
 | Challenge | Root Cause | Solution | Outcome |
 |---|---|---|---|
@@ -280,7 +380,7 @@ All code, pretrained checkpoints, and documentation developed under this award a
 
 ---
 
-## 8. Future Work
+## 9. Future Work
 
 1. **Complete KRAS hybrid pipeline.** Run `fes` and `kinetics` objectives on the KRAS exploration ensemble. The `fes` objective (25 ns × 300 structures) will produce the first data-driven free energy surface for KRAS-WT at physiological temperature. The `kinetics` objective (50 ns × 500 structures + PyEMMA MSM) will estimate implied timescales for switch I/II interconversion.
 
@@ -296,7 +396,7 @@ All code, pretrained checkpoints, and documentation developed under this award a
 
 ---
 
-## 9. Personnel and Training
+## 10. Personnel and Training
 
 The project directly supported the following personnel during the reporting period:
 
@@ -308,7 +408,7 @@ Both personnel participated in weekly group meetings, presented results at one n
 
 ---
 
-## 10. References
+## 11. References
 
 [1] Ho, J., Jain, A., & Abbeel, P. (2020). Denoising diffusion probabilistic models. *Advances in Neural Information Processing Systems*, 33, 6840–6851.
 
