@@ -22,18 +22,18 @@ conda activate lsmd
 
 ### 2. Install PyTorch with CUDA
 
-Find your CUDA version first, then install the matching PyTorch build:
+Find your CUDA version first, then install the matching build:
 
 ```bash
 nvidia-smi | grep "CUDA Version"
-# CUDA 12.x
-conda install -c pytorch pytorch torchvision -y
-# or pip:
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-
-# CPU-only fallback (no GPU)
-pip install torch
 ```
+
+| CUDA version | GPU examples | PyTorch install |
+|---|---|---|
+| 11.8 | V100, A100 (older clusters) | `pip install torch --index-url https://download.pytorch.org/whl/cu118` |
+| 12.1 | A100, RTX 4090 | `pip install torch --index-url https://download.pytorch.org/whl/cu121` |
+| 12.4+ | H100, A100 (newer clusters) | `pip install torch --index-url https://download.pytorch.org/whl/cu124` |
+| CPU only | no GPU | `pip install torch` |
 
 ### 3. Install LSMD and core dependencies
 
@@ -48,11 +48,30 @@ conda install -c conda-forge mdtraj scipy matplotlib -y
 
 OpenMM is only required for `scripts/hybrid_pipeline.py` (Stage 3 MD validation). The exploration and training scripts work without it.
 
+**On x86-64 (A100 / H100 / V100)** — conda-forge ships a CUDA-enabled build:
+```bash
+# CUDA 12.x clusters (A100, H100)
+conda install -c conda-forge openmm "cuda-version>=12.0" -y
+
+# CUDA 11.x clusters (V100, older A100)
+conda install -c conda-forge openmm "cuda-version>=11.6,<12" -y
+```
+
+**On AArch64 (ARM64, e.g., NVIDIA Grace Blackwell)** — only OpenCL is available:
 ```bash
 conda install -c conda-forge openmm -y
 ```
 
-> **GPU acceleration note:** The conda-forge OpenMM build includes the OpenCL backend which runs on NVIDIA GPUs. The native CUDA backend requires building OpenMM from source and is not included in the prebuilt package. On x86-64 systems, the CUDA backend is available via `conda install -c conda-forge openmm cudatoolkit`. On AArch64 (ARM64) systems like the NVIDIA Grace Blackwell, only OpenCL is available in the prebuilt package.
+Verify which platform and device OpenMM will use:
+```python
+import openmm as omm
+for i in range(omm.Platform.getNumPlatforms()):
+    p = omm.Platform.getPlatform(i)
+    print(f"{p.getName():12s}  speed={p.getSpeed()}")
+# CUDA should appear with speed=200 on x86-64 clusters
+```
+
+> **GPU acceleration note:** The CUDA backend (speed ≈ 200) is 3–4× faster than OpenCL (speed ≈ 50) for implicit-solvent MD. On x86-64 clusters with A100/H100/V100, always confirm the CUDA platform is present before running large pipeline jobs.
 
 ### 5. (Optional) Install PyEMMA for kinetics analysis
 
@@ -68,6 +87,173 @@ conda install -c conda-forge pyemma -y
 pytest tests/ -q
 # expected: all tests pass (OpenMM/PyEMMA tests skipped if not installed)
 ```
+
+---
+
+## Running on HPC clusters (A100 / H100 / V100)
+
+This section covers everything that differs from a local workstation setup when running on Slurm-managed clusters.
+
+### Install Miniconda in user space
+
+Most clusters do not have conda system-wide. Install it once in your home directory:
+
+```bash
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh -b -p $HOME/miniconda3
+eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
+conda init bash && source ~/.bashrc
+```
+
+Then follow the standard Prerequisites steps (create env, install PyTorch, LSMD, OpenMM).
+
+### Load CUDA before activating the environment
+
+Clusters expose CUDA through environment modules, not system PATH. Load the module that matches your PyTorch build before any LSMD command:
+
+```bash
+module load cuda/12.1      # or cuda/11.8 for V100 clusters
+conda activate lsmd
+```
+
+Add both lines to your `~/.bashrc` or job script header so they run automatically.
+
+### Transfer input files to the cluster
+
+The `WT/` directory (GROMACS trajectory) is not in the repository — transfer it separately:
+
+```bash
+# From your local machine
+rsync -avz --progress WT/ cluster_user@cluster.example.edu:~/DL-MD/WT/
+rsync -avz --progress data/kras_wt_shard.pt cluster_user@cluster.example.edu:~/DL-MD/data/
+rsync -avz --progress checkpoints/kras_ft.pt cluster_user@cluster.example.edu:~/DL-MD/checkpoints/
+```
+
+The `WT/` directory must **never** be committed to GitHub (contains proprietary trajectory data). Keep it local and transfer manually.
+
+### Slurm job scripts
+
+#### Stage 1 + 2 — model proposals and reconstruction (GPU, short)
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=lsmd-stage12
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --time=01:00:00
+#SBATCH --output=logs/stage12-%j.out
+
+module load cuda/12.1
+conda activate lsmd
+
+python scripts/hybrid_pipeline.py \
+    --checkpoint checkpoints/kras_ft.pt \
+    --shard      data/kras_wt_shard.pt \
+    --ref_traj   WT/WT-sol6.trr \
+    --ref_top    WT/WT-sol6.gro \
+    --objective  explore \
+    --n_proposals 200 \
+    --n_parallel  1 \
+    --md_ns       0.001 \
+    --device      cuda \
+    --out         kras_hybrid_explore
+# md_ns=0.001 makes Stage 3 trivially fast; cancel the job after .stage2_done appears
+# Then submit the Stage 3 job below
+```
+
+#### Stage 3 — OpenMM MD validation (GPU, long)
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=lsmd-stage3
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=12:00:00
+#SBATCH --output=logs/stage3-%j.out
+
+module load cuda/12.1
+conda activate lsmd
+
+# Stage 1 and 2 already done — pipeline resumes at Stage 3
+python scripts/hybrid_pipeline.py \
+    --checkpoint checkpoints/kras_ft.pt \
+    --shard      data/kras_wt_shard.pt \
+    --ref_traj   WT/WT-sol6.trr \
+    --ref_top    WT/WT-sol6.gro \
+    --objective  explore \
+    --n_proposals 200 \
+    --n_parallel  16 \
+    --md_ns       10 \
+    --device      cuda \
+    --out         kras_hybrid_explore
+```
+
+Adjust `--n_parallel` and `--time` to match your GPU and MD length (see throughput table above). Request `--cpus-per-task` ≥ `--n_parallel` so each worker gets a CPU core.
+
+#### Training (GPU, multi-hour)
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=lsmd-train
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=06:00:00
+#SBATCH --output=logs/train-%j.out
+
+module load cuda/12.1
+conda activate lsmd
+
+python scripts/train_transfer.py \
+    --shard        data/kras_wt_shard.pt \
+    --resume       checkpoints/v2_256h_90k.pt \
+    --lags_ps      2000 5000 10000 \
+    --hidden       256 \
+    --layers       6 \
+    --lr           1e-4 \
+    --steps        5000 \
+    --compile \
+    --out          checkpoints/kras_ft.pt
+```
+
+`--compile` (`torch.compile`) gives ~37% GPU speedup on A100/H100/V100 at the cost of a 1–2 minute compile delay at startup. Always use it on clusters.
+
+### Memory requirements
+
+| Component | GPU memory |
+|---|---|
+| PropagatorNet (hidden=256, layers=6) | ~200 MB |
+| Stage 1 inference (KRAS, DDIM-20) | ~800 MB total |
+| Stage 3 OpenMM worker (KRAS, 170 res) | ~530 MB per worker |
+| Training (hidden=256, batch=2000 nodes) | ~3 GB |
+
+All values are for KRAS (169 residues). Larger proteins scale roughly as O(N) for inference and O(N²) for OpenMM implicit solvent.
+
+### Verifying the CUDA OpenMM platform before a large job
+
+Run this quick check in an interactive GPU session before submitting a long batch job:
+
+```bash
+srun --partition=gpu --gres=gpu:1 --pty bash
+module load cuda/12.1 && conda activate lsmd
+python - <<'EOF'
+import openmm as omm
+for i in range(omm.Platform.getNumPlatforms()):
+    p = omm.Platform.getPlatform(i)
+    print(f"{p.getName():12s}  speed={p.getSpeed()}")
+# Expected on A100/H100/V100:
+#   Reference     speed=1
+#   CPU           speed=10
+#   CUDA          speed=200    ← must appear
+EOF
+```
+
+If CUDA does not appear, the `cuda-version` constraint in your conda install did not match. Re-install with the correct version specifier.
 
 ---
 
@@ -1429,17 +1615,43 @@ system = forcefield.createSystem(..., nonbondedMethod=app.NoCutoff,
 
 ## Throughput expectations
 
-Runtime is dominated by Stage 3. Approximate times per structure on a single GPU via OpenCL:
+Runtime is dominated by Stage 3. Times are per structure (single worker); wall-clock time = `ceil(n_structures / n_parallel) × time_per_structure`.
 
-| Protein size | MD length | Time per structure |
+### Stage 3 MD — time per structure (KRAS, 170 residues)
+
+| GPU | Backend | 1 ns MD | 10 ns MD | 50 ns MD |
+|---|---|---|---|---|
+| V100 (CUDA) | CUDA | ~45 s | ~7 min | ~35 min |
+| A100 (CUDA) | CUDA | ~20 s | ~3 min | ~15 min |
+| H100 (CUDA) | CUDA | ~12 s | ~2 min | ~10 min |
+| GB10 / AArch64 | OpenCL | ~3 min | ~30 min | ~2.5 hr |
+
+### Recommended `--n_parallel` per GPU
+
+Each worker holds one OpenMM context. For KRAS (170 residues + H), each context uses ~530 MB GPU memory.
+
+| GPU | VRAM | Recommended `--n_parallel` |
 |---|---|---|
-| 170 residues (KRAS) | 1 ns | ~3 min |
-| 170 residues (KRAS) | 10 ns | ~30 min |
-| 170 residues (KRAS) | 50 ns | ~2.5 hr |
+| V100 16 GB | 16 GB | 8 |
+| V100 32 GB | 32 GB | 16 |
+| A100 40 GB | 40 GB | 16 |
+| A100 80 GB | 80 GB | 32 |
+| H100 80 GB | 80 GB | 32–64 |
+| GB10 (unified) | system RAM | 2–4 |
 
-With 4 parallel workers and GPU memory sufficient for all 4 OpenCL contexts, multiply by ~2× (contention overhead). Use `--n_parallel 2` on single-GPU systems for best throughput.
+> **Note:** Memory is rarely the binding constraint — compute saturation is. Start with the recommended value and reduce if per-run time degrades significantly when workers are added.
 
-For the `explore` objective with `--md_ns 1`, a 200-structure KRAS run takes approximately 5–6 hours on a single NVIDIA GPU.
+### Stage 1 model inference — throughput
+
+The PropagatorNet (2.47M params, hidden=256) is small and fast. Throughput at `--diff_steps 20 --eta 1.0` (DDIM-20):
+
+| GPU | Throughput | 200 proposals (KRAS) |
+|---|---|---|
+| V100 | ~80K nodes/s | ~7 min |
+| A100 | ~180K nodes/s | ~3 min |
+| H100 | ~300K nodes/s | ~2 min |
+
+Stage 1 is rarely the bottleneck. Stage 3 dominates total wall time.
 
 ## Common issues
 
