@@ -6,7 +6,7 @@
 | **Principal Investigator** | [PI NAME], [Institution] |
 | **Reporting Period** | June 2025 – June 2026 |
 | **Report Date** | June 28, 2026 |
-| **Program** | Computational and Data-Enabled Science and Engineering (CDS&E) |
+| **Program** | Accelerating Computing-Enabled Discovery (ACED) |
 
 ---
 
