@@ -1,7 +1,5 @@
 import json
-import os
 import pytest
-from pathlib import Path
 from lsmd.md_validation import run_md
 
 

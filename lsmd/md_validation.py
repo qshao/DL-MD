@@ -2,8 +2,6 @@
 import json
 import os
 
-import numpy as np
-
 try:
     import openmm as omm
     import openmm.app as app
@@ -86,11 +84,13 @@ def run_md(pdb_path, out_dir, md_ns, temp_K=310.0, n_steps_min=1000):
                 fh,
             )
 
-        # Reporters
-        simulation.reporters.append(app.DCDReporter(traj_path, 5000))
+        # Reporters: adaptive interval to ensure at least 100 frames
+        n_steps = int(md_ns * 1e6 / 2)
+        report_interval = max(1, n_steps // 100)
+        simulation.reporters.append(app.DCDReporter(traj_path, report_interval))
 
         # Run MD: ns → steps at 2 fs/step
-        simulation.step(int(md_ns * 1e6 / 2))
+        simulation.step(n_steps)
 
         # Final potential energy
         state_f = simulation.context.getState(getPositions=True, getEnergy=True)
