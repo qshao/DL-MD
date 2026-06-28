@@ -191,7 +191,6 @@ def _load_all_ca_frames(md_runs_dir, n_frames_per_run=None):
         frame_list.append(ca_A)
 
     if not frame_list:
-        import torch
         return torch.zeros(0), 0
     all_frames = torch.cat(frame_list, dim=0)   # [T, N, 3]
     return all_frames, all_frames.shape[0]
@@ -230,7 +229,7 @@ def analyze_fes(md_runs_dir, cv_basis_path, out_dir,
 
     if n_frames == 0:
         print("fes: no stable frames found")
-        summary = {"n_frames_stable": 0, "fes_min_kcal": None, "fes_max_kcal": None,
+        summary = {"n_frames_total": 0, "n_frames_stable": 0, "fes_min_kcal": None, "fes_max_kcal": None,
                    "temp_K": temp_K, "n_bins": n_bins}
         with open(os.path.join(out_dir, "fes_summary.json"), "w") as fh:
             json.dump(summary, fh, indent=2)
