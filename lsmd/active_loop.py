@@ -274,14 +274,22 @@ def shard_from_md_runs(md_run_dirs: list, dt_ps: float = 200.0):
             continue
 
         try:
-            # Get frame spacing from the DCD header via mdtraj
-            traj_info = md.load(traj_path, top=top_path)
-            dt_traj_ps = float(traj_info.timestep)   # ps per frame
+            traj = md.load(traj_path, top=top_path)
+            dt_traj_ps = float(traj.timestep)
             stride = max(1, round(dt_ps / dt_traj_ps))
+            traj_s = traj[::stride]
 
-            frames = data.load_frames(traj_path, top_path)
-            R_run = frames["R"][::stride]   # [F_run, N, 3, 3]
-            t_run = frames["t"][::stride]   # [F_run, N, 3]
+            top_obj = traj_s.topology
+            n_idx  = top_obj.select("protein and name N")
+            ca_idx = top_obj.select("protein and name CA")
+            c_idx  = top_obj.select("protein and name C")
+
+            xyz    = torch.tensor(traj_s.xyz, dtype=torch.float32) * 10.0  # nm → Å
+            N_pos  = xyz[:, n_idx,  :]
+            CA_pos = xyz[:, ca_idx, :]
+            C_pos  = xyz[:, c_idx,  :]
+
+            R_run, t_run = g.build_frames(N_pos, CA_pos, C_pos)
             all_R.append(R_run)
             all_t.append(t_run)
         except Exception as exc:
@@ -343,6 +351,11 @@ def build_replay_shard(new_R: torch.Tensor, new_t: torch.Tensor,
     else:
         combined_R = new_R
         combined_t = new_t
+
+    if len(combined_t) > replay_cap:
+        idx = torch.randperm(len(combined_t))[:replay_cap]
+        combined_R = combined_R[idx]
+        combined_t = combined_t[idx]
 
     return {
         **protein_meta,
