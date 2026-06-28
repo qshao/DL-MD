@@ -11,6 +11,7 @@ python scripts/hybrid_pipeline.py \
     --device cuda --out kras_hybrid_explore
 """
 import argparse
+import glob
 import json
 import os
 import subprocess
@@ -62,16 +63,32 @@ def run_proposals(args):
     if os.path.exists(done):
         print("[Stage 1] Already done — skipping.")
         return
-    summary_path = os.path.join(args.out, "proposals", "summary.json")
-    if os.path.exists(summary_path):
-        with open(summary_path) as f:
-            n = len(json.load(f))
-        if n >= args.n_proposals:
-            Path(done).touch()
-            print(f"[Stage 1] Found {n} existing proposals — skipping.")
-            return
+    proposals_dir = os.path.join(args.out, "proposals")
+    # Fix 3: compare against accepted candidate PDB files, not summary.json entry
+    # count (summary only holds accepted structures, so accepted < n_proposals always,
+    # causing the old n >= n_proposals check to never pass).
+    candidates_dir = os.path.join(proposals_dir, "candidates")
+    n_candidates = len(glob.glob(os.path.join(candidates_dir, "*.pdb")))
+    if n_candidates > 0:
+        Path(done).touch()
+        print(f"[Stage 1] Found {n_candidates} existing candidates, skipping.")
+        return
     _run_proposals_subprocess(args)
     Path(done).touch()
+    # Fix 1: for fes objective, build cv_basis.pt if absent so Stage 4 can project frames.
+    # explore_conformations.py (sample mode) never writes this file, so we build it here
+    # from the shard immediately after Stage 1 completes.
+    if args.objective == "fes":
+        cv_basis_path = os.path.join(proposals_dir, "cv_basis.pt")
+        if not os.path.exists(cv_basis_path):
+            import torch
+            from lsmd.cv_guidance import CVSpace
+            shard = torch.load(args.shard, map_location="cpu", weights_only=False)
+            ref_ca = shard["t"]  # [F, N, 3]
+            cv = CVSpace(n_pc=5)
+            cv.fit(ref_ca)
+            torch.save(cv, cv_basis_path)
+            print(f"[Stage 1] Built cv_basis.pt from shard ({ref_ca.shape[0]} frames)")
 
 
 def run_reconstruction(args):

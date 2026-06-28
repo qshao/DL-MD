@@ -29,10 +29,15 @@ def run_md(pdb_path, out_dir, md_ns, temp_K=310.0, n_steps_min=1000):
     os.makedirs(out_dir, exist_ok=True)
     metrics_path = os.path.join(out_dir, "metrics.json")
 
-    # Checkpoint: return cached result if already computed (no OpenMM needed)
+    # Checkpoint: return cached result only when the previous run succeeded.
+    # A cached error (GPU OOM, bad PDB, etc.) should NOT be treated as permanent —
+    # fall through and re-run so transient failures can be recovered.
     if os.path.exists(metrics_path):
         with open(metrics_path) as fh:
-            return json.load(fh)
+            cached = json.load(fh)
+        if cached.get("error") is None:
+            return cached  # only skip on successful previous run
+        # else fall through and re-run
 
     if not HAS_OPENMM:
         raise ImportError(
