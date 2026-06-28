@@ -165,6 +165,18 @@ def run_md(pdb_path, out_dir, md_ns, temp_K=310.0, n_steps_min=5000):
             simulation.context, maxIterations=n_steps_min
         )
 
+        # A: PE gate — reject structures that are still severely clashed after
+        # minimisation. Per-atom PE > 0 kJ/mol means repulsive clash energy
+        # dominates; production MD at 310 K will blow up within picoseconds.
+        state_min = simulation.context.getState(getEnergy=True)
+        pe_min    = state_min.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+        n_atoms   = system.getNumParticles()
+        if pe_min / n_atoms > 0.0:
+            raise ValueError(
+                f"post-minimisation PE/atom = {pe_min/n_atoms:.1f} kJ/mol "
+                f"(total {pe_min:.0f} kJ/mol) — structure still clashed, skipping"
+            )
+
         # Save minimised structure as topology reference for later mdtraj loading
         with open(top_path, "w") as fh:
             app.PDBFile.writeFile(
@@ -173,12 +185,19 @@ def run_md(pdb_path, out_dir, md_ns, temp_K=310.0, n_steps_min=5000):
                 fh,
             )
 
+        # B: Warm-up — 100 ps at 50 K before production to gently relax any
+        # residual clash geometry the minimiser couldn't fully resolve.
+        warmup_steps = int(0.1e6 / 2)   # 100 ps at 2 fs/step
+        simulation.context.setVelocitiesToTemperature(50.0 * unit.kelvin)
+        simulation.step(warmup_steps)
+        integrator.setTemperature(temp_K * unit.kelvin)
+
         # Reporters: adaptive interval to ensure at least 100 frames
         n_steps = int(md_ns * 1e6 / 2)
         report_interval = max(1, n_steps // 100)
         simulation.reporters.append(app.DCDReporter(traj_path, report_interval))
 
-        # Run MD: ns → steps at 2 fs/step
+        # Production MD
         simulation.step(n_steps)
 
         # Final potential energy
