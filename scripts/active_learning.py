@@ -29,6 +29,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import mdtraj as md
+import numpy as np
 import torch
 
 from lsmd.active_loop import (
@@ -95,7 +97,7 @@ def _filter_novel(proposals: list, accumulated_t: torch.Tensor,
 def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
               shard_1f: dict, accumulated_pt: str, prev_total_md_ns: float,
               prev_novel_fraction: float, prev_accumulated_t,
-              loop_summary: list):
+              prev_hist=None):
     """Execute one active learning round; return updated state or None if converged."""
     round_dir  = os.path.join(args.out, f"round_{round_num}")
     done_stamp = os.path.join(round_dir, ".done")
@@ -180,7 +182,6 @@ def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
     allatom_pdbs = []
     for j, ca_struct in enumerate(selected_ca):
         xyz = rec.reconstruct_frame_ca(ca_struct)   # numpy [N_heavy, 3]
-        import mdtraj as md
         traj_tmp = md.load(args.pdb)
         top_tmp  = traj_tmp.topology
         ha_idx   = top_tmp.select("protein and not type H")
@@ -203,11 +204,14 @@ def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
     with ThreadPoolExecutor(max_workers=args.n_parallel) as pool:
         md_run_dirs = list(pool.map(_run_one, enumerate(allatom_pdbs)))
 
-    n_md_success = sum(
-        1 for d in md_run_dirs
-        if os.path.exists(os.path.join(d, "metrics.json")) and
-           json.load(open(os.path.join(d, "metrics.json"))).get("error") is None
-    )
+    n_md_success = 0
+    for d in md_run_dirs:
+        mpath = os.path.join(d, "metrics.json")
+        if os.path.exists(mpath):
+            with open(mpath) as _f:
+                _err = json.load(_f).get("error")
+            if _err is None:
+                n_md_success += 1
     print(f"[round {round_num}] MD success: {n_md_success}/{batch_size}", flush=True)
 
     # ── 8. Extract frames and build replay shard ───────────────────────────
@@ -257,11 +261,22 @@ def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
     state = {
         "total_md_ns":         total_md_ns,
         "last_novel_fraction": novel_fraction,
-        "accumulated_t":       acc_now,
+        "accumulated_frames":  acc_now,
         "prev_accumulated_t":  prev_accumulated_t,
         "round":               round_num,
+        "cv_basis":            cv_space,
+        "prev_hist":           prev_hist,
     }
     converged, metric = check_convergence(args.stop, args.stop_threshold, state)
+
+    # Compute histogram for next round (FES criterion only)
+    if args.stop == "fes":
+        proj = cv_space.project_batch(acc_now.float())
+        pc1 = proj[:, 0].detach().cpu().numpy()
+        pc2 = proj[:, 1].detach().cpu().numpy()
+        new_prev_hist = np.histogram2d(pc1, pc2, bins=50)[0]
+    else:
+        new_prev_hist = None
 
     # Determine metric label
     fes_js = metric if args.stop == "fes" else float("nan")
@@ -275,11 +290,12 @@ def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
     Path(done_stamp).touch()
 
     return {
-        "next_ckpt":          next_ckpt,
-        "total_md_ns":        total_md_ns,
-        "novel_fraction":     novel_fraction,
-        "accumulated_t":      acc_now,
-        "converged":          converged,
+        "next_ckpt":      next_ckpt,
+        "total_md_ns":    total_md_ns,
+        "novel_fraction": novel_fraction,
+        "accumulated_t":  acc_now,
+        "converged":      converged,
+        "prev_hist":      new_prev_hist,
     }
 
 
@@ -406,6 +422,9 @@ def main():
     else:
         prev_t = None
 
+    # Previous FES histogram (for fes stopping criterion)
+    prev_hist = None
+
     # ── Round loop ────────────────────────────────────────────────────────────
     for round_num in range(args.rounds):
         if round_num in completed:
@@ -432,7 +451,7 @@ def main():
             prev_total_md_ns=total_md_ns,
             prev_novel_fraction=novel_fraction,
             prev_accumulated_t=prev_t,
-            loop_summary=loop_summary,
+            prev_hist=prev_hist,
         )
 
         if result is None:
@@ -443,6 +462,7 @@ def main():
         novel_fraction = result["novel_fraction"]
         prev_t         = result["accumulated_t"]
         current_ckpt   = result["next_ckpt"]
+        prev_hist      = result["prev_hist"]
 
         if result["converged"]:
             print(f"[active_learning] stopping criterion '{args.stop}' met at round {round_num}.",

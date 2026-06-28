@@ -304,7 +304,7 @@ def test_active_learning_help():
     """scripts/active_learning.py --help must exit 0."""
     result = subprocess.run(
         [sys.executable, "scripts/active_learning.py", "--help"],
-        capture_output=True, cwd="/home/qshao/DL-MD"
+        capture_output=True, cwd=str(Path(__file__).resolve().parent.parent)
     )
     assert result.returncode == 0
     assert b"--pdb" in result.stdout
@@ -332,3 +332,73 @@ def test_active_learning_resume_skips_done(tmp_path, monkeypatch):
     completed = _load_completed_rounds(str(tmp_path))
     assert 0 in completed
     assert completed[0]["total_md_ns"] == 40.0
+
+
+def test_active_loop_early_termination(tmp_path):
+    """Loop terminates (returns None) when no proposals are novel."""
+    from unittest.mock import patch, MagicMock
+    from scripts.active_learning import run_round
+
+    N = 5
+    pdb_path = str(tmp_path / "input.pdb")
+    _write_tiny_pdb(pdb_path, n_res=N)
+
+    # accumulated_pt deliberately absent so run_round falls back to shard_1f["t"]
+    accumulated_pt = str(tmp_path / "accumulated_frames.pt")
+
+    shard_1f = {
+        "R":        torch.eye(3).unsqueeze(0).unsqueeze(0).expand(1, N, -1, -1).clone(),
+        "t":        torch.randn(1, N, 3),
+        "res_type": torch.zeros(N, dtype=torch.long),
+        "chain_id": torch.zeros(N, dtype=torch.long),
+        "res_index": torch.arange(N),
+        "n_res":    N,
+        "dt":       200.0,
+        "seq":      ["ALA"] * N,
+    }
+    protein_meta = {k: shard_1f[k]
+                    for k in ("res_type", "chain_id", "res_index", "seq", "n_res")}
+
+    class FakeArgs:
+        out            = str(tmp_path)
+        pdb            = pdb_path
+        proposals      = 3
+        batch_size     = 2
+        md_ns          = 1.0
+        novel_threshold = 1.5
+        device         = "cpu"
+        stop           = "coverage"
+        stop_threshold = 0.1
+        n_parallel     = 1
+        replay_cap     = 100
+        fine_tune_steps = 10
+        bootstrap_ns   = 1.0
+        rounds         = 1
+
+    args = FakeArgs()
+
+    # rollout returns a 1-element list; traj[-1] is a [N,3] Ca tensor
+    fake_traj = [torch.randn(N, 3)]
+
+    with patch("torch.load", return_value={"state_dict": {}}), \
+         patch("scripts.active_learning.load_checkpoint",
+               return_value=(MagicMock(), MagicMock(), MagicMock())), \
+         patch("scripts.active_learning.rollout", return_value=fake_traj), \
+         patch("scripts.active_learning._min_rmsd_kabsch", return_value=0.0), \
+         patch("scripts.active_learning.write_ca_pdb"):
+
+        result = run_round(
+            round_num=0,
+            args=args,
+            current_ckpt="fake_checkpoint.pt",
+            protein_meta=protein_meta,
+            shard_1f=shard_1f,
+            accumulated_pt=accumulated_pt,
+            prev_total_md_ns=0.0,
+            prev_novel_fraction=1.0,
+            prev_accumulated_t=None,
+            prev_hist=None,
+        )
+
+    # All proposals have RMSD 0.0 < novel_threshold 1.5 → no novel → early exit
+    assert result is None, "Expected early termination (None) when no novel proposals"
