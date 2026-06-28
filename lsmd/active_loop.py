@@ -228,12 +228,18 @@ def bootstrap_check(pdb_path: str, checkpoint: str, device: str,
     traj_path = os.path.join(out_dir, "trajectory.dcd")
     top_path  = os.path.join(out_dir, "topology.pdb")
     frames    = data.load_frames(traj_path, top_path)
-    # data.load_frames() returns res_names but not seq/n_res; add from PDB shard
+    # data.load_frames() returns res_type with a per-file local vocabulary.
+    # Override res_type, chain_id, and res_index with canonical values from
+    # _pdb_to_shard() (which uses lsmd.vocab.residue_indices()) so the model
+    # always receives the same residue encoding regardless of bootstrap path.
     return {
         **frames,
-        "dt":    200.0,
-        "seq":   shard_1f["seq"],
-        "n_res": len(frames["res_type"]),
+        "dt":       200.0,
+        "seq":      shard_1f["seq"],
+        "n_res":    shard_1f["n_res"],
+        "res_type": shard_1f["res_type"],
+        "chain_id": shard_1f["chain_id"],
+        "res_index": shard_1f["res_index"],
     }
 
 
@@ -384,8 +390,9 @@ def check_convergence(criterion: str, threshold: float, state: dict):
                 round               (int)         — current round index (0-based)
                 accumulated_frames  (Tensor)      — [F, N, 3] Cα positions, all rounds
                 cv_basis            (CVSpace)     — fitted collective variable space
-                prev_hist           (np.ndarray | None) — [50, 50] 2-D histogram from
-                                    previous round, or None if not yet available
+                prev_hist           (np.ndarray | None) — [F_prev, 2] raw PC1/PC2
+                                    scores from the previous round, or None if not
+                                    yet available
 
     Returns:
         (converged: bool, metric: float)
@@ -412,8 +419,13 @@ def check_convergence(criterion: str, threshold: float, state: dict):
         )
 
 
-def _check_fes(state: dict, threshold: float):
+def _check_fes(state: dict, threshold: float) -> tuple:
     """JS divergence between current and previous FES histograms.
+
+    prev_hist is expected to be a raw [F_prev, 2] numpy array of PC1/PC2
+    scores from the previous round (NOT a pre-computed histogram).  Both
+    rounds are histogrammed with a unified range derived from the union of
+    their PC scores so that bin edges always align.
 
     Requires: round >= 2 AND accumulated_frames has >= 50 frames AND
     prev_hist is not None.  Returns (False, nan) whenever any condition
@@ -421,33 +433,48 @@ def _check_fes(state: dict, threshold: float):
     """
     rnd = state.get("round", 0)
     accumulated = state.get("accumulated_frames")
-    prev_hist = state.get("prev_hist")
-
-    if rnd < 2 or accumulated is None or len(accumulated) < 50 or prev_hist is None:
-        return False, float("nan")
-
+    prev_pc_scores = state.get("prev_hist")  # [F_prev, 2] numpy array or None
     cv_basis = state["cv_basis"]
 
-    # Project all accumulated Cα frames through the CV basis → [F, n_pc+2]
-    projections = cv_basis.project_batch(accumulated.float())  # [F, n_pc+2]
-    pc1 = projections[:, 0].detach().cpu().numpy()
-    pc2 = projections[:, 1].detach().cpu().numpy()
+    if rnd < 2 or accumulated is None or prev_pc_scores is None:
+        return False, float("nan")
+    if accumulated.shape[0] < 50:
+        return False, float("nan")
 
-    # Build 50×50 2D histogram over PC1, PC2
+    # Project current accumulated frames
+    scores_curr = cv_basis.project_batch(accumulated.float())  # [F, n_cv]
+    pc1_c = scores_curr[:, 0].detach().cpu().numpy()
+    pc2_c = scores_curr[:, 1].detach().cpu().numpy()
+    pc1_p = prev_pc_scores[:, 0]
+    pc2_p = prev_pc_scores[:, 1]
+
+    # Unified range across both rounds so histograms share bin edges
+    pc1_range = [float(min(pc1_c.min(), pc1_p.min())),
+                 float(max(pc1_c.max(), pc1_p.max()))]
+    pc2_range = [float(min(pc2_c.min(), pc2_p.min())),
+                 float(max(pc2_c.max(), pc2_p.max()))]
+    # Avoid zero-width ranges
+    if pc1_range[0] == pc1_range[1]:
+        pc1_range[1] += 1e-6
+    if pc2_range[0] == pc2_range[1]:
+        pc2_range[1] += 1e-6
+
     bins = 50
-    h_curr, _, _ = np.histogram2d(pc1, pc2, bins=bins)  # [50, 50]
+    h_curr, _, _ = np.histogram2d(pc1_c, pc2_c, bins=bins,
+                                  range=[pc1_range, pc2_range])
+    h_prev, _, _ = np.histogram2d(pc1_p, pc2_p, bins=bins,
+                                  range=[pc1_range, pc2_range])
 
-    # Normalise to probability distributions; add epsilon to avoid log(0)
-    eps = 1e-10
-    p = h_curr.flatten() + eps
-    p /= p.sum()
-    q = prev_hist.flatten().astype(np.float64) + eps
-    q /= q.sum()
+    h_curr = h_curr.astype(np.float64)
+    h_prev = h_prev.astype(np.float64)
+    h_curr /= h_curr.sum() + 1e-10
+    h_prev /= h_prev.sum() + 1e-10
 
     # Jensen-Shannon divergence: 0.5 * KL(P||M) + 0.5 * KL(Q||M), M = 0.5*(P+Q)
-    m = 0.5 * (p + q)
-    kl_pm = float(np.sum(p * np.log(p / m)))
-    kl_qm = float(np.sum(q * np.log(q / m)))
-    js = 0.5 * kl_pm + 0.5 * kl_qm
+    eps = 1e-10
+    M = 0.5 * (h_curr + h_prev)
+    kl_cm = float(np.sum(h_curr * np.log((h_curr + eps) / (M + eps))))
+    kl_pm = float(np.sum(h_prev * np.log((h_prev + eps) / (M + eps))))
+    js = 0.5 * kl_cm + 0.5 * kl_pm
 
-    return js < threshold, float(js)
+    return bool(js < threshold), float(js)

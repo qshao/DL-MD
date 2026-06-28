@@ -219,12 +219,22 @@ def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
     new_frames = len(new_t) if new_t.shape[0] > 0 else 0
 
     if new_frames > 0:
-        replay_shard = build_replay_shard(
-            new_R, new_t, accumulated_pt, protein_meta,
-            replay_cap=args.replay_cap, dt_ps=200.0
-        )
         replay_shard_path = os.path.join(round_dir, "replay_shard.pt")
-        torch.save(replay_shard, replay_shard_path)
+        frames_appended_stamp = Path(round_dir) / ".frames_appended"
+
+        if frames_appended_stamp.exists():
+            # Idempotency guard: accumulated_frames.pt was already updated on a
+            # prior attempt that crashed before .done; skip re-appending to avoid
+            # double-counting frames in the replay buffer and FES histograms.
+            replay_shard = torch.load(replay_shard_path,
+                                      map_location="cpu", weights_only=False)
+        else:
+            replay_shard = build_replay_shard(
+                new_R, new_t, accumulated_pt, protein_meta,
+                replay_cap=args.replay_cap, dt_ps=200.0
+            )
+            torch.save(replay_shard, replay_shard_path)
+            frames_appended_stamp.touch()
 
         # ── 9. Fine-tune model ────────────────────────────────────────────
         next_ckpt = os.path.join(round_dir, "checkpoint.pt")
@@ -269,14 +279,15 @@ def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
     }
     converged, metric = check_convergence(args.stop, args.stop_threshold, state)
 
-    # Compute histogram for next round (FES criterion only)
-    if args.stop == "fes":
-        proj = cv_space.project_batch(acc_now.float())
-        pc1 = proj[:, 0].detach().cpu().numpy()
-        pc2 = proj[:, 1].detach().cpu().numpy()
-        new_prev_hist = np.histogram2d(pc1, pc2, bins=50)[0]
-    else:
-        new_prev_hist = None
+    # Compute raw PC scores for next round.
+    # Stored as [F, 2] (not a histogram) so _check_fes can use a unified bin
+    # range across consecutive rounds, eliminating histogram misalignment.
+    # Always saved to disk so prev_hist can be restored on resume (Fix 2).
+    proj = cv_space.project_batch(acc_now.float())
+    pc1 = proj[:, 0].detach().cpu().numpy()
+    pc2 = proj[:, 1].detach().cpu().numpy()
+    new_prev_hist = np.stack([pc1, pc2], axis=1)  # [F, 2]
+    np.save(str(Path(round_dir) / "prev_hist.npy"), new_prev_hist)
 
     # Determine metric label
     fes_js = metric if args.stop == "fes" else float("nan")
@@ -422,8 +433,15 @@ def main():
     else:
         prev_t = None
 
-    # Previous FES histogram (for fes stopping criterion)
+    # Previous FES PC scores (for fes stopping criterion).
+    # On resume, reload from the last completed round so _check_fes is not
+    # broken by a cold-start prev_hist=None after rounds 0–N are done.
     prev_hist = None
+    if completed:
+        last = max(completed)
+        ph_path = Path(args.out) / f"round_{last}" / "prev_hist.npy"
+        if ph_path.exists():
+            prev_hist = np.load(str(ph_path))
 
     # ── Round loop ────────────────────────────────────────────────────────────
     for round_num in range(args.rounds):

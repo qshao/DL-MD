@@ -262,15 +262,21 @@ def test_convergence_fes_insufficient_data():
 
 
 def test_convergence_fes_hits():
-    """FES converges when JS divergence < threshold (identical histograms → JS ≈ 0)."""
+    """FES converges when JS divergence < threshold (identical PC scores → JS ≈ 0).
+
+    prev_hist is now a raw [F, 2] PC scores array (not a pre-computed 50×50
+    histogram).  _check_fes builds histograms with a unified range from both
+    the current and previous PC scores, so using the same frames for both
+    yields near-zero JS divergence.
+    """
     N = 10
     frames = torch.randn(80, N, 3)
     cv = CVSpace(n_pc=2)
     cv.fit(frames)
 
-    # Build the histogram from these frames to use as prev_hist
+    # prev_hist is now [F, 2] raw PC scores (not a 50×50 histogram)
     projections = cv.project_batch(frames.float())[:, :2].detach().cpu().numpy()
-    h_prev, _, _ = np.histogram2d(projections[:, 0], projections[:, 1], bins=50)
+    prev_pc_scores = projections  # shape [80, 2]
 
     state = {
         "total_md_ns": 10.0,
@@ -278,7 +284,7 @@ def test_convergence_fes_hits():
         "round": 3,
         "accumulated_frames": frames,
         "cv_basis": cv,
-        "prev_hist": h_prev,
+        "prev_hist": prev_pc_scores,
     }
     converged, metric = check_convergence("fes", 0.05, state)
     assert converged
