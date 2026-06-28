@@ -4,6 +4,12 @@ import os
 
 import numpy as np
 
+try:
+    import pyemma  # noqa: F401
+    _HAS_PYEMMA = True
+except ImportError:
+    _HAS_PYEMMA = False
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -283,4 +289,127 @@ def analyze_fes(md_runs_dir, cv_basis_path, out_dir,
     with open(os.path.join(out_dir, "fes_summary.json"), "w") as fh:
         json.dump(summary, fh, indent=2)
     print(f"fes: {n_frames} frames → FES max {fes.max():.2f} kcal/mol")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Kinetics: MSM construction via PyEMMA
+# ---------------------------------------------------------------------------
+
+def _load_featurised_trajs(md_runs_dir):
+    """Load and featurise stable MD trajectories as Cα pairwise distances.
+
+    Returns:
+        list of [T_i, n_features] float32 arrays — one per stable run
+    """
+    import mdtraj as md
+
+    trajs = []
+    for run_id in sorted(os.listdir(md_runs_dir)):
+        metrics_path = os.path.join(md_runs_dir, run_id, "metrics.json")
+        if not os.path.exists(metrics_path):
+            continue
+        with open(metrics_path) as fh:
+            m = json.load(fh)
+        if not m.get("stable", False):
+            continue
+        traj_path = os.path.join(md_runs_dir, run_id, "trajectory.dcd")
+        top_path  = os.path.join(md_runs_dir, run_id, "topology.pdb")
+        if not os.path.exists(traj_path):
+            continue
+        traj   = md.load(traj_path, top=top_path)
+        ca_idx = traj.topology.select("name CA")
+        ca_traj = traj.atom_slice(ca_idx)
+        n = ca_traj.n_atoms
+        # All Cα pairs more than 3 residues apart
+        pairs = [(i, j) for i in range(n) for j in range(i + 3, n)]
+        if not pairs:
+            continue
+        dists = md.compute_distances(ca_traj, pairs)  # [T, n_pairs] in nm
+        trajs.append(dists.astype(np.float32))
+    return trajs
+
+
+def analyze_kinetics(md_runs_dir, out_dir,
+                     tica_lag=50, n_clusters=100, msm_lag=5):
+    """Build a Markov State Model from stable MD trajectories.
+
+    Args:
+        md_runs_dir (str): Directory with per-run MD subdirs.
+        out_dir (str):     Output directory.
+        tica_lag (int):    TICA lag time in frames (1 frame = 10 ps; default 50 = 500 ps).
+        n_clusters (int):  k-means cluster count (default 100).
+        msm_lag (int):     MSM lag time in frames (default 5 = 50 ps).
+
+    Returns:
+        dict: n_trajectories, total_frames, n_states, implied_timescales_ns, etc.
+    """
+    if not _HAS_PYEMMA:
+        raise ImportError(
+            "pyemma is required: conda install -c conda-forge pyemma"
+        )
+    import pyemma
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    trajs = _load_featurised_trajs(md_runs_dir)
+    n_traj = len(trajs)
+    if n_traj == 0:
+        print("kinetics: no stable trajectories found")
+        return {"n_trajectories": 0}
+
+    total_frames = sum(t.shape[0] for t in trajs)
+
+    # TICA
+    tica = pyemma.coordinates.tica(trajs, lag=tica_lag, dim=5, kinetic_map=True)
+    tica_output = tica.get_output()
+    tica_coords = np.concatenate(tica_output, axis=0)  # [T_total, 5]
+    np.save(os.path.join(out_dir, "tica_projection.npy"), tica_coords)
+
+    # k-means clustering
+    k = min(n_clusters, total_frames // 2)
+    cluster = pyemma.cluster.kmeans(tica_output, k=k, max_iter=100, stride=1)
+    np.save(os.path.join(out_dir, "state_assignments.npy"),
+            np.concatenate(cluster.dtrajs))
+
+    # MSM
+    msm = pyemma.msm.estimate_markov_model(cluster.dtrajs, lag=msm_lag)
+    np.save(os.path.join(out_dir, "transition_matrix.npy"),
+            msm.transition_matrix.astype(np.float32))
+
+    # Implied timescales (top 5 processes)
+    its_frames = msm.timescales(k=min(5, k - 1))
+    dt_ps = 10.0  # 1 frame = 10 ps (saved every 5000 steps at 2 fs)
+    its_ns = (its_frames * msm_lag * dt_ps / 1000).tolist()
+
+    timescales_path = os.path.join(out_dir, "timescales.json")
+    with open(timescales_path, "w") as fh:
+        json.dump({"implied_timescales_ns": its_ns, "msm_lag_frames": msm_lag}, fh, indent=2)
+
+    # ITS plot
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.bar(range(1, len(its_ns) + 1), its_ns)
+        ax.set_xlabel("Process"); ax.set_ylabel("Implied timescale (ns)")
+        ax.set_title(f"MSM implied timescales ({k} states, lag={msm_lag} frames)")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "timescales.png"), dpi=150)
+        plt.close(fig)
+    except ImportError:
+        pass
+
+    summary = {
+        "n_trajectories": n_traj,
+        "total_frames": total_frames,
+        "n_states": k,
+        "tica_lag_frames": tica_lag,
+        "msm_lag_frames": msm_lag,
+        "implied_timescales_ns": its_ns,
+    }
+    with open(os.path.join(out_dir, "msm_summary.json"), "w") as fh:
+        json.dump(summary, fh, indent=2)
+    print(f"kinetics: {n_traj} trajs → {k} states, top ITS={its_ns[0]:.1f} ns")
     return summary

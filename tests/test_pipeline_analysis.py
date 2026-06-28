@@ -133,3 +133,39 @@ def test_analyze_fes_boltzmann_inversion(tmp_path, monkeypatch):
     assert fes.shape == (10, 10)
     assert fes.min() == pytest.approx(0.0, abs=1e-6)
     assert (fes >= 0).all()
+
+
+def test_analyze_kinetics_no_pyemma_raises(tmp_path, monkeypatch):
+    """analyze_kinetics raises ImportError when PyEMMA is unavailable."""
+    import lsmd.pipeline_analysis as pa
+    monkeypatch.setattr(pa, "_HAS_PYEMMA", False)
+    with pytest.raises(ImportError, match="pyemma is required"):
+        pa.analyze_kinetics(str(tmp_path / "md"), str(tmp_path / "out"))
+
+
+def test_analyze_kinetics_smoke(tmp_path, monkeypatch):
+    """analyze_kinetics runs on synthetic featurised data when PyEMMA available."""
+    pytest.importorskip("pyemma")
+    from lsmd.pipeline_analysis import analyze_kinetics
+
+    # Provide 5 fake trajectories via monkeypatched featuriser
+    n_res = 10
+    rng = np.random.default_rng(0)
+
+    def _mock_load_featurised(md_runs_dir):
+        # Return list of 5 synthetic [100, n_features] arrays
+        n_pairs = n_res * (n_res - 1) // 2
+        return [rng.standard_normal((100, n_pairs)).astype(np.float32)
+                for _ in range(5)]
+
+    import lsmd.pipeline_analysis as pa
+    monkeypatch.setattr(pa, "_load_featurised_trajs", _mock_load_featurised)
+
+    out_dir = tmp_path / "kinetics"
+    result = analyze_kinetics(
+        str(tmp_path / "md"), str(out_dir),
+        tica_lag=5, n_clusters=10, msm_lag=2,
+    )
+    assert result["n_trajectories"] == 5
+    assert (out_dir / "transition_matrix.npy").exists()
+    assert (out_dir / "msm_summary.json").exists()
