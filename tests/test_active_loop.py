@@ -116,3 +116,99 @@ def test_min_rmsd_kabsch_shifted():
     shifted = coords + torch.tensor([5.0, 3.0, -2.0])
     refs = shifted.unsqueeze(0)
     assert _min_rmsd_kabsch(coords, refs) < 1e-4
+
+
+# ---------------------------------------------------------------------------
+# Task 3: shard_from_md_runs and build_replay_shard tests
+# ---------------------------------------------------------------------------
+from lsmd.active_loop import shard_from_md_runs, build_replay_shard
+
+
+def _make_fake_md_run(tmp_dir, run_id, n_frames, n_res, error=None):
+    """Create a fake md_run directory with metrics.json and stub trajectory."""
+    run_dir = os.path.join(tmp_dir, f"run_{run_id:04d}")
+    os.makedirs(run_dir, exist_ok=True)
+    metrics = {"id": f"run_{run_id}", "md_ns": 10.0, "error": error}
+    with open(os.path.join(run_dir, "metrics.json"), "w") as fh:
+        json.dump(metrics, fh)
+    # Write stub DCD via mdtraj (requires a topology)
+    # Use a pre-built PDB for topology; store CA coords as proxy
+    top_path = os.path.join(run_dir, "topology.pdb")
+    _write_tiny_pdb(top_path, n_res=n_res)
+    # Create fake trajectory: reuse topology PDB itself (1 frame)
+    # For tests, we duplicate the frame n_frames times using mdtraj
+    import mdtraj as md
+    traj = md.load(top_path)
+    coords = np.tile(traj.xyz, (n_frames, 1, 1))
+    # Add small random displacements
+    coords += np.random.randn(*coords.shape) * 0.01
+    traj_out = md.Trajectory(coords, traj.topology)
+    traj_out.save_dcd(os.path.join(run_dir, "trajectory.dcd"))
+    return run_dir
+
+
+def test_shard_from_md_runs_skips_failed(tmp_path):
+    """shard_from_md_runs skips runs where metrics.json has error != null."""
+    n_res = 5
+    good_dir = _make_fake_md_run(str(tmp_path), 0, n_frames=10, n_res=n_res)
+    bad_dir  = _make_fake_md_run(str(tmp_path), 1, n_frames=10, n_res=n_res, error="OOM")
+    R, t = shard_from_md_runs([good_dir, bad_dir], dt_ps=1)
+    assert t.shape[1] == n_res
+    assert t.shape[0] > 0
+    # bad run excluded: total frames come only from good run
+    assert t.shape[0] <= 10 + 1  # allow some rounding in stride
+
+
+def test_shard_from_md_runs_empty(tmp_path):
+    """shard_from_md_runs returns empty tensors when all runs failed."""
+    bad_dir = _make_fake_md_run(str(tmp_path), 0, n_frames=5, n_res=5, error="crash")
+    R, t = shard_from_md_runs([bad_dir])
+    assert t.shape[0] == 0
+
+
+def test_build_replay_shard_capped(tmp_path):
+    """build_replay_shard never returns more than replay_cap frames."""
+    N = 5
+    accumulated_pt = str(tmp_path / "acc.pt")
+    protein_meta = {
+        "res_type": torch.zeros(N, dtype=torch.long),
+        "chain_id": torch.zeros(N, dtype=torch.long),
+        "res_index": torch.arange(N),
+        "seq": ["ALA"] * N,
+        "n_res": N,
+    }
+    # Pre-fill history with 200 frames
+    big_R = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(200, N, -1, -1).clone()
+    big_t = torch.randn(200, N, 3)
+    torch.save({"R": big_R, "t": big_t}, accumulated_pt)
+
+    new_R = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(30, N, -1, -1).clone()
+    new_t = torch.randn(30, N, 3)
+    shard = build_replay_shard(new_R, new_t, accumulated_pt, protein_meta, replay_cap=50)
+    assert len(shard["t"]) == 50
+
+
+def test_build_replay_shard_small_history(tmp_path):
+    """build_replay_shard uses all history when history < replay_cap - new."""
+    N = 5
+    accumulated_pt = str(tmp_path / "acc.pt")
+    protein_meta = {
+        "res_type": torch.zeros(N, dtype=torch.long),
+        "chain_id": torch.zeros(N, dtype=torch.long),
+        "res_index": torch.arange(N),
+        "seq": ["ALA"] * N,
+        "n_res": N,
+    }
+    # Pre-fill history with 10 frames
+    hist_R = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(10, N, -1, -1).clone()
+    hist_t = torch.randn(10, N, 3)
+    torch.save({"R": hist_R, "t": hist_t}, accumulated_pt)
+
+    new_R = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(5, N, -1, -1).clone()
+    new_t = torch.randn(5, N, 3)
+    shard = build_replay_shard(new_R, new_t, accumulated_pt, protein_meta, replay_cap=5000)
+    assert len(shard["t"]) == 15  # 5 new + 10 all history
+
+    # accumulated_pt must now have 10 + 5 = 15 frames
+    acc = torch.load(accumulated_pt, weights_only=False)
+    assert acc["t"].shape[0] == 15

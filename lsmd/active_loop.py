@@ -235,3 +235,118 @@ def bootstrap_check(pdb_path: str, checkpoint: str, device: str,
         "seq":   shard_1f["seq"],
         "n_res": len(frames["res_type"]),
     }
+
+
+# ---------------------------------------------------------------------------
+# shard_from_md_runs
+# ---------------------------------------------------------------------------
+
+def shard_from_md_runs(md_run_dirs: list, dt_ps: float = 200.0):
+    """Extract Cα backbone frames from completed OpenMM MD run directories.
+
+    For each run directory that has a successful `metrics.json` (error == null)
+    and valid `trajectory.dcd` + `topology.pdb`, loads the full-atom trajectory,
+    extracts backbone SE(3) frames with `data.load_frames()`, and strides to
+    approximately dt_ps ps between frames.
+
+    Args:
+        md_run_dirs: list of run directory paths (order does not matter).
+        dt_ps:       desired frame spacing in ps (default 200 ps).
+
+    Returns:
+        (R, t) where R is [F_total, N, 3, 3] and t is [F_total, N, 3] float32.
+        Returns (empty, empty) tensors if all runs failed or no directories given.
+    """
+    all_R, all_t = [], []
+
+    for run_dir in sorted(md_run_dirs):
+        metrics_path = os.path.join(run_dir, "metrics.json")
+        if not os.path.exists(metrics_path):
+            continue
+        with open(metrics_path) as fh:
+            m = json.load(fh)
+        if m.get("error") is not None:
+            continue
+
+        traj_path = os.path.join(run_dir, "trajectory.dcd")
+        top_path  = os.path.join(run_dir, "topology.pdb")
+        if not (os.path.exists(traj_path) and os.path.exists(top_path)):
+            continue
+
+        try:
+            # Get frame spacing from the DCD header via mdtraj
+            traj_info = md.load(traj_path, top=top_path)
+            dt_traj_ps = float(traj_info.timestep)   # ps per frame
+            stride = max(1, round(dt_ps / dt_traj_ps))
+
+            frames = data.load_frames(traj_path, top_path)
+            R_run = frames["R"][::stride]   # [F_run, N, 3, 3]
+            t_run = frames["t"][::stride]   # [F_run, N, 3]
+            all_R.append(R_run)
+            all_t.append(t_run)
+        except Exception as exc:
+            print(f"[shard_from_md_runs] skipping {run_dir}: {exc}", flush=True)
+            continue
+
+    if not all_R:
+        return torch.empty(0), torch.empty(0)
+
+    return torch.cat(all_R, dim=0), torch.cat(all_t, dim=0)
+
+
+# ---------------------------------------------------------------------------
+# build_replay_shard
+# ---------------------------------------------------------------------------
+
+def build_replay_shard(new_R: torch.Tensor, new_t: torch.Tensor,
+                       accumulated_pt: str, protein_meta: dict,
+                       replay_cap: int = 5000, dt_ps: float = 200.0) -> dict:
+    """Build a fine-tuning shard from new frames + replay of historical frames.
+
+    Appends new_R / new_t to accumulated_pt (the growing history store), then
+    returns a shard dict whose `t` and `R` are:
+        all new frames  +  random_sample(history_before_this_round, n_old)
+    where n_old = min(replay_cap − len(new_frames), len(history)).
+
+    Args:
+        new_R:          [F_new, N, 3, 3] rotation matrices from this round's MD.
+        new_t:          [F_new, N, 3] Cα positions from this round's MD.
+        accumulated_pt: path to accumulated_frames.pt (appended in-place).
+        protein_meta:   dict with {res_type, chain_id, res_index, seq, n_res}.
+        replay_cap:     maximum total frames in returned shard (default 5000).
+        dt_ps:          frame spacing label for the shard (default 200 ps).
+
+    Returns:
+        shard dict with {res_type, chain_id, res_index, seq, n_res, R, t, dt}.
+    """
+    # Load existing history (frames accumulated before this round)
+    if os.path.exists(accumulated_pt):
+        acc = torch.load(accumulated_pt, map_location="cpu", weights_only=False)
+        hist_R = acc["R"]   # [F_hist, N, 3, 3]
+        hist_t = acc["t"]   # [F_hist, N, 3]
+    else:
+        N = new_t.shape[1]
+        hist_R = torch.empty(0, N, 3, 3)
+        hist_t = torch.empty(0, N, 3)
+
+    # Append new frames to accumulated store
+    updated_R = torch.cat([hist_R, new_R], dim=0)
+    updated_t = torch.cat([hist_t, new_t], dim=0)
+    torch.save({"R": updated_R, "t": updated_t}, accumulated_pt)
+
+    # Build replay buffer: all new + sample of old history
+    n_old = min(max(0, replay_cap - len(new_t)), len(hist_t))
+    if n_old > 0 and len(hist_t) > 0:
+        idx = torch.randperm(len(hist_t))[:n_old]
+        combined_R = torch.cat([new_R, hist_R[idx]], dim=0)
+        combined_t = torch.cat([new_t, hist_t[idx]], dim=0)
+    else:
+        combined_R = new_R
+        combined_t = new_t
+
+    return {
+        **protein_meta,
+        "R": combined_R,
+        "t": combined_t,
+        "dt": float(dt_ps),
+    }
