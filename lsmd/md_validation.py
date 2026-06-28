@@ -1,6 +1,7 @@
 """OpenMM implicit-solvent MD validation for all-atom protein structures."""
 import json
 import os
+import tempfile
 
 try:
     import openmm as omm
@@ -9,6 +10,87 @@ try:
     HAS_OPENMM = True
 except ImportError:
     HAS_OPENMM = False
+
+
+def _prepare_pdb(pdb_path: str) -> str:
+    """Return a path to a PDB that OpenMM's amber14 force field can parse.
+
+    Handles two common issues in crystal/cryo-EM structures:
+      1. HIS residues with ambiguous protonation — renamed to HIE (Ne-protonated).
+      2. C-terminal residue missing OXT — computed from C/O/CA geometry.
+
+    Returns the original path when neither fix is needed (avoids temp file I/O).
+    """
+    import numpy as np
+
+    with open(pdb_path) as fh:
+        lines = fh.readlines()
+
+    atom_lines = [l for l in lines if l.startswith(("ATOM", "HETATM"))]
+    if not atom_lines:
+        return pdb_path
+
+    # ── Collect last-residue info BEFORE any renaming ────────────────────────
+    last_chain  = atom_lines[-1][21]
+    last_res_id = atom_lines[-1][22:26].strip()
+    last_atoms  = {
+        l[12:16].strip(): l for l in atom_lines
+        if l[22:26].strip() == last_res_id and l[21] == last_chain
+    }
+    needs_oxt = "OXT" not in last_atoms and "OT2" not in last_atoms
+    has_his   = any(l[17:20] == "HIS" for l in atom_lines)
+
+    if not needs_oxt and not has_his:
+        return pdb_path
+
+    # ── Rename HIS → HIE in all ATOM/HETATM and TER lines ──────────────────
+    new_lines = []
+    for l in lines:
+        if (l.startswith(("ATOM", "HETATM", "TER"))) and len(l) > 20 and l[17:20] == "HIS":
+            l = l[:17] + "HIE" + l[20:]
+        new_lines.append(l)
+
+    # ── Add OXT to C-terminal residue if missing ─────────────────────────────
+    if needs_oxt:
+        def _xyz(raw_line):
+            return np.array([float(raw_line[30:38]),
+                             float(raw_line[38:46]),
+                             float(raw_line[46:54])])
+
+        C_line  = last_atoms.get("C")
+        O_line  = last_atoms.get("O")
+        CA_line = last_atoms.get("CA")
+        if C_line and O_line and CA_line:
+            C, O, CA = _xyz(C_line), _xyz(O_line), _xyz(CA_line)
+            # Place OXT as the carboxylate mirror of O through the C-CA bond axis
+            u   = (C - CA); u /= np.linalg.norm(u)
+            CO  = O - C
+            OXT = C + (CO - 2.0 * np.dot(CO, u) * u)
+
+            # Use the renamed residue name (HIE if originally HIS, else original)
+            res_name = "HIE" if last_atoms["C"][17:20] == "HIS" else last_atoms["C"][17:20]
+
+            # Serial: one past the last ATOM/HETATM in new_lines
+            last_ser = max(
+                int(l[6:11]) for l in new_lines if l.startswith(("ATOM", "HETATM"))
+            )
+            oxt_line = (
+                f"ATOM  {last_ser+1:5d}  OXT {res_name} {last_chain}"
+                f"{last_res_id.rjust(4)}    "
+                f"{OXT[0]:8.3f}{OXT[1]:8.3f}{OXT[2]:8.3f}"
+                f"  1.00  0.00           O  \n"
+            )
+            insert_idx = next(
+                (i for i, l in enumerate(new_lines)
+                 if l.startswith("TER") or l.startswith("END")),
+                len(new_lines),
+            )
+            new_lines.insert(insert_idx, oxt_line)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdb", mode="w", delete=False)
+    tmp.writelines(new_lines)
+    tmp.flush()
+    return tmp.name
 
 
 def run_md(pdb_path, out_dir, md_ns, temp_K=310.0, n_steps_min=5000):
@@ -56,7 +138,7 @@ def run_md(pdb_path, out_dir, md_ns, temp_K=310.0, n_steps_min=5000):
     }
 
     try:
-        pdb = app.PDBFile(pdb_path)
+        pdb = app.PDBFile(_prepare_pdb(pdb_path))
         forcefield = app.ForceField("amber14-all.xml", "implicit/gbn2.xml")
         modeller = app.Modeller(pdb.topology, pdb.positions)
         modeller.addHydrogens(forcefield)
