@@ -363,3 +363,91 @@ def build_replay_shard(new_R: torch.Tensor, new_t: torch.Tensor,
         "t": combined_t,
         "dt": float(dt_ps),
     }
+
+
+# ---------------------------------------------------------------------------
+# Convergence checkers
+# ---------------------------------------------------------------------------
+
+def check_convergence(criterion: str, threshold: float, state: dict):
+    """Check whether the active learning loop has converged.
+
+    Args:
+        criterion: "budget" | "coverage" | "fes"
+        threshold: criterion-specific stopping value.
+        state: dict with keys depending on criterion:
+            budget:
+                total_md_ns         (float)       — cumulative MD nanoseconds
+            coverage:
+                last_novel_fraction (float)       — novel fraction in last round
+            fes:
+                round               (int)         — current round index (0-based)
+                accumulated_frames  (Tensor)      — [F, N, 3] Cα positions, all rounds
+                cv_basis            (CVSpace)     — fitted collective variable space
+                prev_hist           (np.ndarray | None) — [50, 50] 2-D histogram from
+                                    previous round, or None if not yet available
+
+    Returns:
+        (converged: bool, metric: float)
+        metric is always returned (nan when not yet computable) for logging.
+
+    Raises:
+        ValueError: if criterion is not one of the supported values.
+    """
+    if criterion == "budget":
+        val = float(state["total_md_ns"])
+        return val >= threshold, val
+
+    elif criterion == "coverage":
+        val = float(state.get("last_novel_fraction", 1.0))
+        return val < threshold, val
+
+    elif criterion == "fes":
+        return _check_fes(state, threshold)
+
+    else:
+        raise ValueError(
+            f"Unknown convergence criterion: {criterion!r}. "
+            "Choose 'budget', 'coverage', or 'fes'."
+        )
+
+
+def _check_fes(state: dict, threshold: float):
+    """JS divergence between current and previous FES histograms.
+
+    Requires: round >= 2 AND accumulated_frames has >= 50 frames AND
+    prev_hist is not None.  Returns (False, nan) whenever any condition
+    is unmet.
+    """
+    rnd = state.get("round", 0)
+    accumulated = state.get("accumulated_frames")
+    prev_hist = state.get("prev_hist")
+
+    if rnd < 2 or accumulated is None or len(accumulated) < 50 or prev_hist is None:
+        return False, float("nan")
+
+    cv_basis = state["cv_basis"]
+
+    # Project all accumulated Cα frames through the CV basis → [F, n_pc+2]
+    projections = cv_basis.project_batch(accumulated.float())  # [F, n_pc+2]
+    pc1 = projections[:, 0].detach().cpu().numpy()
+    pc2 = projections[:, 1].detach().cpu().numpy()
+
+    # Build 50×50 2D histogram over PC1, PC2
+    bins = 50
+    h_curr, _, _ = np.histogram2d(pc1, pc2, bins=bins)  # [50, 50]
+
+    # Normalise to probability distributions; add epsilon to avoid log(0)
+    eps = 1e-10
+    p = h_curr.flatten() + eps
+    p /= p.sum()
+    q = prev_hist.flatten().astype(np.float64) + eps
+    q /= q.sum()
+
+    # Jensen-Shannon divergence: 0.5 * KL(P||M) + 0.5 * KL(Q||M), M = 0.5*(P+Q)
+    m = 0.5 * (p + q)
+    kl_pm = float(np.sum(p * np.log(p / m)))
+    kl_qm = float(np.sum(q * np.log(q / m)))
+    js = 0.5 * kl_pm + 0.5 * kl_qm
+
+    return js < threshold, float(js)

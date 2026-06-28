@@ -212,3 +212,81 @@ def test_build_replay_shard_small_history(tmp_path):
     # accumulated_pt must now have 10 + 5 = 15 frames
     acc = torch.load(accumulated_pt, weights_only=False)
     assert acc["t"].shape[0] == 15
+
+
+# ---------------------------------------------------------------------------
+# Task 4: check_convergence tests
+# ---------------------------------------------------------------------------
+import math
+from lsmd.active_loop import check_convergence
+
+
+def test_convergence_budget_hits():
+    """Budget criterion converges when total_md_ns >= threshold."""
+    state = {"total_md_ns": 100.0, "last_novel_fraction": 0.5, "round": 1}
+    converged, metric = check_convergence("budget", 100.0, state)
+    assert converged
+    assert abs(metric - 100.0) < 1e-6
+
+
+def test_convergence_budget_miss():
+    """Budget criterion does not converge when total_md_ns < threshold."""
+    state = {"total_md_ns": 45.0, "last_novel_fraction": 0.5, "round": 1}
+    converged, metric = check_convergence("budget", 100.0, state)
+    assert not converged
+    assert abs(metric - 45.0) < 1e-6
+
+
+def test_convergence_coverage_hits():
+    """Coverage criterion converges when last_novel_fraction < threshold."""
+    state = {"total_md_ns": 10.0, "last_novel_fraction": 0.05, "round": 3}
+    converged, metric = check_convergence("coverage", 0.10, state)
+    assert converged
+    assert abs(metric - 0.05) < 1e-6
+
+
+def test_convergence_fes_insufficient_data():
+    """FES criterion returns (False, nan) when round < 2 or frames < 50."""
+    N = 10
+    state = {
+        "total_md_ns": 10.0,
+        "last_novel_fraction": 0.5,
+        "round": 0,
+        "accumulated_frames": torch.randn(20, N, 3),
+        "cv_basis": None,
+        "prev_hist": None,
+    }
+    converged, metric = check_convergence("fes", 0.05, state)
+    assert not converged
+    assert math.isnan(metric)
+
+
+def test_convergence_fes_hits():
+    """FES converges when JS divergence < threshold (identical histograms → JS ≈ 0)."""
+    N = 10
+    frames = torch.randn(80, N, 3)
+    cv = CVSpace(n_pc=2)
+    cv.fit(frames)
+
+    # Build the histogram from these frames to use as prev_hist
+    projections = cv.project_batch(frames.float())[:, :2].detach().cpu().numpy()
+    h_prev, _, _ = np.histogram2d(projections[:, 0], projections[:, 1], bins=50)
+
+    state = {
+        "total_md_ns": 10.0,
+        "last_novel_fraction": 0.2,
+        "round": 3,
+        "accumulated_frames": frames,
+        "cv_basis": cv,
+        "prev_hist": h_prev,
+    }
+    converged, metric = check_convergence("fes", 0.05, state)
+    assert converged
+    assert metric < 0.05
+
+
+def test_convergence_unknown_criterion():
+    """Unknown criterion raises ValueError."""
+    state = {"total_md_ns": 10.0, "last_novel_fraction": 0.5, "round": 1}
+    with pytest.raises(ValueError, match="Unknown convergence criterion"):
+        check_convergence("unknown", 0.5, state)
