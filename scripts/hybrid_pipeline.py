@@ -64,7 +64,8 @@ def run_proposals(args):
         return
     summary_path = os.path.join(args.out, "proposals", "summary.json")
     if os.path.exists(summary_path):
-        n = len(json.load(open(summary_path)))
+        with open(summary_path) as f:
+            n = len(json.load(f))
         if n >= args.n_proposals:
             Path(done).touch()
             print(f"[Stage 1] Found {n} existing proposals — skipping.")
@@ -104,7 +105,8 @@ def run_reconstruction(args):
             ca_gen_A  = torch.tensor(ca_traj.xyz[0] * 10.0)  # nm → Å
             xyz_A     = rec.reconstruct_frame_ca(ca_gen_A)    # [N_heavy, 3] Å
             out_traj  = md.Trajectory(
-                xyz_A[np.newaxis] / 10.0, rec._out_top        # Å → nm
+                xyz_A[np.newaxis] / 10.0,
+                rec._out_top,   # no public topology accessor on AllAtomReconstructor; _out_top is the protein-heavy-atom MDTraj Topology built in __init__  # noqa: SLF001
             )
             out_traj.save_pdb(out_pdb)
         except Exception as exc:
@@ -165,7 +167,9 @@ def run_md_validation(args):
             except Exception as exc:
                 print(f"  {os.path.basename(pdb)}: ERROR {exc}", flush=True)
 
-    print(f"[Stage 3] Done. {n_stable}/{len(pdb_files)} structures stable.")
+    # n_stable counts only this batch (tasks not already done); len(pdb_files) is all PDBs.
+    print(f"[Stage 3] Done. {n_stable}/{len(tasks)} structures stable this batch "
+          f"(of {len(pdb_files)} total PDBs).")
     Path(done).touch()
 
 

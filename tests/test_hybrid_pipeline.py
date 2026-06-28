@@ -1,3 +1,4 @@
+import argparse
 import json
 import subprocess
 import sys
@@ -49,3 +50,18 @@ def test_missing_required_args(tmp_path):
         cwd=str(Path(__file__).resolve().parent.parent),
     )
     assert result.returncode != 0
+
+
+def test_run_analysis_kinetics_dispatches_analyze_kinetics(tmp_path, monkeypatch):
+    """run_analysis dispatches analyze_kinetics when objective is kinetics."""
+    import lsmd.pipeline_analysis as pa
+    called = []
+    monkeypatch.setattr(pa, "analyze_kinetics",
+                        lambda md_runs_dir, out_dir, **kw: called.append("kinetics") or {})
+    args = argparse.Namespace(
+        objective="kinetics",
+        out=str(tmp_path),
+    )
+    from scripts.hybrid_pipeline import run_analysis
+    run_analysis(args)
+    assert called == ["kinetics"]
