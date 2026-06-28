@@ -11,7 +11,6 @@ Provides:
 """
 import json
 import os
-import shutil
 
 import mdtraj as md
 import numpy as np
