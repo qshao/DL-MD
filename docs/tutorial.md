@@ -11,36 +11,62 @@ This tutorial covers both the original per-protein DDPM and the transferable cro
 
 ## Prerequisites
 
-### 1. Create a virtual environment
+### 1. Create a conda environment
+
+[Miniconda](https://docs.conda.io/en/latest/miniconda.html) is recommended over `venv` because OpenMM and mdtraj distribute compiled C++ extensions through conda-forge that are not available on PyPI.
 
 ```bash
-python -m venv lsmd-env
-source lsmd-env/bin/activate        # Linux / macOS
-# lsmd-env\Scripts\activate         # Windows
+conda create -n lsmd python=3.11 -y
+conda activate lsmd
 ```
 
 ### 2. Install PyTorch with CUDA
 
+Find your CUDA version first, then install the matching PyTorch build:
+
 ```bash
 nvidia-smi | grep "CUDA Version"
-# Install from https://pytorch.org/get-started/locally/
-pip install torch --index-url https://download.pytorch.org/whl/cu121   # CUDA 12.x
-pip install torch   # CPU-only fallback
+# CUDA 12.x
+conda install -c pytorch pytorch torchvision -y
+# or pip:
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# CPU-only fallback (no GPU)
+pip install torch
 ```
 
-### 3. Install LSMD
+### 3. Install LSMD and core dependencies
 
 ```bash
 git clone https://github.com/qshao/DL-MD.git
 cd DL-MD
-pip install -e ".[dev]"
+pip install -e ".[dev]"          # installs lsmd package + pytest
+conda install -c conda-forge mdtraj scipy matplotlib -y
 ```
 
-### 4. Verify
+### 4. (Optional) Install OpenMM for hybrid pipeline
+
+OpenMM is only required for `scripts/hybrid_pipeline.py` (Stage 3 MD validation). The exploration and training scripts work without it.
+
+```bash
+conda install -c conda-forge openmm -y
+```
+
+> **GPU acceleration note:** The conda-forge OpenMM build includes the OpenCL backend which runs on NVIDIA GPUs. The native CUDA backend requires building OpenMM from source and is not included in the prebuilt package. On x86-64 systems, the CUDA backend is available via `conda install -c conda-forge openmm cudatoolkit`. On AArch64 (ARM64) systems like the NVIDIA Grace Blackwell, only OpenCL is available in the prebuilt package.
+
+### 5. (Optional) Install PyEMMA for kinetics analysis
+
+PyEMMA is only required for the `kinetics` objective in `hybrid_pipeline.py`.
+
+```bash
+conda install -c conda-forge pyemma -y
+```
+
+### 6. Verify
 
 ```bash
 pytest tests/ -q
-# expected: all tests passed
+# expected: all tests pass (OpenMM/PyEMMA tests skipped if not installed)
 ```
 
 ---
@@ -1145,3 +1171,301 @@ The script:
 5. Computes `R` (3×3 rotation matrices) from Cα positions if not present
 
 Output is a standard atlas-compatible shard that can be used with any LSMD script.
+
+---
+
+---
+
+# Part 4 — Hybrid ML-MD Pipeline
+
+The hybrid pipeline combines the SE(3) PropagatorNet with classical OpenMM molecular dynamics to produce physically validated protein conformations. The model generates diverse Cα proposals, sidechains are reconstructed from a reference template, and each structure is validated by a short OpenMM implicit-solvent MD run. A single `--objective` flag controls the analysis goal.
+
+## Model overview
+
+The **SE(3) PropagatorNet** is a Cα-level denoising diffusion model:
+
+| Property | Value |
+|---|---|
+| Architecture | Union-graph message-passing GNN (SE(3)-equivariant) |
+| Parameters | 2.47 M |
+| Hidden dimension | 256 |
+| Message-passing layers | 6 |
+| k-NN graph connectivity | k = 12 |
+| Diffusion noise levels (T) | 200 |
+| Default inference | DDIM-20, η = 1.0 (fast stochastic) |
+| Training lag range | 2000–10 000 ps |
+| Input/output | Cα positions [N, 3] → next Cα positions [N, 3] |
+
+The model works in **SE(3) local residue frames**. Each residue carries a rotation R ∈ SO(3) and translation t ∈ ℝ³ built from its backbone geometry. The network predicts the relative frame update (ω, Δt) in the local coordinate system, making predictions invariant to global rigid-body motion and transferable across all proteins.
+
+At inference, the model is used in **explore mode** (CV-guided conformational diversity) or **sample mode** (unguided ensemble) depending on the objective.
+
+## Pipeline stages
+
+```
+Stage 1 — Model proposals
+  explore_conformations.py (called as subprocess)
+  → proposals/candidates/*.pdb   Cα-only PDBs
+  → proposals/summary.json       per-structure metadata
+  → proposals/cv_basis.pt        PCA basis (explore and fes objectives)
+
+Stage 2 — Cα → all-atom reconstruction
+  AllAtomReconstructor.reconstruct_frame_ca()
+  → allatom/<id>.pdb             all heavy atoms, no hydrogens, no solvent
+
+Stage 3 — OpenMM MD validation
+  md_validation.run_md()  (ProcessPoolExecutor, n_parallel workers)
+  → md_runs/<id>/trajectory.dcd
+  → md_runs/<id>/topology.pdb
+  → md_runs/<id>/metrics.json
+
+Stage 4 — Objective-specific analysis
+  pipeline_analysis.analyze_*()
+  → results/<objective>/
+```
+
+Each stage writes a completion marker (`.stage1_done`, `.stage2_done`, `.stage3_done`). Re-running the pipeline after interruption skips completed stages automatically. Stage 4 always re-runs (no marker) so analysis parameters can be tuned without repeating expensive MD.
+
+## Prerequisites
+
+```bash
+# Core (always required)
+conda activate lsmd
+
+# Stage 3
+conda install -c conda-forge openmm mdtraj -y
+
+# Stage 4 kinetics objective only
+conda install -c conda-forge pyemma -y
+```
+
+## Quick start: KRAS explore
+
+```bash
+python scripts/hybrid_pipeline.py \
+    --checkpoint checkpoints/kras_ft.pt \
+    --shard      data/kras_wt_shard.pt \
+    --ref_traj   WT/WT-sol6.trr \
+    --ref_top    WT/WT-sol6.gro \
+    --objective  explore \
+    --n_proposals 200 \
+    --n_parallel  4 \
+    --device      cuda \
+    --out         kras_hybrid_explore
+```
+
+Expected output in `kras_hybrid_explore/`:
+```
+proposals/
+  candidates/00000.pdb … 00199.pdb   Cα PDB files
+  summary.json                        per-structure metadata
+  cv_basis.pt                         PCA basis for Stage 4
+  structures.pt                       [200, N, 3] stacked Cα tensors
+
+allatom/
+  00000.pdb … 00199.pdb   all heavy atoms (OpenMM adds H at runtime)
+  failed.txt               structures that failed reconstruction (if any)
+
+md_runs/
+  00000/
+    trajectory.dcd          MD trajectory
+    topology.pdb            first frame (reference for mdtraj)
+    metrics.json            stability results
+
+results/explore/
+  cluster_summary.json      Ward-linkage cluster report
+  library/                  representative all-atom PDBs, one per cluster
+```
+
+## All three objectives
+
+### explore — diverse conformation library
+
+Generates CV-guided diverse Cα proposals, validates each with 10 ns MD (default), then clusters stable structures by Cα RMSD.
+
+```bash
+python scripts/hybrid_pipeline.py \
+    --checkpoint checkpoints/kras_ft.pt \
+    --shard      data/kras_wt_shard.pt \
+    --ref_traj   WT/WT-sol6.trr \
+    --ref_top    WT/WT-sol6.gro \
+    --objective  explore \
+    --n_proposals 200 \
+    --n_parallel  4 \
+    --md_ns       10 \
+    --device      cuda \
+    --out         kras_hybrid_explore
+```
+
+Stage 4 output `results/explore/cluster_summary.json`:
+```json
+{
+  "n_proposals_attempted": 200,
+  "n_stable": 183,
+  "n_clusters": 47,
+  "rmsd_cutoff_A": 2.0,
+  "representatives": [
+    {"cluster_id": 0, "size": 12, "medoid_id": "00031", "rmsd_to_native_A": 3.21},
+    ...
+  ]
+}
+```
+
+### fes — free energy surface
+
+Generates an unguided proposal ensemble, validates with 25 ns MD, and projects all stable frames onto PC1 × PC2 to compute a 2D free energy surface via Boltzmann inversion.
+
+```bash
+python scripts/hybrid_pipeline.py \
+    --checkpoint checkpoints/kras_ft.pt \
+    --shard      data/kras_wt_shard.pt \
+    --ref_traj   WT/WT-sol6.trr \
+    --ref_top    WT/WT-sol6.gro \
+    --objective  fes \
+    --n_proposals 300 \
+    --n_parallel  4 \
+    --md_ns       25 \
+    --device      cuda \
+    --out         kras_hybrid_fes
+```
+
+Stage 4 output in `results/fes/`:
+- `fes.npy` — [50, 50] free energy surface in kcal/mol (minimum = 0)
+- `cv_edges.npy` — bin edges for PC1 and PC2 axes
+- `fes.png` — 2D heatmap
+- `fes_summary.json` — statistics
+
+### kinetics — Markov state model
+
+Generates a broad unguided ensemble, validates with 50 ns MD per structure, then builds a TICA + k-means + MSM kinetic model via PyEMMA.
+
+```bash
+python scripts/hybrid_pipeline.py \
+    --checkpoint checkpoints/kras_ft.pt \
+    --shard      data/kras_wt_shard.pt \
+    --ref_traj   WT/WT-sol6.trr \
+    --ref_top    WT/WT-sol6.gro \
+    --objective  kinetics \
+    --n_proposals 500 \
+    --n_parallel  4 \
+    --md_ns       50 \
+    --device      cuda \
+    --out         kras_hybrid_kinetics
+```
+
+Requires PyEMMA (`conda install -c conda-forge pyemma`). Stage 4 output in `results/kinetics/`:
+- `transition_matrix.npy` — [k, k] row-stochastic MSM
+- `timescales.json` — top-5 implied timescales in ns
+- `tica_projection.npy` — [N_frames, 5] TICA coordinates
+- `state_assignments.npy` — discrete state per frame
+- `msm_summary.json` — MSM diagnostics
+
+## Full CLI reference
+
+```
+python scripts/hybrid_pipeline.py [-h]
+  --checkpoint CHECKPOINT   Fine-tuned PropagatorNet checkpoint (.pt)
+  --shard SHARD             Atlas-compatible protein shard (.pt)
+  --ref_traj REF_TRAJ       All-atom MD trajectory for reconstruction (TRR/DCD/XTC)
+  --ref_top REF_TOP         Topology matching ref_traj (GRO/PDB)
+  --objective {explore,kinetics,fes}
+
+  [--n_proposals N]         Proposals to generate (default: 200/500/300 by objective)
+  [--n_parallel N]          ProcessPoolExecutor workers for Stage 3 (default: 4)
+  [--md_ns FLOAT]           MD length per structure in ns (default: 10/50/25 by objective)
+  [--temp_K FLOAT]          MD temperature in Kelvin (default: 310.0)
+  [--device DEVICE]         cuda or cpu (default: cuda if available)
+  [--out DIR]               Output directory (default: hybrid_out)
+  [--seed INT]              Random seed
+
+  # Proposal stage pass-throughs (explore objective only):
+  [--n_steps N]             Rollout steps per proposal (default: 50)
+  [--tau_ps FLOAT]          Physical lag per step in ps (default: 2000)
+  [--k_guide FLOAT]         CV repulsion strength (default: 0.15)
+  [--sigma_cv FLOAT]        Gaussian width in CV space (default: 0.8)
+  [--guide_warmup N]        Accepts before activating CV guidance (default: 20)
+```
+
+## MD setup details (Stage 3)
+
+Each structure is run with:
+
+| Setting | Value |
+|---|---|
+| Force field | AMBER14 protein (`amber14-all.xml`) |
+| Implicit solvent | GBn2 (`implicit/gbn2.xml`) |
+| Nonbonded method | NoCutoff (implicit solvent) |
+| Constraints | HBonds (required for stable 2 fs integration) |
+| Integrator | LangevinMiddle, 1 ps⁻¹ friction, 2 fs timestep |
+| Hydrogen mass | 1.5 amu (HMR) |
+| Temperature | 310 K (adjustable via `--temp_K`) |
+| Minimization | 5000 steps before MD |
+| Trajectory save | Every 10 ps (every 5000 steps) |
+
+Stability criterion: `rmsd_std < 3.0 Å` AND `rmsd_final < 8.0 Å` relative to the minimized start frame.
+
+> **Important:** Always include `constraints=app.HBonds` when using `createSystem()` with `implicit/gbn2.xml`. Omitting constraints causes the integrator to blow up on structures with any sidechain steric clashes from the reconstruction step.
+
+## OpenMM note: do not double-specify the solvent model
+
+```python
+# WRONG — raises "implicitSolvent was specified but never used" in OpenMM 8.x
+forcefield = app.ForceField("amber14-all.xml", "implicit/gbn2.xml")
+system = forcefield.createSystem(..., implicitSolvent=app.GBn2)
+
+# CORRECT — gbn2.xml already sets the solvent model
+forcefield = app.ForceField("amber14-all.xml", "implicit/gbn2.xml")
+system = forcefield.createSystem(..., nonbondedMethod=app.NoCutoff,
+                                 constraints=app.HBonds,
+                                 hydrogenMass=1.5*unit.amu)
+```
+
+## Checkpoint and resume behaviour
+
+- **Stage 1 skip:** triggered when at least one `.pdb` file exists in `proposals/candidates/`
+- **Stage 2 skip:** triggered by `.stage2_done` marker; individual structures skip if `allatom/<id>.pdb` already exists
+- **Stage 3 skip:** triggered by `.stage3_done` marker; individual MD runs skip if `md_runs/<id>/metrics.json` exists **and** its `error` field is `null`. A previously failed run (GPU crash, bad PDB) is **not** cached — it will be re-attempted on the next launch.
+- **Stage 4:** always re-runs. Delete and re-run to change clustering cutoff or FES bin count.
+
+## Throughput expectations
+
+Runtime is dominated by Stage 3. Approximate times per structure on a single GPU via OpenCL:
+
+| Protein size | MD length | Time per structure |
+|---|---|---|
+| 170 residues (KRAS) | 1 ns | ~3 min |
+| 170 residues (KRAS) | 10 ns | ~30 min |
+| 170 residues (KRAS) | 50 ns | ~2.5 hr |
+
+With 4 parallel workers and GPU memory sufficient for all 4 OpenCL contexts, multiply by ~2× (contention overhead). Use `--n_parallel 2` on single-GPU systems for best throughput.
+
+For the `explore` objective with `--md_ns 1`, a 200-structure KRAS run takes approximately 5–6 hours on a single NVIDIA GPU.
+
+## Common issues
+
+### Simulation explosion (NaN energy, RMSD > 10⁶ Å)
+The reconstructed sidechains from nearest-template matching can have steric clashes. Without `constraints=app.HBonds`, the 2 fs integrator hits a singularity. Always pass `constraints=app.HBonds` to `createSystem()`.
+
+### "implicitSolvent was specified but never used" (OpenMM 8.x)
+In OpenMM 8.x, when `implicit/gbn2.xml` is loaded as part of the `ForceField`, you must **not** also pass `implicitSolvent=app.GBn2` to `createSystem()`. Remove the `implicitSolvent`, `soluteDielectric`, and `solventDielectric` arguments — the XML file sets them.
+
+### Stage 3 workers failing silently
+Each `run_md` worker catches all exceptions and writes them to `md_runs/<id>/metrics.json` under the `error` key. Check failed runs with:
+```bash
+python3 -c "
+import glob, json
+for f in sorted(glob.glob('kras_hybrid_explore/md_runs/*/metrics.json')):
+    m = json.load(open(f))
+    if m['error']:
+        print(m['id'], m['error'][:80])
+"
+```
+
+### OpenCL vs CUDA
+On AArch64 (ARM64) systems (e.g., NVIDIA Grace Blackwell GB10), the conda-forge OpenMM package includes OpenCL but not the CUDA backend. OpenCL still runs on the GPU but is 3–4× slower than CUDA. To verify which device OpenMM is using:
+```python
+import openmm as omm
+p = omm.Platform.getPlatformByName('OpenCL')
+# ... create a minimal context, then:
+print(p.getPropertyValue(ctx, 'OpenCLDeviceName'))
+```
