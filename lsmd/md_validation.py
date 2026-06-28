@@ -11,7 +11,7 @@ except ImportError:
     HAS_OPENMM = False
 
 
-def run_md(pdb_path, out_dir, md_ns, temp_K=310.0, n_steps_min=1000):
+def run_md(pdb_path, out_dir, md_ns, temp_K=310.0, n_steps_min=5000):
     """Run AMBER14/GBn2 implicit-solvent MD on a heavy-atom PDB structure.
 
     Args:
@@ -61,12 +61,14 @@ def run_md(pdb_path, out_dir, md_ns, temp_K=310.0, n_steps_min=1000):
         modeller = app.Modeller(pdb.topology, pdb.positions)
         modeller.addHydrogens(forcefield)
 
+        # gbn2.xml is already loaded in ForceField; do not pass implicitSolvent
+        # here — OpenMM 8.x raises if you specify both the XML and the flag.
+        # HBonds constraints remove high-frequency H-X oscillations that blow
+        # up the integrator when reconstructed sidechains have clashes.
         system = forcefield.createSystem(
             modeller.topology,
             nonbondedMethod=app.NoCutoff,
-            implicitSolvent=app.GBn2,
-            soluteDielectric=1.0,
-            solventDielectric=78.5,
+            constraints=app.HBonds,
             hydrogenMass=1.5 * unit.amu,
         )
         integrator = omm.LangevinMiddleIntegrator(
