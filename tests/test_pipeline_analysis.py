@@ -94,3 +94,42 @@ def test_analyze_explore_filters_unstable(tmp_path, monkeypatch):
     assert summary_path.exists()
     summary = json.loads(summary_path.read_text())
     assert summary["n_stable"] == 2
+
+
+def test_analyze_fes_boltzmann_inversion(tmp_path, monkeypatch):
+    """FES minimum is 0.0 and values are non-negative."""
+    from lsmd.pipeline_analysis import analyze_fes
+    from lsmd.cv_guidance import CVSpace
+    import torch
+
+    # Build a tiny CVSpace (5 residues, n_pc=2) and save it
+    rng = torch.Generator(); rng.manual_seed(0)
+    ca_ref = torch.randn(20, 5, 3, generator=rng)
+    cv_space = CVSpace(n_pc=2)
+    cv_space.fit(ca_ref)
+    cv_basis_path = str(tmp_path / "cv_basis.pt")
+    cv_space.save(cv_basis_path)
+
+    # Fake MD runs: 3 stable, each with known CA coords
+    md_runs = tmp_path / "md_runs"
+    n_res = 5
+
+    def _mock_load_all_ca(md_runs_dir, n_frames_per_run=10):
+        # Return synthetic frames without loading real DCD files
+        all_frames = torch.randn(30, n_res, 3, generator=rng)
+        return all_frames, 30
+
+    import lsmd.pipeline_analysis as pa
+    monkeypatch.setattr(pa, "_load_all_ca_frames", _mock_load_all_ca)
+
+    out_dir = tmp_path / "fes"
+    result = analyze_fes(str(md_runs), cv_basis_path, str(out_dir), temp_K=310.0, n_bins=10)
+
+    assert result["n_frames_stable"] == 30
+    assert result["fes_min_kcal"] == pytest.approx(0.0)
+    assert result["fes_max_kcal"] >= 0.0
+    assert (out_dir / "fes.npy").exists()
+    fes = np.load(str(out_dir / "fes.npy"))
+    assert fes.shape == (10, 10)
+    assert fes.min() == pytest.approx(0.0, abs=1e-6)
+    assert (fes >= 0).all()

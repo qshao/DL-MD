@@ -153,3 +153,135 @@ def analyze_explore(md_runs_dir, out_dir, rmsd_cutoff_A=2.0):
         json.dump(summary, fh, indent=2)
     print(f"explore: {n_stable}/{n_attempted} stable → {len(unique_labels)} clusters")
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Helpers for FES and kinetics: load all frames from stable runs
+# ---------------------------------------------------------------------------
+
+def _load_all_ca_frames(md_runs_dir, n_frames_per_run=None):
+    """Load all Cα frames from every stable MD run.
+
+    Returns:
+        all_frames: torch.Tensor [T, N, 3] in Å
+        n_frames:   int — total frames loaded
+    """
+    import torch
+    import mdtraj as md
+
+    frame_list = []
+    for run_id in sorted(os.listdir(md_runs_dir)):
+        metrics_path = os.path.join(md_runs_dir, run_id, "metrics.json")
+        if not os.path.exists(metrics_path):
+            continue
+        with open(metrics_path) as fh:
+            m = json.load(fh)
+        if not m.get("stable", False):
+            continue
+        traj_path = os.path.join(md_runs_dir, run_id, "trajectory.dcd")
+        top_path  = os.path.join(md_runs_dir, run_id, "topology.pdb")
+        if not os.path.exists(traj_path):
+            continue
+        traj   = md.load(traj_path, top=top_path)
+        ca_idx = traj.topology.select("name CA")
+        ca_nm  = traj.atom_slice(ca_idx).xyz          # [F, N, 3] nm
+        ca_A   = torch.tensor(ca_nm * 10.0)           # → Å
+        if n_frames_per_run is not None:
+            ca_A = ca_A[:n_frames_per_run]
+        frame_list.append(ca_A)
+
+    if not frame_list:
+        import torch
+        return torch.zeros(0), 0
+    all_frames = torch.cat(frame_list, dim=0)   # [T, N, 3]
+    return all_frames, all_frames.shape[0]
+
+
+# ---------------------------------------------------------------------------
+# FES: free energy surface over CV space
+# ---------------------------------------------------------------------------
+
+_kB_KCAL = 0.001987   # kcal / (mol · K)
+
+
+def analyze_fes(md_runs_dir, cv_basis_path, out_dir,
+                temp_K=310.0, n_bins=50):
+    """Estimate free energy surface by projecting MD frames onto CV space.
+
+    Args:
+        md_runs_dir (str):   Directory with per-run MD subdirs.
+        cv_basis_path (str): Path to cv_basis.pt written by explore_conformations.py.
+        out_dir (str):       Output directory.
+        temp_K (float):      Temperature for Boltzmann inversion (default 310.0).
+        n_bins (int):        Histogram bins per CV axis (default 50).
+
+    Returns:
+        dict: n_frames_total, n_frames_stable, temp_K, fes_min_kcal, fes_max_kcal, n_bins.
+    """
+    import torch
+    from lsmd.cv_guidance import CVSpace
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    cv_space = CVSpace.load(cv_basis_path)
+    cv_space.to("cpu")
+
+    all_frames, n_frames = _load_all_ca_frames(md_runs_dir)
+
+    if n_frames == 0:
+        print("fes: no stable frames found")
+        summary = {"n_frames_stable": 0, "fes_min_kcal": None, "fes_max_kcal": None,
+                   "temp_K": temp_K, "n_bins": n_bins}
+        with open(os.path.join(out_dir, "fes_summary.json"), "w") as fh:
+            json.dump(summary, fh, indent=2)
+        return summary
+
+    # Project all frames onto first two CVs (PC1, PC2)
+    with torch.no_grad():
+        cv_all = cv_space.project_batch(all_frames)   # [T, n_cv+2]
+    pc1 = cv_all[:, 0].numpy()
+    pc2 = cv_all[:, 1].numpy()
+
+    # 2D histogram
+    hist, x_edges, y_edges = np.histogram2d(
+        pc1, pc2, bins=n_bins, density=True
+    )
+
+    # Boltzmann inversion: F = -kT ln P, shift minimum to 0
+    kT = _kB_KCAL * temp_K
+    with np.errstate(divide="ignore"):
+        fes = -kT * np.log(hist + 1e-12)
+    fes -= fes.min()
+
+    np.save(os.path.join(out_dir, "fes.npy"), fes.astype(np.float32))
+    np.save(os.path.join(out_dir, "cv_edges.npy"),
+            np.array([x_edges, y_edges], dtype=object))
+
+    # Plot
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(6, 5))
+        pcm = ax.pcolormesh(x_edges, y_edges, fes.T, cmap="viridis_r", vmin=0)
+        plt.colorbar(pcm, ax=ax, label="FES (kcal/mol)")
+        ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+        ax.set_title(f"FES — {n_frames} frames, T={temp_K} K")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "fes.png"), dpi=150)
+        plt.close(fig)
+    except ImportError:
+        pass
+
+    summary = {
+        "n_frames_total": n_frames,
+        "n_frames_stable": n_frames,
+        "temp_K": temp_K,
+        "n_bins": n_bins,
+        "fes_min_kcal": round(float(fes.min()), 4),
+        "fes_max_kcal": round(float(fes.max()), 4),
+    }
+    with open(os.path.join(out_dir, "fes_summary.json"), "w") as fh:
+        json.dump(summary, fh, indent=2)
+    print(f"fes: {n_frames} frames → FES max {fes.max():.2f} kcal/mol")
+    return summary
