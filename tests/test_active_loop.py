@@ -43,7 +43,7 @@ from lsmd.active_loop import (
 
 
 def _write_tiny_pdb(path, n_res=5):
-    """Write a minimal CA-only PDB with ideal 3.8 Å bonds."""
+    """Write a minimal backbone PDB (N, CA, C, O per residue)."""
     lines = ["REMARK tiny test PDB"]
     res_names = ["ALA", "GLY", "VAL", "LEU", "ILE"][:n_res]
     atom_names_full = [" N  ", " CA ", " C  ", " O  "]

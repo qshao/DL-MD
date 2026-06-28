@@ -20,6 +20,7 @@ import torch
 from lsmd import data, geometry as g
 from lsmd.cv_guidance import CVSpace
 from lsmd.transfer_eval import load_checkpoint, rollout
+from lsmd.vocab import residue_indices
 
 
 # ---------------------------------------------------------------------------
@@ -72,9 +73,7 @@ def _pdb_to_shard(pdb_path: str, dt_ps: float = 200.0) -> dict:
 
     R, t = g.build_frames(N_pos, CA_pos, C_pos)  # [1, N, 3, 3], [1, N, 3]
 
-    uniq     = sorted(set(res_names))
-    type_map = {nm: i for i, nm in enumerate(uniq)}
-    res_type  = torch.tensor([type_map[nm] for nm in res_names], dtype=torch.long)
+    res_type  = residue_indices(res_names)
     chain_id  = torch.tensor(chain_ids, dtype=torch.long)
     res_index = torch.arange(len(res_names), dtype=torch.long)
 
@@ -183,7 +182,6 @@ def bootstrap_check(pdb_path: str, checkpoint: str, device: str,
     from lsmd.md_validation import run_md
 
     shard_1f = _pdb_to_shard(pdb_path)
-    N = shard_1f["n_res"]
 
     # Load model
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
