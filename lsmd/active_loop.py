@@ -303,7 +303,13 @@ def shard_from_md_runs(md_run_dirs: list, dt_ps: float = 200.0):
 
         try:
             traj = md.load(traj_path, top=top_path)
-            dt_traj_ps = float(traj.timestep)
+            # MDTraj's traj.timestep for OpenMM DCDs reflects the integration
+            # step, not the reporter interval — use metrics.json md_ns instead.
+            md_ns_run = m.get("md_ns")
+            if md_ns_run and traj.n_frames > 1:
+                dt_traj_ps = md_ns_run * 1000.0 / traj.n_frames
+            else:
+                dt_traj_ps = float(traj.timestep)
             stride = max(1, round(dt_ps / dt_traj_ps))
             traj_s = traj[::stride]
 
