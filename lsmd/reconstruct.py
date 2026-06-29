@@ -170,6 +170,22 @@ class AllAtomReconstructor:
         self._prot_ha = np.array(prot_ha, dtype=int)
         self._out_top = traj.atom_slice(self._prot_ha).topology
 
+        # Residue label and peptide-bond indices in the output heavy-atom array.
+        # Used by interresidue_clash_free to check atom overlaps and C–N distances.
+        _ha_to_out = np.full(int(self._prot_ha.max()) + 1, -1, dtype=np.int32)
+        for k, ai in enumerate(self._prot_ha):
+            _ha_to_out[ai] = k
+
+        _res_map = np.full(int(self._prot_ha.max()) + 1, -1, dtype=np.int32)
+        for res_i, atom_idxs in enumerate(all_heavy_idx):
+            for ai in atom_idxs:
+                _res_map[ai] = res_i
+        self._res_label = _res_map[self._prot_ha]   # [N_heavy_out] residue index
+
+        # Output-array indices of backbone C and N atoms (for peptide-bond check)
+        self._c_out_idx = np.array([_ha_to_out[ai] for ai in c_idx], dtype=np.int32)
+        self._n_out_idx = np.array([_ha_to_out[ai] for ai in n_idx], dtype=np.int32)
+
         # Cache full xyz in Å  [F, N_atoms, 3]
         xyz_nm = np.array(traj.xyz)
         self._xyz_A = torch.tensor(xyz_nm * 10.0, dtype=torch.float32)
@@ -268,6 +284,66 @@ class AllAtomReconstructor:
                 xyz[ai] = xyz[ai] + shift
 
         return xyz[self._prot_ha].numpy()
+
+    # ------------------------------------------------------------------
+
+    def interresidue_clash_free(self, xyz_A: np.ndarray,
+                                clash_A: float = 1.2,
+                                max_clashes_per_res: float = 7.0,
+                                max_cn_A: float = 30.0) -> bool:
+        """Check that a reconstructed structure is physically plausible.
+
+        Two independent checks, either of which can fail:
+
+        1. **Overlap count** — counts non-adjacent-residue heavy-atom pairs
+           within clash_A Å (default 1.2 Å).  Returns False if the count
+           exceeds max_clashes_per_res × n_residues.  CA-only rigid-translation
+           reconstruction (reconstruct_frame_ca) can produce thousands of
+           overlapping pairs when adjacent Cα displacements differ greatly;
+           OpenMM minimisation cannot recover structures with extreme overlap.
+
+        2. **Peptide-bond stretch** — checks the C(i)–N(i+1) distance for each
+           pair of consecutive residues.  Returns False if any exceeds max_cn_A
+           (default 30 Å).  This catches model-collapse rounds where the
+           diffusion model outputs Cα positions tens–hundreds of Å from the
+           template, producing impossibly stretched peptide bonds before H
+           addition even begins.
+
+        Args:
+            xyz_A:               [N_heavy, 3] heavy-atom positions in Å.
+            clash_A:             severe overlap distance in Å (default 1.2 Å).
+            max_clashes_per_res: overlap-pair budget per residue (default 7.0;
+                                 successful AdK structures average ~3–5).
+            max_cn_A:            maximum allowed C–N peptide-bond distance in Å
+                                 (default 30 Å; collapsed-model structures
+                                 show C–N distances of 100–1000+ Å).
+
+        Returns:
+            True if both checks pass.
+        """
+        # Check 2 first — O(P) and catches model-collapse proposals cheaply
+        # before the O(N²) KD-tree scan.
+        C_pos = xyz_A[self._c_out_idx[:-1]]   # C of residue i   [P-1, 3]
+        N_pos = xyz_A[self._n_out_idx[1:]]    # N of residue i+1 [P-1, 3]
+        if float(np.linalg.norm(C_pos - N_pos, axis=1).max()) > max_cn_A:
+            return False
+
+        # Check 1 — KD-tree overlap count
+        try:
+            from scipy.spatial import cKDTree
+        except ImportError:
+            return True  # scipy not installed — skip gracefully
+
+        tree = cKDTree(xyz_A)
+        pairs = tree.query_pairs(clash_A, output_type="ndarray")
+        if len(pairs) == 0:
+            return True
+
+        ri = self._res_label[pairs[:, 0]]
+        rj = self._res_label[pairs[:, 1]]
+        n_nonadj = int((np.abs(ri - rj) > 1).sum())
+        max_allowed = int(max_clashes_per_res * self.P)
+        return n_nonadj <= max_allowed
 
     # ------------------------------------------------------------------
 

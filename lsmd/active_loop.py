@@ -130,6 +130,29 @@ def _geometry_pass_rate(proposals: list, ref_bond_A: float,
     return n_pass / len(proposals)
 
 
+def _ca_backbone_ok(ca: torch.Tensor, max_bond_A: float = 30.0) -> bool:
+    """Return True if no adjacent Cα–Cα distance exceeds max_bond_A Å.
+
+    Catches model-collapse proposals where the diffusion model outputs Cα
+    positions tens or hundreds of Å from the template.  With CA-only rigid-
+    translation reconstruction (reconstruct_frame_ca), an adjacent Cα pair
+    displaced by D Å produces a peptide C–N bond of ~D Å; for D ≫ 10 Å no
+    amount of OpenMM minimisation can recover it.
+
+    Args:
+        ca:          [N, 3] Cα positions in Å.
+        max_bond_A:  maximum allowed adjacent Cα–Cα distance (default 30 Å).
+                     Round-0 proposals from an untuned universal model have bonds
+                     up to ~14 Å and still sometimes succeed; round-1 collapsed
+                     proposals have bonds > 30 Å and universally fail.
+
+    Returns:
+        True if max adjacent bond ≤ max_bond_A.
+    """
+    bonds = (ca[1:] - ca[:-1]).float().norm(dim=-1)
+    return bool(bonds.max().item() <= max_bond_A)
+
+
 def _min_rmsd_kabsch(query: torch.Tensor, refs: torch.Tensor) -> float:
     """Minimum Cα RMSD from query [N,3] to any frame in refs [F,N,3] via Kabsch.
 

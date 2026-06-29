@@ -34,7 +34,7 @@ import numpy as np
 import torch
 
 from lsmd.active_loop import (
-    _pdb_to_shard, _min_rmsd_kabsch, bootstrap_check,
+    _pdb_to_shard, _min_rmsd_kabsch, _ca_backbone_ok, bootstrap_check,
     shard_from_md_runs, build_replay_shard, check_convergence,
 )
 from lsmd.cv_guidance import CVSpace
@@ -169,27 +169,61 @@ def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
         Path(done_stamp).touch()
         return None
 
-    # Random selection from novel candidates
-    batch_size = min(args.batch_size, n_novel)
-    selected_ca = random.sample(novel, batch_size)
-    print(f"[round {round_num}] generated={args.proposals} novel={n_novel} selected={batch_size}",
-          flush=True)
+    # ── 5.5. Cα backbone geometry gate ───────────────────────────────────────
+    novel_geo = [ca for ca in novel if _ca_backbone_ok(ca)]
+    n_geo = len(novel_geo)
+    n_geo_rejected = n_novel - n_geo
+    if n_geo_rejected:
+        print(f"[round {round_num}] Ca-geometry gate: {n_geo_rejected}/{n_novel} rejected "
+              f"({n_geo} passed)", flush=True)
+
+    if n_geo == 0:
+        print(f"[round {round_num}] No proposals passed Ca-geometry gate — skipping round.",
+              flush=True)
+        _write_summary(round_dir, round_num, args, proposals_ca, [],
+                       md_success=0, new_frames=0, total_md_ns=prev_total_md_ns,
+                       novel_fraction=0.0, fes_js=None, converged=False,
+                       prev_accumulated_t=prev_accumulated_t, accumulated_t=accumulated_t)
+        Path(done_stamp).touch()
+        return {
+            "next_ckpt":      current_ckpt,
+            "total_md_ns":    prev_total_md_ns,
+            "novel_fraction": 0.0,
+            "accumulated_t":  accumulated_t,
+            "converged":      False,
+            "prev_hist":      prev_hist,
+        }
+
+    # Random selection from geometry-valid novel candidates
+    batch_size = min(args.batch_size, n_geo)
+    selected_ca = random.sample(novel_geo, batch_size)
+    print(f"[round {round_num}] generated={args.proposals} novel={n_novel} "
+          f"geo_ok={n_geo} selected={batch_size}", flush=True)
 
     # ── 6. Reconstruct all-atom structures ──────────────────────────────────
     allatom_dir = os.path.join(round_dir, "allatom")
     os.makedirs(allatom_dir, exist_ok=True)
     rec = AllAtomReconstructor(args.pdb, args.pdb)  # use input PDB as template
+    traj_tmp = md.load(args.pdb)
+    ha_idx   = traj_tmp.topology.select("protein and not type H")
+    ha_top   = traj_tmp.atom_slice(ha_idx).topology
     allatom_pdbs = []
-    for j, ca_struct in enumerate(selected_ca):
+    n_allatom_rejected = 0
+    j_out = 0
+    for ca_struct in selected_ca:
         xyz = rec.reconstruct_frame_ca(ca_struct)   # numpy [N_heavy, 3]
-        traj_tmp = md.load(args.pdb)
-        top_tmp  = traj_tmp.topology
-        ha_idx   = top_tmp.select("protein and not type H")
-        xyz_nm   = xyz / 10.0                        # Å → nm
-        t_out = md.Trajectory(xyz_nm[None], traj_tmp.atom_slice(ha_idx).topology)
-        out_pdb = os.path.join(allatom_dir, f"struct_{j:04d}.pdb")
+        if not rec.interresidue_clash_free(xyz):
+            n_allatom_rejected += 1
+            continue
+        xyz_nm = xyz / 10.0                         # Å → nm
+        t_out  = md.Trajectory(xyz_nm[None], ha_top)
+        out_pdb = os.path.join(allatom_dir, f"struct_{j_out:04d}.pdb")
         t_out.save_pdb(out_pdb)
         allatom_pdbs.append(out_pdb)
+        j_out += 1
+    if n_allatom_rejected:
+        print(f"[round {round_num}] all-atom clash gate: {n_allatom_rejected}/{batch_size} "
+              f"rejected before MD", flush=True)
 
     # ── 7. Run MD validation (parallel) ──────────────────────────────────────
     md_runs_dir = os.path.join(round_dir, "md_runs")
