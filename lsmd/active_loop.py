@@ -246,17 +246,29 @@ def bootstrap_check(pdb_path: str, checkpoint: str, device: str,
               "falling back to 1-frame shard", flush=True)
         return shard_1f
 
-    # Load bootstrap trajectory → multi-frame shard
+    # Load bootstrap trajectory → multi-frame shard at 50 ps stride
     traj_path = os.path.join(out_dir, "trajectory.dcd")
     top_path  = os.path.join(out_dir, "topology.pdb")
     frames    = data.load_frames(traj_path, top_path)
+
+    # Stride to 50 ps spacing (same target as shard_from_md_runs).
+    # data.load_frames returns all frames; compute actual dt from bootstrap_ns.
+    target_dt_ps = 50.0
+    n_raw = int(frames["R"].shape[0])
+    actual_dt_ps = bootstrap_ns * 1000.0 / n_raw if n_raw > 1 else target_dt_ps
+    stride = max(1, round(target_dt_ps / actual_dt_ps))
+    if stride > 1:
+        frames = {k: (v[::stride] if isinstance(v, torch.Tensor) and v.ndim > 0
+                      and v.shape[0] == n_raw else v)
+                  for k, v in frames.items()}
+
     # data.load_frames() returns res_type with a per-file local vocabulary.
     # Override res_type, chain_id, and res_index with canonical values from
     # _pdb_to_shard() (which uses lsmd.vocab.residue_indices()) so the model
     # always receives the same residue encoding regardless of bootstrap path.
     return {
         **frames,
-        "dt":       200.0,
+        "dt":       target_dt_ps,
         "seq":      shard_1f["seq"],
         "n_res":    shard_1f["n_res"],
         "res_type": shard_1f["res_type"],
