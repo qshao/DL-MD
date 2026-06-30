@@ -445,14 +445,20 @@ def main():
 
     if 0 not in completed:
         os.makedirs(os.path.join(args.out, "round_0"), exist_ok=True)
-        shard_1f = bootstrap_check(
-            pdb_path=args.pdb,
-            checkpoint=args.checkpoint,
-            device=args.device,
-            bootstrap_ns=args.bootstrap_ns,
-            out_dir=os.path.join(args.out, "round_0", "bootstrap"),
-        )
-        torch.save(shard_1f, bootstrap_shard_path)
+        if os.path.exists(bootstrap_shard_path):
+            # Bootstrap shard pre-populated (e.g. copied from a prior run) — skip MD.
+            print("[bootstrap_check] bootstrap_shard.pt found; skipping bootstrap MD.",
+                  flush=True)
+            shard_1f = torch.load(bootstrap_shard_path, map_location="cpu", weights_only=False)
+        else:
+            shard_1f = bootstrap_check(
+                pdb_path=args.pdb,
+                checkpoint=args.checkpoint,
+                device=args.device,
+                bootstrap_ns=args.bootstrap_ns,
+                out_dir=os.path.join(args.out, "round_0", "bootstrap"),
+            )
+            torch.save(shard_1f, bootstrap_shard_path)
         protein_meta = {k: shard_1f[k]
                         for k in ("res_type", "chain_id", "res_index", "seq", "n_res")}
         torch.save(protein_meta, protein_meta_path)
