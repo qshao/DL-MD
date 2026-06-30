@@ -249,7 +249,7 @@ def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
     print(f"[round {round_num}] MD success: {n_md_success}/{batch_size}", flush=True)
 
     # ── 8. Extract frames and build replay shard ───────────────────────────
-    new_R, new_t = shard_from_md_runs(md_run_dirs, dt_ps=200)
+    new_R, new_t = shard_from_md_runs(md_run_dirs, dt_ps=50)
     new_frames = len(new_t) if new_t.shape[0] > 0 else 0
 
     if new_frames > 0:
@@ -265,7 +265,7 @@ def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
         else:
             replay_shard = build_replay_shard(
                 new_R, new_t, accumulated_pt, protein_meta,
-                replay_cap=args.replay_cap, dt_ps=200.0
+                replay_cap=args.replay_cap, dt_ps=50.0
             )
             torch.save(replay_shard, replay_shard_path)
             frames_appended_stamp.touch()
