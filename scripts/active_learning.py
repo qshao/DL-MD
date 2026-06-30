@@ -97,8 +97,10 @@ def _filter_novel(proposals: list, accumulated_t: torch.Tensor,
 def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
               shard_1f: dict, accumulated_pt: str, prev_total_md_ns: float,
               prev_novel_fraction: float, prev_accumulated_t,
-              prev_hist=None):
+              prev_hist=None, md_ns: float = None):
     """Execute one active learning round; return updated state or None if converged."""
+    if md_ns is None:
+        md_ns = args.md_ns
     round_dir  = os.path.join(args.out, f"round_{round_num}")
     done_stamp = os.path.join(round_dir, ".done")
     os.makedirs(round_dir, exist_ok=True)
@@ -232,7 +234,7 @@ def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
     def _run_one(j_pdb):
         j, pdb = j_pdb
         run_dir_j = os.path.join(md_runs_dir, f"struct_{j:04d}")
-        run_md(pdb, run_dir_j, md_ns=args.md_ns, temp_K=310.0)
+        run_md(pdb, run_dir_j, md_ns=md_ns, temp_K=310.0)
         return run_dir_j
 
     with ThreadPoolExecutor(max_workers=args.n_parallel) as pool:
@@ -293,7 +295,7 @@ def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
               flush=True)
 
     # ── 10. Check stopping criterion ────────────────────────────────────────
-    total_md_ns = prev_total_md_ns + n_md_success * args.md_ns
+    total_md_ns = prev_total_md_ns + n_md_success * md_ns
     novel_fraction = n_novel / len(proposals_ca)
 
     # Load updated accumulated_t for FES criterion
@@ -398,7 +400,11 @@ def parse_args():
     ap.add_argument("--batch-size",      type=int,   default=20,
                     help="Number of novel proposals to validate with MD per round.")
     ap.add_argument("--md-ns",           type=float, default=10.0,
-                    help="MD validation length per structure (nanoseconds).")
+                    help="MD validation length per structure (nanoseconds). "
+                         "Ignored when --md-ns-schedule is given.")
+    ap.add_argument("--md-ns-schedule",  type=str,   default=None,
+                    help="Comma-separated MD lengths (ns) per round; last value repeats "
+                         "for all later rounds. E.g. '5,3,2,1'. Overrides --md-ns.")
     ap.add_argument("--replay-cap",      type=int,   default=5000,
                     help="Max frames in replay shard (controls fine-tuning cost).")
     ap.add_argument("--novel-threshold", type=float, default=1.5,
@@ -493,6 +499,10 @@ def main():
             prev_ckpt = os.path.join(args.out, f"round_{round_num - 1}", "checkpoint.pt")
             current_ckpt = prev_ckpt if os.path.exists(prev_ckpt) else args.checkpoint
 
+        _sched = ([float(x) for x in args.md_ns_schedule.split(",")]
+                  if args.md_ns_schedule else [args.md_ns])
+        md_ns_this_round = _sched[min(round_num, len(_sched) - 1)]
+
         result = run_round(
             round_num=round_num,
             args=args,
@@ -504,6 +514,7 @@ def main():
             prev_novel_fraction=novel_fraction,
             prev_accumulated_t=prev_t,
             prev_hist=prev_hist,
+            md_ns=md_ns_this_round,
         )
 
         if result is None:
