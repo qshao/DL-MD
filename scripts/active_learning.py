@@ -97,7 +97,7 @@ def _filter_novel(proposals: list, accumulated_t: torch.Tensor,
 def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
               shard_1f: dict, accumulated_pt: str, prev_total_md_ns: float,
               prev_novel_fraction: float, prev_accumulated_t,
-              prev_hist=None, md_ns: float = None):
+              prev_hist=None, md_ns: float = None, last_good_ckpt: str = None):
     """Execute one active learning round; return updated state or None if converged."""
     if md_ns is None:
         md_ns = args.md_ns
@@ -182,18 +182,25 @@ def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
     if n_geo == 0:
         print(f"[round {round_num}] No proposals passed Ca-geometry gate — skipping round.",
               flush=True)
+        # Revert to the last checkpoint that produced valid proposals so the
+        # next round doesn't keep using this collapsed checkpoint forever.
+        fallback = last_good_ckpt if last_good_ckpt else current_ckpt
+        if fallback != current_ckpt:
+            print(f"[round {round_num}] Reverting to last-good checkpoint: {fallback}",
+                  flush=True)
         _write_summary(round_dir, round_num, args, proposals_ca, [],
                        md_success=0, new_frames=0, total_md_ns=prev_total_md_ns,
                        novel_fraction=0.0, fes_js=None, converged=False,
                        prev_accumulated_t=prev_accumulated_t, accumulated_t=accumulated_t)
         Path(done_stamp).touch()
         return {
-            "next_ckpt":      current_ckpt,
-            "total_md_ns":    prev_total_md_ns,
-            "novel_fraction": 0.0,
-            "accumulated_t":  accumulated_t,
-            "converged":      False,
-            "prev_hist":      prev_hist,
+            "next_ckpt":         fallback,
+            "total_md_ns":       prev_total_md_ns,
+            "novel_fraction":    0.0,
+            "accumulated_t":     accumulated_t,
+            "converged":         False,
+            "prev_hist":         prev_hist,
+            "proposals_geo_ok":  False,
         }
 
     # Random selection from geometry-valid novel candidates
@@ -337,12 +344,13 @@ def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
     Path(done_stamp).touch()
 
     return {
-        "next_ckpt":      next_ckpt,
-        "total_md_ns":    total_md_ns,
-        "novel_fraction": novel_fraction,
-        "accumulated_t":  acc_now,
-        "converged":      converged,
-        "prev_hist":      new_prev_hist,
+        "next_ckpt":        next_ckpt,
+        "total_md_ns":      total_md_ns,
+        "novel_fraction":   novel_fraction,
+        "accumulated_t":    acc_now,
+        "converged":        converged,
+        "prev_hist":        new_prev_hist,
+        "proposals_geo_ok": True,   # proposals passed Cα gate; caller updates last_good_ckpt
     }
 
 
@@ -491,6 +499,38 @@ def main():
         if ph_path.exists():
             prev_hist = np.load(str(ph_path))
 
+    # ── Checkpoint state files ────────────────────────────────────────────────
+    # current_ckpt.txt  — the checkpoint to use for proposals in the next round.
+    # last_good_ckpt.txt — last checkpoint whose proposals passed the Cα gate;
+    #                      used as a fallback when a fine-tuned checkpoint causes
+    #                      100 % Cα collapse so we never get stuck in a loop.
+    ckpt_state_file     = os.path.join(args.out, "current_ckpt.txt")
+    last_good_ckpt_file = os.path.join(args.out, "last_good_ckpt.txt")
+
+    if os.path.exists(ckpt_state_file):
+        with open(ckpt_state_file) as f:
+            current_ckpt = f.read().strip()
+    else:
+        # Bootstrap: walk back through completed rounds to seed current_ckpt.
+        current_ckpt = args.checkpoint
+        for r in sorted(completed.keys(), reverse=True):
+            r_ckpt = os.path.join(args.out, f"round_{r}", "checkpoint.pt")
+            if os.path.exists(r_ckpt):
+                current_ckpt = r_ckpt
+                break
+
+    if os.path.exists(last_good_ckpt_file):
+        with open(last_good_ckpt_file) as f:
+            last_good_ckpt = f.read().strip()
+    else:
+        last_good_ckpt = args.checkpoint  # base is always a safe fallback
+
+    def _save_ckpt_state(cur: str, good: str) -> None:
+        with open(ckpt_state_file, "w") as f:
+            f.write(cur)
+        with open(last_good_ckpt_file, "w") as f:
+            f.write(good)
+
     # ── Round loop ────────────────────────────────────────────────────────────
     for round_num in range(args.rounds):
         if round_num in completed:
@@ -499,21 +539,6 @@ def main():
                       flush=True)
                 break
             continue  # already done, not converged
-
-        # Determine current checkpoint — walk back through all prior rounds to
-        # find the most recent one that actually produced a fine-tuned checkpoint.
-        # Collapsed rounds (Cα gate rejected all proposals) leave no checkpoint,
-        # so a simple round_{N-1} lookup would silently fall back to the base
-        # every time a collapse occurs, breaking the accumulation chain.
-        if round_num == 0:
-            current_ckpt = args.checkpoint
-        else:
-            current_ckpt = args.checkpoint
-            for r in range(round_num - 1, -1, -1):
-                r_ckpt = os.path.join(args.out, f"round_{r}", "checkpoint.pt")
-                if os.path.exists(r_ckpt):
-                    current_ckpt = r_ckpt
-                    break
 
         _sched = ([float(x) for x in args.md_ns_schedule.split(",")]
                   if args.md_ns_schedule else [args.md_ns])
@@ -531,6 +556,7 @@ def main():
             prev_accumulated_t=prev_t,
             prev_hist=prev_hist,
             md_ns=md_ns_this_round,
+            last_good_ckpt=last_good_ckpt,
         )
 
         if result is None:
@@ -540,8 +566,17 @@ def main():
         total_md_ns    = result["total_md_ns"]
         novel_fraction = result["novel_fraction"]
         prev_t         = result["accumulated_t"]
-        current_ckpt   = result["next_ckpt"]
         prev_hist      = result["prev_hist"]
+
+        # Update last_good_ckpt when proposals passed the Cα gate.
+        # Record current_ckpt BEFORE overwriting it — that's the checkpoint
+        # whose proposals we just validated.
+        if result.get("proposals_geo_ok"):
+            last_good_ckpt = current_ckpt
+
+        current_ckpt   = result["next_ckpt"]
+
+        _save_ckpt_state(current_ckpt, last_good_ckpt)
 
         if result["converged"]:
             print(f"[active_learning] stopping criterion '{args.stop}' met at round {round_num}.",
