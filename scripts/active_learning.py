@@ -279,7 +279,7 @@ def run_round(round_num: int, args, current_ckpt: str, protein_meta: dict,
             "--shard",   replay_shard_path,
             "--resume",  args.checkpoint,   # always from universal base
             "--steps",   str(args.fine_tune_steps),
-            "--lr",      "1e-4",
+            "--lr",      str(args.fine_tune_lr),
             "--hidden",  "256",
             "--layers",  "6",
             "--lags_ps", "200", "1000", "5000",
@@ -416,6 +416,8 @@ def parse_args():
     ap.add_argument("--bootstrap-ns",    type=float, default=10.0,
                     help="Bootstrap MD length (ns) if universal model geometry is poor.")
     ap.add_argument("--fine-tune-steps", type=int,   default=2000)
+    ap.add_argument("--fine-tune-lr",   type=float, default=1e-5,
+                    help="Learning rate for fine-tuning (default 1e-5; lower = more conservative).")
     ap.add_argument("--n-parallel",      type=int,   default=4,
                     help="Parallel MD worker threads.")
     ap.add_argument("--device",          default="cuda")
@@ -492,12 +494,20 @@ def main():
                 break
             continue  # already done, not converged
 
-        # Determine current checkpoint
+        # Determine current checkpoint — walk back through all prior rounds to
+        # find the most recent one that actually produced a fine-tuned checkpoint.
+        # Collapsed rounds (Cα gate rejected all proposals) leave no checkpoint,
+        # so a simple round_{N-1} lookup would silently fall back to the base
+        # every time a collapse occurs, breaking the accumulation chain.
         if round_num == 0:
             current_ckpt = args.checkpoint
         else:
-            prev_ckpt = os.path.join(args.out, f"round_{round_num - 1}", "checkpoint.pt")
-            current_ckpt = prev_ckpt if os.path.exists(prev_ckpt) else args.checkpoint
+            current_ckpt = args.checkpoint
+            for r in range(round_num - 1, -1, -1):
+                r_ckpt = os.path.join(args.out, f"round_{r}", "checkpoint.pt")
+                if os.path.exists(r_ckpt):
+                    current_ckpt = r_ckpt
+                    break
 
         _sched = ([float(x) for x in args.md_ns_schedule.split(",")]
                   if args.md_ns_schedule else [args.md_ns])
