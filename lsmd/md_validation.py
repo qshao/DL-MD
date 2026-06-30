@@ -93,19 +93,26 @@ def _prepare_pdb(pdb_path: str) -> str:
     return tmp.name
 
 
-def run_md(pdb_path, out_dir, md_ns, temp_K=310.0, n_steps_min=5000):
+def run_md(pdb_path, out_dir, md_ns, temp_K=310.0, n_steps_min=5000,
+           drift_check_ns=0.5, drift_slope_A_ns=4.0, drift_consec=3):
     """Run AMBER14/GBn2 implicit-solvent MD on a heavy-atom PDB structure.
 
     Args:
-        pdb_path (str):   Path to all-atom heavy-atom PDB (no H, no solvent).
-        out_dir (str):    Directory for trajectory.dcd, topology.pdb, metrics.json.
-        md_ns (float):    Simulation length in nanoseconds.
-        temp_K (float):   Temperature in Kelvin (default 310.0).
-        n_steps_min (int):Energy minimisation steps (default 1000).
+        pdb_path (str):        Path to all-atom heavy-atom PDB (no H, no solvent).
+        out_dir (str):         Directory for trajectory.dcd, topology.pdb, metrics.json.
+        md_ns (float):         Simulation length in nanoseconds.
+        temp_K (float):        Temperature in Kelvin (default 310.0).
+        n_steps_min (int):     Energy minimisation steps (default 5000).
+        drift_check_ns (float):Check interval for drift detection (default 0.5 ns).
+        drift_slope_A_ns (float): RMSD slope threshold in Å/ns; per-chunk slopes
+                               above this for drift_consec consecutive windows
+                               trigger early termination (default 4.0 Å/ns).
+        drift_consec (int):    Consecutive windows above slope threshold before
+                               early termination (default 3).
 
     Returns:
-        dict: id, md_ns, final_pe_kJ, rmsd_initial_A, rmsd_final_A,
-              rmsd_mean_A, rmsd_std_A, stable, error
+        dict: id, md_ns (actual simulated time), final_pe_kJ, rmsd_initial_A,
+              rmsd_final_A, rmsd_mean_A, rmsd_std_A, stable, error
     """
     struct_id = os.path.splitext(os.path.basename(pdb_path))[0]
     os.makedirs(out_dir, exist_ok=True)
@@ -197,15 +204,63 @@ def run_md(pdb_path, out_dir, md_ns, temp_K=310.0, n_steps_min=5000):
         report_interval = max(1, n_steps // 100)
         simulation.reporters.append(app.DCDReporter(traj_path, report_interval))
 
-        # Production MD
-        simulation.step(n_steps)
+        # Production MD — run in drift-check windows; terminate early if RMSD
+        # slope stays above threshold for drift_consec consecutive windows.
+        import mdtraj as md
+        import numpy as np
+        check_steps  = max(report_interval, int(drift_check_ns * 1e6 / 2))
+        n_chunks     = max(1, int(np.ceil(n_steps / check_steps)))
+        chunk_mean_rmsds: list = []
+        n_frames_prev        = 0
+        actual_ns            = md_ns   # updated if we stop early
+        consec_above         = 0
+
+        for ci in range(n_chunks):
+            steps_this = min(check_steps, n_steps - ci * check_steps)
+            if steps_this <= 0:
+                break
+            simulation.step(steps_this)
+
+            try:
+                traj_p  = md.load(traj_path, top=top_path)
+                ca_p    = traj_p.topology.select("name CA")
+                rmsd_p  = md.rmsd(traj_p.atom_slice(ca_p),
+                                  traj_p.atom_slice(ca_p), frame=0) * 10.0
+                n_new   = traj_p.n_frames - n_frames_prev
+                if n_new > 0:
+                    chunk_mean_rmsds.append(float(rmsd_p[n_frames_prev:].mean()))
+                    n_frames_prev = traj_p.n_frames
+            except Exception:
+                continue
+
+            # Need at least drift_consec windows before we can trigger
+            if len(chunk_mean_rmsds) < drift_consec:
+                continue
+
+            recent = chunk_mean_rmsds[-drift_consec:]
+            slope  = np.polyfit(
+                np.arange(drift_consec) * drift_check_ns, recent, 1
+            )[0]  # Å/ns
+            if slope > drift_slope_A_ns:
+                consec_above += 1
+            else:
+                consec_above = 0
+
+            if consec_above >= drift_consec:
+                actual_ns = (ci + 1) * drift_check_ns
+                print(
+                    f"[md] early stop at {actual_ns:.1f}/{md_ns:.1f} ns: "
+                    f"RMSD drift {slope:.1f} Å/ns, "
+                    f"last chunk mean {recent[-1]:.1f} Å",
+                    flush=True,
+                )
+                break
 
         # Final potential energy
         state_f = simulation.context.getState(getPositions=True, getEnergy=True)
         pe = state_f.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
 
-        # Per-frame RMSD via mdtraj (already installed)
-        import mdtraj as md
+        # Per-frame RMSD of the trajectory that was actually written
         traj = md.load(traj_path, top=top_path)
         ca_idx = traj.topology.select("name CA")
         ca_traj = traj.atom_slice(ca_idx)
@@ -213,6 +268,7 @@ def run_md(pdb_path, out_dir, md_ns, temp_K=310.0, n_steps_min=5000):
         rmsd_A  = rmsd_nm * 10.0                        # → Å
 
         result.update({
+            "md_ns":         actual_ns,
             "final_pe_kJ":   round(float(pe), 2),
             "rmsd_initial_A": 0.0,
             "rmsd_final_A":  round(float(rmsd_A[-1]), 4),

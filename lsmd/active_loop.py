@@ -281,7 +281,8 @@ def bootstrap_check(pdb_path: str, checkpoint: str, device: str,
 # shard_from_md_runs
 # ---------------------------------------------------------------------------
 
-def shard_from_md_runs(md_run_dirs: list, dt_ps: float = 200.0):
+def shard_from_md_runs(md_run_dirs: list, dt_ps: float = 200.0,
+                       max_drift_A_ns: float = 5.0, slope_window: int = 10):
     """Extract Cα backbone frames from completed OpenMM MD run directories.
 
     For each run directory that has a successful `metrics.json` (error == null)
@@ -289,9 +290,21 @@ def shard_from_md_runs(md_run_dirs: list, dt_ps: float = 200.0):
     extracts backbone SE(3) frames with `data.load_frames()`, and strides to
     approximately dt_ps ps between frames.
 
+    Frames are filtered by local RMSD slope: only frames whose local rate of
+    RMSD change (|dRMSD/dt| in Å/ns, estimated over a sliding window of
+    slope_window strided frames) is below max_drift_A_ns are retained.  This
+    discards frames during active unfolding while keeping early exploratory
+    frames and any post-transition stable basin — regardless of the absolute
+    RMSD from the reference structure, so large-amplitude conformational
+    transitions are not penalised.
+
     Args:
-        md_run_dirs: list of run directory paths (order does not matter).
-        dt_ps:       desired frame spacing in ps (default 200 ps).
+        md_run_dirs:     list of run directory paths (order does not matter).
+        dt_ps:           desired frame spacing in ps (default 200 ps).
+        max_drift_A_ns:  local |dRMSD/dt| threshold in Å/ns; frames above
+                         this are excluded (default 5.0 Å/ns).
+        slope_window:    number of strided frames used for the local slope
+                         estimate (default 10).
 
     Returns:
         (R, t) where R is [F_total, N, 3, 3] and t is [F_total, N, 3] float32.
@@ -324,6 +337,42 @@ def shard_from_md_runs(md_run_dirs: list, dt_ps: float = 200.0):
                 dt_traj_ps = float(traj.timestep)
             stride = max(1, round(dt_ps / dt_traj_ps))
             traj_s = traj[::stride]
+
+            # ── Drift filter ─────────────────────────────────────────────────
+            # Compute local |dRMSD/dt| at each strided frame and keep only
+            # frames where the RMSD is not actively running away.  This is
+            # trajectory-local: the slope is computed relative to frame 0 of
+            # this trajectory, so the absolute RMSD level does not matter.
+            n_s = traj_s.n_frames
+            if n_s >= 4 and max_drift_A_ns < np.inf:
+                ca_s = traj_s.topology.select("name CA")
+                rmsd_s_A = (
+                    md.rmsd(traj_s.atom_slice(ca_s),
+                            traj_s.atom_slice(ca_s), frame=0) * 10.0
+                )
+                dt_s_ps      = dt_traj_ps * stride   # ps per strided frame
+                frames_per_ns = 1000.0 / dt_s_ps
+                W = max(2, min(slope_window, n_s // 4))
+                local_slopes = np.zeros(n_s)
+                for i in range(n_s):
+                    lo = max(0, i - W // 2)
+                    hi = min(n_s, lo + W)
+                    if hi - lo < 2:
+                        continue
+                    x = np.arange(hi - lo, dtype=float)
+                    local_slopes[i] = (
+                        np.polyfit(x, rmsd_s_A[lo:hi], 1)[0] * frames_per_ns
+                    )
+                mask = np.abs(local_slopes) < max_drift_A_ns
+                n_kept = int(mask.sum())
+                if n_kept < n_s:
+                    print(
+                        f"[shard_from_md_runs] {os.path.basename(run_dir)}: "
+                        f"drift filter kept {n_kept}/{n_s} frames "
+                        f"(threshold {max_drift_A_ns:.1f} Å/ns)",
+                        flush=True,
+                    )
+                traj_s = traj_s[np.where(mask)[0]]
 
             top_obj = traj_s.topology
             n_idx  = top_obj.select("protein and name N")
